@@ -1,5 +1,28 @@
 import { describe, expect, it } from 'vitest';
-import { ALIASES, COMMAND_NAMES, COMMANDS, parseInput } from '../src/router.js';
+import { agentCommandQuery, ALIASES, COMMAND_NAMES, COMMANDS, matchCommands, parseInput } from '../src/router.js';
+
+describe('lista de comandos de cada agente', () => {
+  it('reconhece "@cla /..." e "/fog /..." enquanto você digita', () => {
+    expect(agentCommandQuery('@cla /')).toEqual({ target: 'claude', head: '@cla ', query: '' });
+    expect(agentCommandQuery('/fog /Rev')).toEqual({ target: 'codex', head: '/fog ', query: 'rev' });
+    expect(agentCommandQuery('@claude  /co')).toEqual({ target: 'claude', head: '@claude  ', query: 'co' });
+  });
+
+  it('não é lista: sem a barra, já com argumento, /todos, comando do duo ou nome desconhecido', () => {
+    expect(agentCommandQuery('@cla oi')).toBeNull();
+    expect(agentCommandQuery('@cla /compact agora')).toBeNull(); // o nome já foi escolhido
+    expect(agentCommandQuery('@todos /')).toBeNull();
+    expect(agentCommandQuery('/brain /cla')).toBeNull();
+    expect(agentCommandQuery('@zé /')).toBeNull();
+  });
+
+  it('filtra: quem começa com o texto primeiro, depois quem o contém', () => {
+    const list = ['context', 'compact', 'code-review', 'autocompact'].map((name) => ({ name, description: '' }));
+    expect(matchCommands(list, 'co').map((c) => c.name)).toEqual(['context', 'compact', 'code-review', 'autocompact']);
+    expect(matchCommands(list, 'compact').map((c) => c.name)).toEqual(['compact', 'autocompact']);
+    expect(matchCommands(list, '')).toHaveLength(4);
+  });
+});
 
 describe('parseInput com / (principal)', () => {
   it('/fog, /cla, /todos e os nomes longos mandam para quem foi chamado', () => {

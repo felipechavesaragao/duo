@@ -9,6 +9,7 @@ import {
   patchStats,
   peerLoopHint,
   type Agent,
+  type AgentCommand,
   type AgentStats,
   type EmitFn,
   type PeerRequest,
@@ -65,11 +66,13 @@ interface Running {
   own: string[];
   /** request_id do pedido que liga o Remote Control */
   remoteControlRequest?: string;
+  /** request_id do initialize, que traz a lista de comandos */
+  initRequest: string;
 }
 
 interface Turn {
   proc: ChildProcess;
-  /** uuid da mensagem do duo: o eco dela marca onde começa este turno */
+  /** uuid da mensagem do duo: o command_lifecycle "started" ou o eco dela marcam onde começa este turno */
   uuid: string;
   /** o CLI já leu a mensagem; antes disso, o que chega é de um turno que ele abriu sozinho */
   started: boolean;
@@ -101,12 +104,20 @@ interface Turn {
  * plano termina depois do `result`, ele manda `task_notification`, um `system/init` novo e um turno inteiro
  * com `result` próprio, sem mensagem nenhuma no stdin. Uma mensagem que chega no meio desse turno entra
  * nele: um `result` só para os dois. Com `--replay-user-messages` ele ecoa a mensagem (com o `uuid` que
- * mandamos) no ponto em que a lê; é esse eco que separa o turno dele do turno do duo.
+ * mandamos) no ponto em que a lê; é esse eco que separa o turno dele do turno do duo. O `command_lifecycle`
+ * "started" com o mesmo uuid marca o mesmo ponto: logo depois do eco na mensagem que entra num turno dele,
+ * antes do eco nas outras. Num comando local (/context) a saída vem antes do eco e depois do "started".
  *
  * Remote Control (medido em 02/11/2026, 2.1.316): no `-p` a opção `--remote-control` é ignorada, mas o
  * `control_request` {subtype: "remote_control", enabled: true} liga a ponte (é o que o app desktop usa nas
  * sessões dele): a resposta traz `session_url` e chegam `system/bridge_state` ready e connected. O que você
  * digita no app entra na fila como uma mensagem; o eco dela tem um uuid que não é nosso.
+ *
+ * Comandos (medido em 02/11/2026, 2.1.316): o `control_request` initialize responde na hora, antes de
+ * qualquer mensagem, com `commands` [{name, description, argumentHint}]; `system/commands_changed` traz a
+ * lista nova quando ela muda (plugins e MCP carregando). Um "/context" mandado puro roda como comando e a
+ * saída vem como resposta. Os `terminal_slash_commands` do `system/init` (doctor, color, focus...) também
+ * rodam no `-p` (o /doctor vira um prompt) ou respondem que não estão disponíveis: ficam na lista.
  *
  * Retomada que falha (medido em 02/11/2026, Claude Code 2.1.316): com um id inexistente ele manda
  * um `result` de erro SEM o `system/init`, escreve "No conversation found with session ID" no
@@ -123,6 +134,8 @@ export class ClaudeAgent implements Agent {
   onRemoteMessage?: (text: string) => void;
   onNotice?: EmitFn;
   onStats?: (stats: AgentStats) => void;
+  onCommands?: (commands: AgentCommand[]) => void;
+  commands: AgentCommand[] = [];
   readonly stats: AgentStats;
   private run?: Running;
   private sessionId?: string;
@@ -149,6 +162,10 @@ export class ClaudeAgent implements Agent {
           run.proc.stdin?.write(line + '\n');
         }),
     );
+  }
+
+  warmUp(): void {
+    this.ensureProcess();
   }
 
   reset(): void {
@@ -195,11 +212,14 @@ export class ClaudeAgent implements Agent {
       deniedByYou: new Set(),
       subagents: new Set(),
       own: [],
+      initRequest: `duo-init-${randomUUID()}`,
     };
     onJsonLines(proc, (msg) => this.handle(run, msg));
     proc.on('error', (err) => this.fail(run, new Error(`não consegui iniciar o claude: ${err.message}`)));
     proc.on('exit', (code) => this.onExit(run, code));
     this.run = run;
+    const init = { type: 'control_request', request_id: run.initRequest, request: { subtype: 'initialize' } };
+    proc.stdin?.write(JSON.stringify(init) + '\n');
     if (this.opts.remoteControl) {
       run.remoteControlRequest = `duo-rc-${randomUUID()}`;
       const request = { subtype: 'remote_control', enabled: true };
@@ -247,6 +267,10 @@ export class ClaudeAgent implements Agent {
     }
     if (msg.type === 'control_response') {
       const res = msg.response ?? {};
+      if (res.request_id === run.initRequest) {
+        if (res.subtype === 'success') this.setCommands(res.response?.commands);
+        return;
+      }
       if (res.request_id !== run.remoteControlRequest) return;
       if (res.subtype === 'success') {
         this.onNotice?.({ kind: 'text', text: `Claude no Remote Control: ${res.response?.session_url ?? '(sem link)'}` });
@@ -256,6 +280,7 @@ export class ClaudeAgent implements Agent {
       return;
     }
     if (msg.type === 'system' && msg.subtype === 'init') run.sawInit = true;
+    if (msg.type === 'system' && msg.subtype === 'commands_changed') this.setCommands(msg.commands);
     const resumeFailed = msg.type === 'result' && msg.is_error && run.resumedWith !== undefined && !run.sawInit;
 
     if (typeof msg.session_id === 'string' && !resumeFailed && msg.session_id !== this.sessionId) {
@@ -265,12 +290,14 @@ export class ClaudeAgent implements Agent {
     this.trackStats(run, msg);
 
     const turn = this.turn?.proc === run.proc ? this.turn : undefined;
+    if (msg.type === 'command_lifecycle') {
+      if (turn && msg.state === 'started' && msg.command_uuid === turn.uuid) this.startTurn(run, turn);
+      return;
+    }
     if (msg.type === 'user') {
       if (!msg.isReplay) return;
       if (turn && msg.uuid === turn.uuid) {
-        // o eco da mensagem do duo: o turno que ele abriu sozinho (se havia) acabou de receber a mensagem
-        this.finishOwnTurn(run);
-        turn.started = true;
+        this.startTurn(run, turn);
       } else if (this.opts.remoteControl && !msg.isSynthetic) {
         // outra mensagem lida pelo CLI: só pode ter vindo do app, pelo Remote Control
         const text = userText(msg.message?.content);
@@ -286,7 +313,7 @@ export class ClaudeAgent implements Agent {
       return;
     }
 
-    // antes do eco, o que chega é de um turno que o CLI abriu sozinho: vai para a tela do mesmo jeito
+    // antes de o CLI ler a mensagem, o que chega é de um turno que ele abriu sozinho: vai para a tela do mesmo jeito
     const mine = turn?.started ? turn : undefined;
     const emit: EmitFn = mine ? mine.emit : (ev) => this.onOwnTurnEvent?.(ev);
     const texts = mine ? mine.texts : run.own;
@@ -319,6 +346,22 @@ export class ClaudeAgent implements Agent {
       }
       this.settle(mine, msg.is_error ? new Error(resultError(msg)) : mine.texts.join('\n\n'));
     }
+  }
+
+  /** A lista de comandos que o CLI informou. */
+  private setCommands(list: unknown): void {
+    if (!Array.isArray(list)) return;
+    this.commands = list
+      .filter((c) => typeof c?.name === 'string')
+      .map((c) => ({ name: c.name, description: String(c.description ?? ''), hint: c.argumentHint || undefined }));
+    this.onCommands?.(this.commands);
+  }
+
+  /** O CLI leu a mensagem do duo: o turno que ele abriu sozinho (se havia) termina aqui, e o do duo começa. */
+  private startTurn(run: Running, turn: Turn): void {
+    if (turn.started) return;
+    this.finishOwnTurn(run);
+    turn.started = true;
   }
 
   /** O turno que o CLI abriu sozinho terminou (ou a mensagem do duo entrou nele): a resposta vai para a janela. */

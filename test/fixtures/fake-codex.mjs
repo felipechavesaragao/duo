@@ -8,6 +8,8 @@
 // AGENTE / FIM (um subagente começa / termina), INIT (devolve os parâmetros do initialize),
 // CHAMA <texto> (usa a ferramenta do cliente, se o thread/start a trouxe em dynamicTools: pedido item/tool/call,
 // como o 0.166.0). Todo turno manda o uso de tokens da conversa.
+// skills/list → duas skills, uma desligada, como o 0.166.0. Turno com o item {type:"skill"} responde
+// "eco: [skill <nome>] <texto>".
 import readline from 'node:readline';
 
 const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
@@ -32,6 +34,10 @@ rl.on('line', (line) => {
       return reply({ userAgent: 'codex-falso' });
     case 'initialized':
       return;
+    case 'skills/list': {
+      const skill = (name, enabled) => ({ name, description: `a skill ${name}`, path: `C:/skills/${name}/SKILL.md`, enabled, scope: 'user' });
+      return reply({ data: [{ cwd: params.cwds?.[0], skills: [skill('revisar', true), skill('desligada', false)], errors: [] }] });
+    }
     case 'thread/start':
       thread = 'thread-nova';
       threadParams = params;
@@ -47,7 +53,7 @@ rl.on('line', (line) => {
     case 'turn/start':
       if (params.threadId !== thread) return fail(`thread not loaded: ${params.threadId}`);
       reply({ turn: { id: 'turno', status: 'inProgress' } });
-      return runTurn(params.input?.[0]?.text ?? '');
+      return runTurn(params.input?.[0]?.text ?? '', params.input?.find((i) => i.type === 'skill'));
     default:
       return out({ id, error: { code: -32601, message: `método desconhecido: ${method}` } });
   }
@@ -56,9 +62,9 @@ rl.on('line', (line) => {
 const note = (method, params) => out({ method, params: { threadId: thread, ...params } });
 const message = (text) => note('item/completed', { item: { id: 'm', type: 'agentMessage', text } });
 
-async function runTurn(text) {
+async function runTurn(text, skill) {
   note('turn/started', { turn: { id: 'turno' } });
-  let answer = `eco: ${text}`;
+  let answer = skill ? `eco: [skill ${skill.name} ${skill.path}] ${text}` : `eco: ${text}`;
   if (text === 'PID') answer = `pid ${process.pid}`;
   if (text === 'PARAMS') answer = JSON.stringify(threadParams);
   if (text === 'INIT') answer = JSON.stringify(initParams);

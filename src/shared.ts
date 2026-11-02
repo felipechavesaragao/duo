@@ -73,7 +73,9 @@ export class SharedLog {
    * deles só comece depois (fila ocupada com uma mensagem anterior).
    */
   prepare(id: AgentId, text: string, shared: boolean, msgIndex?: number, sender: 'voce' | AgentId = 'voce'): Prepared {
-    if (!shared) return { prompt: text, upTo: this.state.seen[id], intro: false, amnesia: false };
+    // Comando do agente ("/compact") vai como você digitou: com o contexto na frente, ele vira texto e não
+    // roda. O contexto não conta como entregue e vai na próxima mensagem.
+    if (!shared || text.startsWith('/')) return { prompt: text, upTo: this.state.seen[id], intro: false, amnesia: false };
     const end = msgIndex ?? this.state.items.length; // contexto = [seen, end); a mensagem vai no fim
     const upTo = msgIndex === undefined ? end : msgIndex + 1;
 

@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeAgent } from '../src/agents/claude.js';
 import { CodexAgent } from '../src/agents/codex.js';
-import { ResumeFailedError, type Agent } from '../src/agents/types.js';
+import { ResumeFailedError, type Agent, type AgentEvent } from '../src/agents/types.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fakeClaude = [process.execPath, path.join(here, 'fixtures', 'fake-claude.mjs')];
@@ -160,6 +160,29 @@ describe('ClaudeAgent', () => {
     expect(await agent.send('e aqui?', noop)).toBe('eco: e aqui?');
   });
 
+  it('comandos: carregam ao subir, sem mensagem nenhuma, e acompanham as mudanças', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const seen: string[][] = [];
+    agent.onCommands = (list) => seen.push(list.map((c) => c.name));
+    agent.warmUp();
+    await vi.waitFor(() => expect(agent.commands.map((c) => c.name)).toEqual(['compact', 'context', 'doctor']));
+    expect(agent.commands[0]).toEqual({ name: 'compact', description: 'Resume a conversa', hint: '<instruções>' });
+    await agent.send('MUDA', noop);
+    expect(agent.commands.map((c) => c.name)).toEqual(['compact', 'context', 'doctor', 'nova']);
+    expect(seen.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('comando local: a saída chega antes do eco e é a resposta do turno, não um turno dele sozinho', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const own: string[] = [];
+    agent.onOwnTurnEvent = (ev) => own.push(ev.text);
+    agent.onOwnTurnReply = (text) => own.push(text);
+    const emitted: AgentEvent[] = [];
+    expect(await agent.send('/context', (ev) => emitted.push(ev))).toBe('saída do /context');
+    expect(emitted).toEqual([{ kind: 'text', text: 'saída do /context' }]);
+    expect(own).toEqual([]);
+  });
+
   it('sem Remote Control, não pede a ponte', async () => {
     const agent = track(new ClaudeAgent({ bin: fakeClaude }));
     const notices: string[] = [];
@@ -312,6 +335,16 @@ describe('CodexAgent (app-server)', () => {
     const answer = await agent.send('PEDE', (ev) => emitted.push(ev));
     expect(answer).toMatch(/^recusado:/);
     expect(emitted.some((e) => e.kind === 'error' && e.text.includes('item/commandExecution/requestApproval'))).toBe(true);
+  });
+
+  it('comandos: as skills ligadas carregam ao subir, e "/skill" manda a skill junto', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    agent.warmUp();
+    await vi.waitFor(() => expect(agent.commands).toEqual([{ name: 'revisar', description: 'a skill revisar' }]));
+    expect(await agent.send('/revisar o parser', noop)).toBe(
+      'eco: [skill revisar C:/skills/revisar/SKILL.md] $revisar o parser',
+    );
+    expect(await agent.send('/desligada x', noop)).toBe('eco: /desligada x'); // não é skill: vai como texto
   });
 
   it('reset: a próxima mensagem começa conversa nova', async () => {

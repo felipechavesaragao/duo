@@ -1,4 +1,4 @@
-import type { AgentId } from './agents/types.js';
+import type { AgentCommand, AgentId } from './agents/types.js';
 import { BRAIN_MAX } from './brain.js';
 
 export type Target = AgentId | 'todos';
@@ -95,6 +95,24 @@ export function parseInput(raw: string, current: Target): Command | null {
   return { type: 'ask', targets: targetsOf(current), prompt: input, newDefault: current };
 }
 
+/**
+ * Você está digitando um comando de um agente ("@cla /co", "/fog /rev"): para quem, o que vem antes da barra
+ * e o que já foi digitado do nome. null = não é isso (inclusive /todos: cada um tem a sua lista).
+ */
+export function agentCommandQuery(input: string): { target: AgentId; head: string; query: string } | null {
+  const m = input.match(/^([/@])([\p{L}\p{N}_-]+)(\s+)\/(\S*)$/u);
+  const target = m ? targetOf(m[2].toLowerCase()) : undefined;
+  if (!m || !target || target === 'todos') return null;
+  return { target, head: `${m[1]}${m[2]}${m[3]}`, query: m[4].toLowerCase() };
+}
+
+/** Os comandos que batem com o que você digitou: os que começam com ele primeiro, depois os que o contêm. */
+export function matchCommands(commands: AgentCommand[], query: string): AgentCommand[] {
+  const starts = commands.filter((c) => c.name.toLowerCase().startsWith(query));
+  const contains = commands.filter((c) => !c.name.toLowerCase().startsWith(query) && c.name.toLowerCase().includes(query));
+  return [...starts, ...contains];
+}
+
 export const HELP_TEXT = [
   '/claude <msg>     manda só para o Claude      (atalhos: /c, /cla)',
   '/codex <msg>      manda só para o Codex       (atalhos: /x, /fog)',
@@ -102,6 +120,8 @@ export const HELP_TEXT = [
   '/codex            sem mensagem: muda o destino padrão',
   '<msg>             manda para o destino padrão (aparece antes do ›)',
   '/cla /init        manda um comando do agente (o /init vai para o Claude)',
+  '@cla /  @fog /    mostra a lista de comandos de cada um (do Codex, as skills);',
+  '                  digite para filtrar, Tab completa o primeiro',
   '                  (com @ também funciona: @fog, @todos...)',
   '/brain /cla <msg> o Claude responde, o Codex avalia, e revezam até concordarem',
   `                  (no máximo ${BRAIN_MAX} respostas; /brain /fog: o Codex começa)`,

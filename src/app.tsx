@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Box, Static, Text, useApp, useStdout } from 'ink';
+import { Box, Static, Text, useApp, useInput, useStdout } from 'ink';
 import TextInput from 'ink-text-input';
 import {
   createQueue,
   ResumeFailedError,
   truncate,
   type Agent,
+  type AgentCommand,
   type AgentId,
   type AgentStats,
 } from './agents/types.js';
@@ -19,7 +20,7 @@ import {
   type Who,
 } from './persist.js';
 import { BRAIN_MAX, brainOpening, brainReview, brainVerdict, otherOf } from './brain.js';
-import { HELP_TEXT, parseInput, type Target } from './router.js';
+import { agentCommandQuery, HELP_TEXT, matchCommands, parseInput, type Target } from './router.js';
 import { SharedLog } from './shared.js';
 
 interface Entry extends ScreenEntry {
@@ -117,6 +118,12 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
     claude: { ...agents.claude.stats },
     codex: { ...agents.codex.stats },
   }));
+  const [commands, setCommands] = useState<Record<AgentId, AgentCommand[]>>(() => ({
+    claude: agents.claude.commands,
+    codex: agents.codex.commands,
+  }));
+  // muda para remontar a caixa de texto: depois do Tab, o cursor vai para o fim
+  const [inputKey, setInputKey] = useState(0);
 
   const add = useCallback(
     (who: Who, kind: Entry['kind'], text: string) => {
@@ -155,6 +162,7 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
     };
     for (const agent of Object.values(agents)) {
       agent.onStats = (s) => setStats((prev) => ({ ...prev, [agent.id]: s }));
+      agent.onCommands = (list) => setCommands((prev) => ({ ...prev, [agent.id]: list }));
       // turno que ele abriu sozinho (terminou um subagente em segundo plano): aparece e entra na janela como os outros
       agent.onOwnTurnEvent = (ev) => add(agent.id, ev.kind, ev.text);
       agent.onOwnTurnReply = (text) => {
@@ -301,6 +309,12 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
       };
     }
   }, [agents, add, rec, runTurn]);
+
+  // Sobe os dois já ao abrir, como o terminal: a lista de comandos carrega antes da primeira mensagem.
+  // Vem depois do askPeer: é ao subir que cada um ganha a ferramenta de falar com o outro.
+  useEffect(() => {
+    for (const agent of Object.values(agents)) agent.warmUp();
+  }, [agents]);
 
   /** O brain em andamento (só um por vez). `stop` = /parar: encerra depois da resposta em andamento. */
   const brain = useRef<{ stop: boolean } | null>(null);
@@ -461,6 +475,18 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
   const promptColor = target === 'todos' ? 'white' : COLORS[target];
   const asking = asks[0];
 
+  // "@cla /co": a lista de comandos de quem você chamou, filtrada pelo que já digitou
+  const query = asking ? null : agentCommandQuery(input);
+  const matches = query ? matchCommands(commands[query.target], query.query) : [];
+  useInput(
+    (_, key) => {
+      if (!key.tab || !query || !matches[0]) return;
+      setInput(`${query.head}/${matches[0].name} `);
+      setInputKey((k) => k + 1);
+    },
+    { isActive: Boolean(query) },
+  );
+
   return (
     <Box flexDirection="column">
       <Static key={staticKey} items={entries}>
@@ -492,8 +518,17 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
             <Text color={promptColor} bold>
               {shared ? '' : '🔒 '}/{target} ›{' '}
             </Text>
-            <TextInput value={input} onChange={setInput} onSubmit={onSubmit} />
+            <TextInput key={inputKey} value={input} onChange={setInput} onSubmit={onSubmit} />
           </Box>
+        )}
+        {query && (
+          <CommandList
+            agent={agents[query.target].name}
+            color={COLORS[query.target]}
+            total={commands[query.target].length}
+            matches={matches}
+            width={stdout.columns ?? 100}
+          />
         )}
         {(['claude', 'codex'] as AgentId[]).map((id) => (
           <Text key={id}>
@@ -502,6 +537,33 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
           </Text>
         ))}
       </Box>
+    </Box>
+  );
+}
+
+/** Quantos comandos a lista mostra de cada vez: o resto aparece conforme você filtra. */
+const LIST_MAX = 8;
+
+function CommandList(props: { agent: string; color: string; total: number; matches: AgentCommand[]; width: number }) {
+  const { agent, color, total, matches, width } = props;
+  if (total === 0) return <Text dimColor> os comandos do {agent} ainda não carregaram</Text>;
+  if (matches.length === 0) return <Text dimColor> nenhum comando do {agent} com esse nome</Text>;
+  const shown = matches.slice(0, LIST_MAX);
+  const nameWidth = Math.min(30, Math.max(...shown.map((c) => c.name.length)) + 1);
+  return (
+    <Box flexDirection="column">
+      {shown.map((c, i) => (
+        <Text key={c.name} wrap="truncate">
+          <Text color={color} bold={i === 0}>
+            {' '}/{c.name.padEnd(nameWidth)}
+          </Text>
+          <Text dimColor> {truncate(c.description, Math.max(20, width - nameWidth - 6))}</Text>
+        </Text>
+      ))}
+      <Text dimColor>
+        {' '}
+        {matches.length > LIST_MAX ? `+${matches.length - LIST_MAX} · ` : ''}Tab completa /{shown[0].name}
+      </Text>
     </Box>
   );
 }

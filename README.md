@@ -45,6 +45,7 @@ Depois é só rodar `duo` na pasta do projeto em que você quer trabalhar. Os do
 | `<msg>` | manda para o destino padrão, que aparece antes do `›` |
 | `/codex` | sem mensagem: muda o destino padrão |
 | `/cla /init` | manda um comando do próprio agente (o `/init` vai para o Claude) |
+| `@cla /` | mostra a lista de comandos do Claude (`@fog /`: as skills do Codex); digite para filtrar, Tab completa |
 | `/brain /cla <msg>` | o Claude responde, o Codex avalia, e eles revezam até concordarem (no máximo 6 respostas; `/brain /fog` faz o Codex começar) |
 | `/parar` | encerra o brain depois da resposta em andamento |
 | `/compartilhado` | (padrão) cada um vê o que você e o outro disseram |
@@ -55,6 +56,8 @@ Depois é só rodar `duo` na pasta do projeto em que você quer trabalhar. Os do
 | `/sair` | encerra (ou Ctrl+C) |
 
 `@` funciona no lugar de `/` para chamar os agentes: `@fog`, `@todos`...
+
+**Comandos de cada agente**: o duo pede a lista a cada um quando abre. A do Claude é a que o `claude -p` informa (`/compact`, `/context`, `/usage`, as skills e os comandos de plugin); os poucos que só funcionam na tela do terminal, como `/focus`, respondem que não estão disponíveis. O Codex não aceita comandos `/` fora do terminal dele, então a lista dele são as skills ligadas: `@fog /nome-da-skill <texto>` chama a skill, como o `$nome-da-skill` no terminal do Codex. Um comando vai puro, sem o contexto da janela; o que o agente perdeu vai junto da mensagem seguinte.
 
 No `/todos`, os dois respondem ao mesmo tempo e nenhum vê a resposta do outro àquela mensagem. Cada um fica sabendo da resposta do outro na mensagem seguinte.
 

@@ -5,7 +5,14 @@ import React from 'react';
 import { describe, expect, it } from 'vitest';
 import { render } from 'ink-testing-library';
 import { App, footerText } from '../src/app.js';
-import { ResumeFailedError, type Agent, type AgentId, type AgentStats, type EmitFn } from '../src/agents/types.js';
+import {
+  ResumeFailedError,
+  type Agent,
+  type AgentCommand,
+  type AgentId,
+  type AgentStats,
+  type EmitFn,
+} from '../src/agents/types.js';
 import { newSessionData, Recorder, SessionStore } from '../src/persist.js';
 
 class FakeAgent implements Agent {
@@ -16,6 +23,9 @@ class FakeAgent implements Agent {
   askPeer?: Agent['askPeer'];
   stats: AgentStats = { subagents: 0 };
   onStats?: (stats: AgentStats) => void;
+  commands: AgentCommand[] = [];
+  onCommands?: (commands: AgentCommand[]) => void;
+  warmed = 0;
   /** próximas chamadas que devem falhar com "conversa não existe" */
   failResume = 0;
   /** respostas roteirizadas, na ordem; '!erro' faz aquela resposta falhar */
@@ -52,6 +62,9 @@ class FakeAgent implements Agent {
   }
   reset() {
     this.resumeId = undefined;
+  }
+  warmUp() {
+    this.warmed++;
   }
   dispose() {}
 }
@@ -285,6 +298,48 @@ describe('turno que o agente abre sozinho', () => {
     await type(stdin, '/codex viu?');
     expect(codex.prompts[0]).toContain('usuário → Claude\nOI DO CELULAR');
     expect(codex.prompts[0]).toContain('### Claude\nRESPOSTA NO CELULAR');
+  });
+});
+
+describe('lista de comandos de cada agente', () => {
+  it('"@cla /co" mostra os do Claude que batem; Tab completa e o comando vai puro', async () => {
+    const { claude, codex } = fakes();
+    claude.commands = [
+      { name: 'context', description: 'Mostra o uso de contexto' },
+      { name: 'compact', description: 'Resume a conversa' },
+      { name: 'init', description: 'Cria o CLAUDE.md' },
+    ];
+    const { stdin, lastFrame } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    expect([claude.warmed, codex.warmed]).toEqual([1, 1]); // os dois sobem ao abrir
+    await type(stdin, '/codex opina'); // contexto para o Claude receber depois
+    stdin.write('@cla /co');
+    await tick();
+    const frame = lastFrame()!;
+    expect(frame).toContain('/context');
+    expect(frame).toContain('Mostra o uso de contexto');
+    expect(frame).toContain('/compact');
+    expect(frame).not.toContain('/init');
+
+    stdin.write('\t');
+    await tick();
+    expect(lastFrame()).toContain('› @cla /context');
+    expect(lastFrame()).not.toContain('Tab completa'); // nome escolhido: a lista sai
+    await type(stdin, 'agora'); // o cursor foi para o fim
+    expect(claude.prompts.at(-1)).toBe('/context agora'); // sem o contexto na frente: roda como comando
+  });
+
+  it('as skills do Codex chegam depois de abrir, e a lista acompanha', async () => {
+    const { claude, codex } = fakes();
+    const { stdin, lastFrame } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    stdin.write('@fog /');
+    await tick();
+    expect(lastFrame()).toContain('os comandos do Codex ainda não carregaram');
+    codex.onCommands!([{ name: 'review-agent', description: 'Acha bugs' }]);
+    await tick();
+    expect(lastFrame()).toContain('/review-agent');
+    expect(lastFrame()).toContain('Acha bugs');
   });
 });
 

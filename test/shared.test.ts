@@ -208,6 +208,16 @@ describe('SharedLog', () => {
     expect(p).toContain('### Codex → Claude\nPARECER');
   });
 
+  it('comando do agente vai puro, e o contexto fica para a mensagem seguinte', () => {
+    const log = new SharedLog();
+    turn(log, ['codex'], 'revisa');
+    log.agentReply('codex', 'PARECER-DO-CODEX', true);
+    expect(turn(log, ['claude'], '/compact').claude).toBe('/compact');
+    const next = turn(log, ['claude'], 'e agora?').claude;
+    expect(next).toContain('### Codex\nPARECER-DO-CODEX');
+    expect(next).toContain('janela de terminal compartilhada'); // a apresentação também esperou
+  });
+
   it('chamada no modo privado: só os dois veem', () => {
     const log = new SharedLog();
     const idx = log.agentMessage('claude', 'codex', 'SEGREDO', false);

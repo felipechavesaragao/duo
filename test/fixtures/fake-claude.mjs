@@ -12,8 +12,13 @@
 // "SOZINHO <texto>" → responde, e logo depois abre um turno sozinho, como o 2.1.316 quando uma tarefa em
 //                   segundo plano termina: task_notification, init, a resposta dele e o result. Mensagem que
 //                   chega nesses 300ms entra no mesmo turno: eco dela, a resposta e um result só para os dois.
-// Com --replay-user-messages, ecoa cada mensagem lida (com o uuid dela), como o 2.1.316.
+// Com --replay-user-messages, ecoa cada mensagem lida (com o uuid dela), como o 2.1.316. O command_lifecycle
+// "started" vem antes do eco; numa mensagem que entra no turno que ele abriu sozinho, logo depois.
+// "/<comando>"     → comando local, como o /context no 2.1.316: "started", a saída (modelo <synthetic>), o eco
+//                   e o result, nessa ordem.
 // control_request "remote_control" → liga a ponte, como o 2.1.316: session_url na resposta e bridge_state.
+// control_request "initialize" → responde com a lista de comandos, como o 2.1.316.
+// "MUDA"           → system/commands_changed com um comando a mais.
 // "APP <texto>"    → responde, e logo depois chega <texto> como se você tivesse digitado no app (Remote
 //                   Control): o eco dela com um uuid que não é do duo, e um turno inteiro respondendo.
 // Toda resposta traz usage (contexto = 1000 × número da mensagem) e o result traz o contextWindow.
@@ -47,6 +52,11 @@ if (resume === 'sumiu') {
       .mcp_response;
 
   const model = 'claude-falso-1';
+  const commands = [
+    { name: 'compact', description: 'Resume a conversa', argumentHint: '<instruções>' },
+    { name: 'context', description: 'Mostra o uso de contexto', argumentHint: '' },
+    { name: 'doctor', description: 'Confere a instalação', argumentHint: '' },
+  ];
   const usage = () => ({ input_tokens: 10, cache_creation_input_tokens: 90, cache_read_input_tokens: 1000 * n - 110, output_tokens: 10 });
   const say = (text) =>
     out({ type: 'assistant', session_id: sid, message: { model, usage: usage(), content: [{ type: 'text', text }] } });
@@ -66,6 +76,7 @@ if (resume === 'sumiu') {
   };
   const echo = (msg) =>
     replay && out({ type: 'user', session_id: sid, uuid: msg.uuid, isReplay: true, parent_tool_use_id: null, message: msg.message });
+  const started = (msg) => out({ type: 'command_lifecycle', command_uuid: msg.uuid, state: 'started', session_id: sid });
 
   /** mensagens que chegaram no meio do turno que ele abriu sozinho; null = nenhum aberto */
   let own = null;
@@ -77,6 +88,7 @@ if (resume === 'sumiu') {
     await new Promise((r) => setTimeout(r, 300));
     for (const msg of own) {
       echo(msg);
+      started(msg);
       say(`eco: ${msg.message.content}`);
     }
     own = null;
@@ -90,6 +102,10 @@ if (resume === 'sumiu') {
       pending.delete(msg.response.request_id);
       return resolve?.(msg.response);
     }
+    if (msg.type === 'control_request' && msg.request.subtype === 'initialize') {
+      const response = { commands, models: [], pid: process.pid };
+      return out({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id, response } });
+    }
     if (msg.type === 'control_request' && msg.request.subtype === 'remote_control') {
       const response = { session_url: 'https://claude.ai/code/session_falsa', bridge_session_id: 'cse_falsa' };
       out({ type: 'system', subtype: 'bridge_state', state: 'ready', session_id: sid });
@@ -97,10 +113,21 @@ if (resume === 'sumiu') {
       return out({ type: 'system', subtype: 'bridge_state', state: 'connected', session_id: sid });
     }
     if (own) return void own.push(msg);
+    started(msg);
     if (++n === 1) out({ type: 'system', subtype: 'init', session_id: sid, model });
-    echo(msg);
     const text = msg.message.content;
+    if (text.startsWith('/')) {
+      out({ type: 'assistant', session_id: sid, message: { model: '<synthetic>', content: [{ type: 'text', text: `saída do ${text}` }] } });
+      echo(msg);
+      return done();
+    }
+    echo(msg);
     if (text === 'ARGS') return reply(`eco: ${JSON.stringify(args)}`);
+    if (text === 'MUDA') {
+      commands.push({ name: 'nova', description: 'chegou depois', argumentHint: '' });
+      out({ type: 'system', subtype: 'commands_changed', commands, session_id: sid });
+      return reply('eco: MUDA');
+    }
     if (text.startsWith('APP ')) {
       reply('eco: ok');
       setTimeout(() => {

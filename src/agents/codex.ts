@@ -8,6 +8,7 @@ import {
   ResumeFailedError,
   truncate,
   type Agent,
+  type AgentCommand,
   type AgentStats,
   type EmitFn,
   type PeerRequest,
@@ -71,6 +72,10 @@ const RPC_TIMEOUT_MS = 120_000;
  * thread/start aceita `dynamicTools`; o Codex chama a ferramenta com o pedido `item/tool/call` e espera
  * `{ contentItems, success }`. A ferramenta fica gravada na conversa e volta no thread/resume, mas só o
  * thread/start a aceita: conversa aberta sem ela (duo antigo) continua sem, mesmo retomada.
+ *
+ * Comandos (medido em 02/11/2026, 0.166.0): o app-server não tem os "/" do terminal do Codex; o que ele lista
+ * são as skills (`skills/list`, com name, description e o caminho do SKILL.md; `skills/changed` avisa que
+ * mudaram). O terminal aciona uma skill mandando "$nome …" e o item {type: "skill", name, path} no turn/start.
  */
 export class CodexAgent implements Agent {
   readonly id = 'codex' as const;
@@ -78,7 +83,11 @@ export class CodexAgent implements Agent {
   onSessionId?: (id: string) => void;
   askPeer?: (req: PeerRequest) => Promise<string>;
   onStats?: (stats: AgentStats) => void;
+  onCommands?: (commands: AgentCommand[]) => void;
+  commands: AgentCommand[] = [];
   readonly stats: AgentStats;
+  /** caminho do SKILL.md de cada skill, por nome: "/nome" vira a skill no turno */
+  private skills = new Map<string, string>();
   private threadId?: string;
   private conn?: Connection;
   /** a conversa já foi aberta (thread/start ou thread/resume) no processo atual */
@@ -98,6 +107,11 @@ export class CodexAgent implements Agent {
 
   send(prompt: string, emit: EmitFn): Promise<string> {
     return this.enqueue(() => this.runTurn(prompt, emit));
+  }
+
+  warmUp(): void {
+    // falha aqui aparece na primeira mensagem, que tenta de novo
+    this.connect().catch(() => undefined);
   }
 
   reset(): void {
@@ -145,6 +159,7 @@ export class CodexAgent implements Agent {
       }
     });
     conn.on((method, p) => this.trackStats(method, p)); // a conexão toda: subagente pode terminar fora do turno
+    conn.on((method) => method === 'skills/changed' && void this.loadSkills(conn));
     conn.handleRequest = (method, p) => (method === 'item/tool/call' ? this.answerTool(conn, p) : undefined);
     this.conn = conn;
     await conn.request('initialize', {
@@ -153,7 +168,33 @@ export class CodexAgent implements Agent {
       ...(this.askPeer ? { capabilities: { experimentalApi: true, requestAttestation: false } } : {}),
     });
     conn.notify('initialized');
+    void this.loadSkills(conn);
     return conn;
+  }
+
+  /** As skills do Codex são a lista de comandos dele: `skills/list`, só as ligadas. */
+  private async loadSkills(conn: Connection): Promise<void> {
+    try {
+      const result = await conn.request('skills/list', { cwds: [this.opts.cwd ?? process.cwd()] });
+      const skills = (result?.data ?? []).flatMap((entry: any) => entry.skills ?? []).filter((s: any) => s.enabled);
+      this.skills = new Map(skills.map((s: any) => [s.name, s.path]));
+      this.commands = skills.map((s: any) => ({
+        name: s.name,
+        description: s.interface?.shortDescription ?? s.shortDescription ?? s.description ?? '',
+      }));
+      this.onCommands?.(this.commands);
+    } catch {
+      // codex sem skills/list: fica sem lista, e "/nome" segue como texto
+    }
+  }
+
+  /** "/nome resto" com uma skill desse nome vira o que o terminal do Codex manda: "$nome resto" e a skill junto. */
+  private turnInput(prompt: string): object[] {
+    const text = (t: string) => ({ type: 'text', text: t, text_elements: [] });
+    const m = prompt.match(/^\/(\S+)([\s\S]*)$/);
+    const path = m ? this.skills.get(m[1]) : undefined;
+    if (!m || !path) return [text(prompt)];
+    return [text(`$${m[1]}${m[2]}`), { type: 'skill', name: m[1], path }];
   }
 
   /** O Codex chamou a ferramenta do duo: leva a mensagem ao Claude e devolve a resposta dele. */
@@ -277,7 +318,7 @@ export class CodexAgent implements Agent {
       conn.on(listener);
       conn.onClose(onClose);
       conn
-        .request('turn/start', { threadId, input: [{ type: 'text', text: prompt, text_elements: [] }] })
+        .request('turn/start', { threadId, input: this.turnInput(prompt) })
         .catch((e: unknown) => finish(() => reject(e instanceof Error ? e : new Error(String(e)))));
     });
   }

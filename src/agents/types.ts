@@ -24,6 +24,14 @@ export interface PeerRequest {
   signal: AbortSignal;
 }
 
+/** Um comando do próprio agente (`/nome`), para a lista que aparece quando você digita `@cla /`. */
+export interface AgentCommand {
+  name: string;
+  description: string;
+  /** o argumento que ele espera, quando o CLI informa */
+  hint?: string;
+}
+
 /** O que o rodapé mostra de cada um. */
 export interface AgentStats {
   /** modelo em uso, como o CLI informou; undefined = ainda não sabe (antes da primeira mensagem) */
@@ -42,6 +50,12 @@ export interface Agent {
   readonly stats: AgentStats;
   /** chamado a cada mudança em `stats` */
   onStats?: (stats: AgentStats) => void;
+  /** comandos do agente (do Claude, os do CLI; do Codex, as skills); vazio até ele subir */
+  readonly commands: AgentCommand[];
+  /** chamado quando a lista de comandos muda */
+  onCommands?: (commands: AgentCommand[]) => void;
+  /** sobe o processo já, sem mandar nada: a lista de comandos carrega antes da primeira mensagem */
+  warmUp(): void;
   /** id da conversa no CLI de origem (session_id do Claude / thread_id do Codex); undefined = ainda não começou */
   readonly resumeId: string | undefined;
   /** chamado assim que o id da conversa aparece ou muda: o duo grava na hora */
