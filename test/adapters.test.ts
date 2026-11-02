@@ -140,6 +140,34 @@ describe('ClaudeAgent', () => {
     expect(replies).toEqual(['sozinho: o Fog respondeu']);
   });
 
+  it('Remote Control: liga a ponte ao subir o processo e avisa o link', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude, remoteControl: true }));
+    const notices: string[] = [];
+    agent.onNotice = (ev) => notices.push(ev.text);
+    expect(await agent.send('oi', noop)).toBe('eco: oi');
+    expect(notices).toEqual(['Claude no Remote Control: https://claude.ai/code/session_falsa']);
+  });
+
+  it('Remote Control: o que você digita no app aparece como seu, e a resposta como turno dele', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude, remoteControl: true }));
+    const typed: string[] = [];
+    const replies: string[] = [];
+    agent.onRemoteMessage = (text) => typed.push(text);
+    agent.onOwnTurnReply = (text) => replies.push(text);
+    await agent.send('APP oi do celular', noop);
+    await vi.waitFor(() => expect(replies).toEqual(['eco: oi do celular']));
+    expect(typed).toEqual(['oi do celular']);
+    expect(await agent.send('e aqui?', noop)).toBe('eco: e aqui?');
+  });
+
+  it('sem Remote Control, não pede a ponte', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const notices: string[] = [];
+    agent.onNotice = (ev) => notices.push(ev.text);
+    await agent.send('oi', noop);
+    expect(notices).toEqual([]);
+  });
+
   it('o processo cai com a pergunta aberta: o pedido é cancelado', async () => {
     const agent = track(new ClaudeAgent({ bin: fakeClaude }));
     let signal: AbortSignal | undefined;

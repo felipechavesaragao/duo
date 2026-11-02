@@ -269,6 +269,23 @@ describe('turno que o agente abre sozinho', () => {
     await type(stdin, '/codex e você?');
     expect(codex.prompts[0]).toContain('### Claude\nO DEVIL APROVOU');
   });
+
+  it('o que você digita no app (Remote Control) aparece como seu, e o outro recebe como contexto', async () => {
+    const { claude, codex } = fakes();
+    const { stdin, frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    claude.onNotice!({ kind: 'text', text: 'Claude no Remote Control: https://claude.ai/code/session_x' });
+    claude.onRemoteMessage!('OI DO CELULAR');
+    claude.onOwnTurnReply!('RESPOSTA NO CELULAR');
+    await tick();
+    const shown = frames.join('\n');
+    expect(shown).toContain('Claude no Remote Control: https://claude.ai/code/session_x');
+    expect(shown).toContain('[pelo app, para o Claude] OI DO CELULAR');
+
+    await type(stdin, '/codex viu?');
+    expect(codex.prompts[0]).toContain('usuário → Claude\nOI DO CELULAR');
+    expect(codex.prompts[0]).toContain('### Claude\nRESPOSTA NO CELULAR');
+  });
 });
 
 describe('rodapé', () => {

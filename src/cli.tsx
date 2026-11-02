@@ -5,6 +5,7 @@ import { parseArgs } from 'node:util';
 import { App } from './app.js';
 import { ClaudeAgent } from './agents/claude.js';
 import { CodexAgent } from './agents/codex.js';
+import { remoteControlAtStartup } from './claudeSettings.js';
 import { newSessionData, Recorder, SessionStore, type SessionData } from './persist.js';
 import type { Target } from './router.js';
 
@@ -68,6 +69,8 @@ const agents = {
     permissionMode: values.yolo ? 'bypassPermissions' : values['claude-permission'],
     model: values['claude-model'],
     resumeId: data.claudeSessionId,
+    // como no terminal: se o seu settings liga o Remote Control, a conversa do Claude aparece no app
+    remoteControl: remoteControlAtStartup(process.cwd()),
   }),
   codex: new CodexAgent({
     sandbox: values.yolo ? undefined : values['codex-sandbox'],

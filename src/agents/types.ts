@@ -56,6 +56,10 @@ export interface Agent {
    */
   onOwnTurnEvent?: EmitFn;
   onOwnTurnReply?: (text: string) => void;
+  /** mensagem que entrou na conversa por fora do duo: você digitou no app, pelo Remote Control */
+  onRemoteMessage?: (text: string) => void;
+  /** aviso sobre o agente fora de qualquer turno (o Remote Control ligou, ou não ligou) */
+  onNotice?: EmitFn;
   /** Manda uma mensagem. Resolve com a resposta final em texto. Mensagens são enfileiradas. */
   send(prompt: string, emit: EmitFn): Promise<string>;
   /** Esquece a conversa: a próxima mensagem começa uma sessão nova. */

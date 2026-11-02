@@ -42,6 +42,8 @@ export interface ClaudeOptions {
   cwd?: string;
   /** conversa a retomar (session_id gravado pelo duo) */
   resumeId?: string;
+  /** liga o Remote Control em cada processo: a conversa aparece no app e no claude.ai/code, como no terminal */
+  remoteControl?: boolean;
   /** comando a executar; padrão ['claude']. Os testes trocam por um claude falso. */
   bin?: string[];
 }
@@ -61,6 +63,8 @@ interface Running {
   subagents: Set<string>;
   /** textos do turno que o CLI abriu sozinho, até o result dele */
   own: string[];
+  /** request_id do pedido que liga o Remote Control */
+  remoteControlRequest?: string;
 }
 
 interface Turn {
@@ -99,6 +103,11 @@ interface Turn {
  * nele: um `result` só para os dois. Com `--replay-user-messages` ele ecoa a mensagem (com o `uuid` que
  * mandamos) no ponto em que a lê; é esse eco que separa o turno dele do turno do duo.
  *
+ * Remote Control (medido em 02/11/2026, 2.1.316): no `-p` a opção `--remote-control` é ignorada, mas o
+ * `control_request` {subtype: "remote_control", enabled: true} liga a ponte (é o que o app desktop usa nas
+ * sessões dele): a resposta traz `session_url` e chegam `system/bridge_state` ready e connected. O que você
+ * digita no app entra na fila como uma mensagem; o eco dela tem um uuid que não é nosso.
+ *
  * Retomada que falha (medido em 02/11/2026, Claude Code 2.1.316): com um id inexistente ele manda
  * um `result` de erro SEM o `system/init`, escreve "No conversation found with session ID" no
  * stderr e sai sozinho ~1,4s depois, mesmo com o stdin aberto.
@@ -111,6 +120,8 @@ export class ClaudeAgent implements Agent {
   askPeer?: (req: PeerRequest) => Promise<string>;
   onOwnTurnEvent?: EmitFn;
   onOwnTurnReply?: (text: string) => void;
+  onRemoteMessage?: (text: string) => void;
+  onNotice?: EmitFn;
   onStats?: (stats: AgentStats) => void;
   readonly stats: AgentStats;
   private run?: Running;
@@ -189,6 +200,11 @@ export class ClaudeAgent implements Agent {
     proc.on('error', (err) => this.fail(run, new Error(`não consegui iniciar o claude: ${err.message}`)));
     proc.on('exit', (code) => this.onExit(run, code));
     this.run = run;
+    if (this.opts.remoteControl) {
+      run.remoteControlRequest = `duo-rc-${randomUUID()}`;
+      const request = { subtype: 'remote_control', enabled: true };
+      proc.stdin?.write(JSON.stringify({ type: 'control_request', request_id: run.remoteControlRequest, request }) + '\n');
+    }
     return run;
   }
 
@@ -229,6 +245,16 @@ export class ClaudeAgent implements Agent {
       run.asks.get(msg.request_id)?.abort();
       return;
     }
+    if (msg.type === 'control_response') {
+      const res = msg.response ?? {};
+      if (res.request_id !== run.remoteControlRequest) return;
+      if (res.subtype === 'success') {
+        this.onNotice?.({ kind: 'text', text: `Claude no Remote Control: ${res.response?.session_url ?? '(sem link)'}` });
+      } else {
+        this.onNotice?.({ kind: 'error', text: `não consegui ligar o Remote Control: ${res.error ?? 'sem motivo'}` });
+      }
+      return;
+    }
     if (msg.type === 'system' && msg.subtype === 'init') run.sawInit = true;
     const resumeFailed = msg.type === 'result' && msg.is_error && run.resumedWith !== undefined && !run.sawInit;
 
@@ -240,10 +266,15 @@ export class ClaudeAgent implements Agent {
 
     const turn = this.turn?.proc === run.proc ? this.turn : undefined;
     if (msg.type === 'user') {
-      // o eco da mensagem do duo: o turno que ele abriu sozinho (se havia) acabou de receber a mensagem
-      if (turn && msg.isReplay && msg.uuid === turn.uuid) {
+      if (!msg.isReplay) return;
+      if (turn && msg.uuid === turn.uuid) {
+        // o eco da mensagem do duo: o turno que ele abriu sozinho (se havia) acabou de receber a mensagem
         this.finishOwnTurn(run);
         turn.started = true;
+      } else if (this.opts.remoteControl && !msg.isSynthetic) {
+        // outra mensagem lida pelo CLI: só pode ter vindo do app, pelo Remote Control
+        const text = userText(msg.message?.content);
+        if (text) this.onRemoteMessage?.(text);
       }
       return;
     }
@@ -395,6 +426,17 @@ export class ClaudeAgent implements Agent {
         return { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: `o duo não trata ${message.method}` } };
     }
   }
+}
+
+/** O texto de uma mensagem do usuário: string, ou os blocos de texto dela. */
+function userText(content: any): string {
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text)
+    .join('\n')
+    .trim();
 }
 
 function resultError(msg: any): string {

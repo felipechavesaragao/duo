@@ -13,6 +13,9 @@
 //                   segundo plano termina: task_notification, init, a resposta dele e o result. Mensagem que
 //                   chega nesses 300ms entra no mesmo turno: eco dela, a resposta e um result só para os dois.
 // Com --replay-user-messages, ecoa cada mensagem lida (com o uuid dela), como o 2.1.316.
+// control_request "remote_control" → liga a ponte, como o 2.1.316: session_url na resposta e bridge_state.
+// "APP <texto>"    → responde, e logo depois chega <texto> como se você tivesse digitado no app (Remote
+//                   Control): o eco dela com um uuid que não é do duo, e um turno inteiro respondendo.
 // Toda resposta traz usage (contexto = 1000 × número da mensagem) e o result traz o contextWindow.
 import readline from 'node:readline';
 
@@ -87,11 +90,27 @@ if (resume === 'sumiu') {
       pending.delete(msg.response.request_id);
       return resolve?.(msg.response);
     }
+    if (msg.type === 'control_request' && msg.request.subtype === 'remote_control') {
+      const response = { session_url: 'https://claude.ai/code/session_falsa', bridge_session_id: 'cse_falsa' };
+      out({ type: 'system', subtype: 'bridge_state', state: 'ready', session_id: sid });
+      out({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id, response } });
+      return out({ type: 'system', subtype: 'bridge_state', state: 'connected', session_id: sid });
+    }
     if (own) return void own.push(msg);
     if (++n === 1) out({ type: 'system', subtype: 'init', session_id: sid, model });
     echo(msg);
     const text = msg.message.content;
     if (text === 'ARGS') return reply(`eco: ${JSON.stringify(args)}`);
+    if (text.startsWith('APP ')) {
+      reply('eco: ok');
+      setTimeout(() => {
+        const typed = { role: 'user', content: text.slice(4) };
+        out({ type: 'system', subtype: 'init', session_id: sid, model });
+        echo({ uuid: 'mensagem-do-app', message: typed });
+        reply(`eco: ${typed.content}`);
+      }, 100);
+      return;
+    }
     if (text.startsWith('SOZINHO ')) {
       reply('eco: lancei');
       setTimeout(() => ownTurn(text.slice(8)), 100);

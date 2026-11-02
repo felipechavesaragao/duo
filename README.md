@@ -62,6 +62,8 @@ No `/todos`, os dois respondem ao mesmo tempo e nenhum vê a resposta do outro �
 
 Quando um subagente ou comando do Claude em segundo plano termina, ele continua sozinho, sem mensagem sua. Esse turno aparece na janela como os outros, e a resposta entra no contexto do Codex.
 
+**Remote Control**: se o seu settings do Claude Code tem `"remoteControlAtStartup": true`, o duo liga o Remote Control na conversa do Claude, como o terminal faria (o `claude -p` que o duo usa não liga sozinho). A conversa aparece no app desktop e no claude.ai/code, e o link vai para a janela. O que você digitar lá aparece no duo como `[pelo app, para o Claude] …`, a resposta dele também, e o Codex recebe as duas como contexto.
+
 O Codex só recebe a ferramenta numa conversa nova: o app-server aceita ferramentas do cliente só ao abrir a conversa, não ao retomar. Uma conversa do Codex aberta por uma versão anterior do duo continua sem ela até um `/novo`.
 
 O **rodapé** mostra, para cada um, o modelo, os tokens no contexto da conversa (com o tamanho da janela do modelo) e quantos subagentes estão rodando.

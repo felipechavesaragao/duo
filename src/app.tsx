@@ -161,6 +161,13 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
         log.current.agentReply(agent.id, text, rec.data.shared);
         rec.saveSoon();
       };
+      // o que você digitou no app (Remote Control): aparece aqui e o outro recebe como contexto
+      agent.onRemoteMessage = (text) => {
+        add('voce', 'text', `[pelo app, para o ${agent.name}] ${text}`);
+        log.current.userMessage([agent.id], text, rec.data.shared);
+        rec.saveSoon();
+      };
+      agent.onNotice = (ev) => add('sistema', ev.kind, ev.text);
       agent.askPermission = ({ text, signal }) =>
         new Promise<boolean>((resolve) => {
           const drop = () => setAsks((q) => q.filter((a) => a !== ask));
