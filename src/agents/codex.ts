@@ -1,7 +1,37 @@
 import spawn from 'cross-spawn';
 import type { ChildProcess } from 'node:child_process';
 import { killTree, onJsonLines, stderrTail } from './process.js';
-import { createQueue, ResumeFailedError, truncate, type Agent, type EmitFn } from './types.js';
+import {
+  createQueue,
+  patchStats,
+  ResumeFailedError,
+  truncate,
+  type Agent,
+  type AgentStats,
+  type EmitFn,
+  type PeerRequest,
+} from './types.js';
+
+/** A ferramenta que o duo dá ao Codex para falar com o Claude (dynamicTools do app-server). */
+const PEER_TOOL = {
+  type: 'function',
+  name: 'falar_com_claude',
+  description:
+    'Manda uma mensagem ao Claude (o Cla), o outro agente na mesma janela do duo, e espera a resposta dele, que volta ' +
+    'aqui. O usuário acompanha a conversa na janela. O Claude vê a janela compartilhada como contexto, mas não a sua ' +
+    'conversa interna: escreva a mensagem completa (o que fazer, onde está, o que você quer de volta). Pode levar minutos.',
+  inputSchema: {
+    type: 'object',
+    properties: { mensagem: { type: 'string', description: 'o que dizer ao Claude' } },
+    required: ['mensagem'],
+  },
+};
+
+const PEER_HINT =
+  '[duo] Você está no duo, numa janela compartilhada com o usuário e com o Claude (o Cla). Para falar com o Claude ' +
+  '(pedir revisão, segunda opinião ou uma tarefa), use a ferramenta falar_com_claude: a resposta dele volta para você, ' +
+  'e o usuário acompanha tudo na janela. Se a ferramenta não estiver na sua lista, esta conversa começou antes dela ' +
+  'existir: avise o usuário que só uma conversa nova (/novo no duo) a recebe.';
 
 export interface CodexOptions {
   /** read-only | workspace-write | danger-full-access. Vazio = livre: sem sandbox e sem aprovações. */
@@ -29,19 +59,35 @@ const RPC_TIMEOUT_MS = 120_000;
  * - conversa aberta em outro processo: "… already has an active writer". Com o duo aberto, a conversa é
  *   dele: o Codex oficial recebe esse erro até o duo fechar (a escrita é liberada quando o processo sai);
  * - retomar com o histórico inteiro está obsoleto (deprecationNotice): por isso o excludeTurns.
+ *
+ * Rodapé (medido em 02/11/2026, 0.166.0): o modelo vem na resposta do thread/start e do thread/resume;
+ * o contexto em `thread/tokenUsage/updated` (`last.totalTokens` e `modelContextWindow`), que chega
+ * também para a conversa de cada subagente; subagente aparece como item `subAgentActivity` na conversa
+ * principal, com kind "started" e depois "completed" para o mesmo `agentThreadId`.
+ *
+ * Falar com o Claude (medido em 02/11/2026, 0.166.0): com `capabilities.experimentalApi` no initialize, o
+ * thread/start aceita `dynamicTools`; o Codex chama a ferramenta com o pedido `item/tool/call` e espera
+ * `{ contentItems, success }`. A ferramenta fica gravada na conversa e volta no thread/resume, mas só o
+ * thread/start a aceita: conversa aberta sem ela (duo antigo) continua sem, mesmo retomada.
  */
 export class CodexAgent implements Agent {
   readonly id = 'codex' as const;
   readonly name = 'Codex';
   onSessionId?: (id: string) => void;
+  askPeer?: (req: PeerRequest) => Promise<string>;
+  onStats?: (stats: AgentStats) => void;
+  readonly stats: AgentStats;
   private threadId?: string;
   private conn?: Connection;
   /** a conversa já foi aberta (thread/start ou thread/resume) no processo atual */
   private opened = false;
+  /** agentThreadId dos subagentes rodando */
+  private subagents = new Set<string>();
   private enqueue = createQueue();
 
   constructor(private readonly opts: CodexOptions) {
     this.threadId = opts.resumeId;
+    this.stats = { model: opts.model, subagents: 0 };
   }
 
   get resumeId(): string | undefined {
@@ -55,6 +101,7 @@ export class CodexAgent implements Agent {
   reset(): void {
     this.closeConnection();
     this.threadId = undefined;
+    patchStats(this, { contextTokens: undefined });
   }
 
   dispose(): void {
@@ -70,6 +117,7 @@ export class CodexAgent implements Agent {
       approvalPolicy: 'never',
       sandbox: this.opts.sandbox ?? 'danger-full-access',
       ...(this.opts.model ? { model: this.opts.model } : {}),
+      ...(this.askPeer ? { developerInstructions: PEER_HINT } : {}),
     };
   }
 
@@ -89,11 +137,41 @@ export class CodexAgent implements Agent {
         this.conn = undefined;
         this.opened = false;
       }
+      if (!this.conn) {
+        this.subagents.clear(); // os subagentes morreram junto
+        patchStats(this, { subagents: 0 });
+      }
     });
+    conn.on((method, p) => this.trackStats(method, p)); // a conexão toda: subagente pode terminar fora do turno
+    conn.handleRequest = (method, p) => (method === 'item/tool/call' ? this.answerTool(conn, p) : undefined);
     this.conn = conn;
-    await conn.request('initialize', { clientInfo: { name: 'duo', title: 'duo', version: '0.1.0' } });
+    await conn.request('initialize', {
+      clientInfo: { name: 'duo', title: 'duo', version: '0.1.0' },
+      // dynamicTools (a ferramenta de falar com o Claude) é da API experimental
+      ...(this.askPeer ? { capabilities: { experimentalApi: true, requestAttestation: false } } : {}),
+    });
     conn.notify('initialized');
     return conn;
+  }
+
+  /** O Codex chamou a ferramenta do duo: leva a mensagem ao Claude e devolve a resposta dele. */
+  private async answerTool(conn: Connection, p: any): Promise<object> {
+    const reply = (text: string, success: boolean) => ({ contentItems: [{ type: 'inputText', text }], success });
+    const text = String(p.arguments?.mensagem ?? '').trim();
+    if (p.tool !== PEER_TOOL.name || !text || !this.askPeer) {
+      return reply('chamada inválida: a ferramenta do duo precisa de uma mensagem para o Claude', false);
+    }
+    const ctrl = new AbortController();
+    const abort = () => ctrl.abort(); // o processo caiu: ninguém mais espera a resposta
+    conn.onClose(abort);
+    try {
+      const answer = await this.askPeer({ text, signal: ctrl.signal });
+      return reply(`O Claude respondeu:\n\n${answer.trim() || '(sem texto)'}`, true);
+    } catch (e) {
+      return reply(e instanceof Error ? e.message : String(e), false);
+    } finally {
+      conn.offClose(abort);
+    }
   }
 
   private async openThread(conn: Connection): Promise<string> {
@@ -103,7 +181,10 @@ export class CodexAgent implements Agent {
     try {
       result = resumedWith
         ? await conn.request('thread/resume', { threadId: resumedWith, excludeTurns: true, ...this.threadParams() })
-        : await conn.request('thread/start', this.threadParams());
+        : await conn.request('thread/start', {
+            ...this.threadParams(),
+            ...(this.askPeer ? { dynamicTools: [PEER_TOOL] } : {}), // só o thread/start aceita
+          });
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       if (resumedWith && /no rollout found|invalid session id/i.test(message)) {
@@ -121,8 +202,26 @@ export class CodexAgent implements Agent {
       this.threadId = id;
       this.onSessionId?.(id);
     }
+    if (typeof result.model === 'string') patchStats(this, { model: result.model });
     this.opened = true;
     return id;
+  }
+
+  /** Contexto e subagentes da conversa principal, para o rodapé. */
+  private trackStats(method: string, p: any): void {
+    if (!this.threadId || p.threadId !== this.threadId) return;
+    if (method === 'thread/tokenUsage/updated') {
+      const usage = p.tokenUsage ?? {};
+      patchStats(this, {
+        contextTokens: usage.last?.totalTokens,
+        ...(typeof usage.modelContextWindow === 'number' ? { contextWindow: usage.modelContextWindow } : {}),
+      });
+    } else if ((method === 'item/started' || method === 'item/completed') && p.item?.type === 'subAgentActivity') {
+      const { kind, agentThreadId } = p.item;
+      if (kind === 'started') this.subagents.add(agentThreadId);
+      else if (kind === 'completed' || kind === 'interrupted') this.subagents.delete(agentThreadId);
+      patchStats(this, { subagents: this.subagents.size });
+    }
   }
 
   private async runTurn(prompt: string, emit: EmitFn): Promise<string> {
@@ -192,7 +291,9 @@ class Connection {
   private readonly listeners = new Set<Listener>();
   private readonly closeHandlers = new Set<(why: Error) => void>();
   private readonly tail: () => string;
-  /** chamado quando o servidor pede algo ao cliente (aprovação, pergunta): o duo recusa */
+  /** pedido do servidor que o duo atende (a ferramenta do duo); undefined = não atende */
+  handleRequest?: (method: string, params: any) => Promise<unknown> | undefined;
+  /** chamado quando o servidor pede algo que o duo não atende (aprovação, pergunta): o duo recusa */
   onServerRequest?: (method: string) => void;
   closed = false;
 
@@ -256,6 +357,14 @@ class Connection {
       if (msg.error) p.reject(new Error(msg.error.message ?? JSON.stringify(msg.error)));
       else p.resolve(msg.result);
     } else if (msg.id !== undefined) {
+      const handled = this.handleRequest?.(String(msg.method), msg.params ?? {});
+      if (handled) {
+        handled.then(
+          (result) => this.write({ id: msg.id, result }),
+          (e: unknown) => this.write({ id: msg.id, error: { code: -32603, message: String(e) } }),
+        );
+        return;
+      }
       // Pedido do servidor. Com approvalPolicy "never" não deveria vir; se vier, recusa para o turno não travar.
       this.onServerRequest?.(String(msg.method));
       this.write({ id: msg.id, error: { code: -32601, message: 'o duo não responde a este pedido' } });

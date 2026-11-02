@@ -164,4 +164,55 @@ describe('SharedLog', () => {
     log.agentReply('claude', 'ok', true);
     expect(turn(log, ['claude'], 'seguinte').claude).toBe('seguinte'); // amnésia curada
   });
+
+  it('o Claude chama o Codex: nenhum dos dois recebe de novo o que já veio direto', () => {
+    const log = new SharedLog();
+    turn(log, ['claude'], 'PEDIDO-AO-CLAUDE');
+    log.agentReply('claude', 'PLANO-DO-CLAUDE', true);
+
+    // a chamada sai no meio do turno do Claude
+    const idx = log.agentMessage('claude', 'codex', 'REVISA-O-PLANO', true);
+    const p = log.prepare('codex', 'REVISA-O-PLANO', true, idx, 'claude');
+    expect(p.prompt).toContain('### Claude\nPLANO-DO-CLAUDE');
+    expect(p.prompt).toMatch(/Mensagem do Claude para você:\nREVISA-O-PLANO$/);
+    expect(p.prompt.split('REVISA-O-PLANO').length - 1).toBe(1);
+    log.delivered('codex', p);
+    log.agentReply('codex', 'PARECER-DO-CODEX', true, 'claude');
+
+    // o Claude recebeu o parecer pela ferramenta: não volta no contexto dele
+    expect(turn(log, ['claude'], 'e agora?').claude).toBe('e agora?');
+    // e o Codex não recebe de novo a chamada nem a própria resposta, só o que perdeu depois
+    const next = turn(log, ['codex'], 'oi').codex;
+    expect(next).toContain('usuário → Claude\ne agora?');
+    expect(next).not.toContain('REVISA-O-PLANO');
+    expect(next).not.toContain('PARECER-DO-CODEX');
+  });
+
+  it('o Claude parou de esperar: a resposta do Codex vai no contexto dele na próxima mensagem', () => {
+    const log = new SharedLog();
+    turn(log, ['claude'], 'começa');
+    const idx = log.agentMessage('claude', 'codex', 'REVISA', true);
+    log.delivered('codex', log.prepare('codex', 'REVISA', true, idx, 'claude'));
+    log.agentReply('codex', 'PARECER', true); // sem replyTo: ninguém recebeu
+    expect(turn(log, ['claude'], 'e?').claude).toContain('### Codex\nPARECER');
+  });
+
+  it('quem perdeu a memória vê a chamada que fez, com seta', () => {
+    const log = new SharedLog();
+    turn(log, ['claude'], 'começa');
+    log.agentMessage('claude', 'codex', 'REVISA', true);
+    log.agentReply('codex', 'PARECER', true, 'claude');
+    log.forget('claude');
+    const p = turn(log, ['claude'], 'de novo').claude;
+    expect(p).toContain('### você (Claude) → Codex, antes\nREVISA');
+    expect(p).toContain('### Codex → Claude\nPARECER');
+  });
+
+  it('chamada no modo privado: só os dois veem', () => {
+    const log = new SharedLog();
+    const idx = log.agentMessage('claude', 'codex', 'SEGREDO', false);
+    log.agentReply('codex', 'RESPOSTA-SECRETA', false, 'claude');
+    expect(log.state.items[idx].onlyFor).toEqual(['claude', 'codex']);
+    expect(log.state.items.at(-1)?.onlyFor).toEqual(['codex', 'claude']);
+  });
 });

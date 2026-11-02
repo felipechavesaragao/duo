@@ -1,9 +1,12 @@
 import type { AgentId } from './agents/types.js';
 
-/** Um acontecimento da janela: uma mensagem sua ou uma resposta final de um agente. */
+/** Um acontecimento da janela: uma mensagem sua, uma resposta final de um agente, ou um agente chamando o outro. */
 export interface LogItem {
   from: 'voce' | AgentId;
-  /** para quem você mandou (só quando from = 'voce') */
+  /**
+   * Para quem: a sua mensagem, a mensagem de um agente ao outro (ferramenta do duo) ou a resposta que voltou
+   * a quem chamou. Quem está aqui já recebeu o texto direto, então ele não volta no contexto dele.
+   */
   to?: AgentId[];
   text: string;
   /** dito no modo privado: só esses agentes podem ver, nem depois de voltar ao compartilhado */
@@ -57,13 +60,19 @@ export class SharedLog {
     return this.state.items.length - 1;
   }
 
+  /** Um agente chamou o outro pela ferramenta do duo. Devolve a posição, como userMessage. */
+  agentMessage(from: AgentId, to: AgentId, text: string, shared: boolean): number {
+    this.state.items.push({ from, to: [to], text: clip(text), onlyFor: shared ? undefined : [from, to] });
+    return this.state.items.length - 1;
+  }
+
   /**
    * `msgIndex` = posição da mensagem (de userMessage). O agente vê a janela como ela estava quando você
    * apertou Enter: o que chegou depois fica para a próxima mensagem dele. É isso que deixa as respostas
    * do @todos independentes — nenhum dos dois vê a resposta do outro à MESMA mensagem, mesmo que um
    * deles só comece depois (fila ocupada com uma mensagem anterior).
    */
-  prepare(id: AgentId, text: string, shared: boolean, msgIndex?: number): Prepared {
+  prepare(id: AgentId, text: string, shared: boolean, msgIndex?: number, sender: 'voce' | AgentId = 'voce'): Prepared {
     if (!shared) return { prompt: text, upTo: this.state.seen[id], intro: false, amnesia: false };
     const end = msgIndex ?? this.state.items.length; // contexto = [seen, end); a mensagem vai no fim
     const upTo = msgIndex === undefined ? end : msgIndex + 1;
@@ -72,7 +81,7 @@ export class SharedLog {
     const from = this.state.seen[id];
     const missed = this.state.items.slice(from, end).filter((item) => {
       if (item.onlyFor && !item.onlyFor.includes(id)) return false;
-      const toMe = item.from === 'voce' && item.to?.includes(id);
+      const toMe = item.to?.includes(id);
       if (amnesia) return true;
       return item.from !== id && !toMe;
     });
@@ -94,18 +103,20 @@ export class SharedLog {
     }
     if (missed.length > 0) {
       const lines = missed.map((item) => {
+        const to = item.to ? ` → ${item.to.map((t) => NAMES[t]).join(' e ')}` : '';
         const who =
           item.from === 'voce'
-            ? `usuário → ${item.to?.map((t) => NAMES[t]).join(' e ')}`
+            ? `usuário${to}`
             : item.from === id
-              ? `você (${NAMES[id]}), antes`
-              : NAMES[item.from];
+              ? `você (${NAMES[id]})${to}, antes`
+              : `${NAMES[item.from]}${to}`;
         const body = item.text.length > MAX_ITEM_CHARS ? item.text.slice(0, MAX_ITEM_CHARS) + '\n[…cortado]' : item.text;
         return `### ${who}\n${body}`;
       });
       parts.push(`[duo] Contexto da janela desde a sua última mensagem:\n\n${lines.join('\n\n')}\n\n[duo] fim do contexto.`);
     }
-    const prompt = parts.length === 0 ? text : [...parts, `Mensagem do usuário para você:\n${text}`].join('\n\n');
+    const by = sender === 'voce' ? 'do usuário' : `do ${NAMES[sender]}`;
+    const prompt = parts.length === 0 ? text : [...parts, `Mensagem ${by} para você:\n${text}`].join('\n\n');
     return { prompt, upTo, intro, amnesia };
   }
 
@@ -116,11 +127,15 @@ export class SharedLog {
     if (prepared.amnesia && this.state.amnesia) this.state.amnesia[id] = false;
   }
 
-  /** `shared` = o modo em que a mensagem que gerou esta resposta foi enviada. */
-  agentReply(id: AgentId, text: string, shared: boolean): void {
+  /**
+   * `shared` = o modo em que a mensagem que gerou esta resposta foi enviada. `replyTo` = o agente que chamou
+   * e já recebeu a resposta direto (ferramenta do duo): ela não volta no contexto dele.
+   */
+  agentReply(id: AgentId, text: string, shared: boolean, replyTo?: AgentId): void {
     if (!text.trim()) return;
     // Não precisa avançar seen[id]: prepare() já ignora o que veio do próprio agente.
-    this.state.items.push({ from: id, text: clip(text), onlyFor: shared ? undefined : [id] });
+    const to = replyTo ? [replyTo] : undefined;
+    this.state.items.push({ from: id, to, text: clip(text), onlyFor: shared ? undefined : [id, ...(to ?? [])] });
   }
 
   /** O agente perdeu a memória (conversa nova): a próxima mensagem leva a janela inteira. */

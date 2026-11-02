@@ -42,6 +42,87 @@ describe('ClaudeAgent', () => {
     expect(await agent.send('oi de novo', noop)).toBe('eco: oi de novo');
     expect(agent.resumeId).toBe('sessao-nova');
   });
+
+  it('rodapé: modelo, contexto da conversa principal e subagentes rodando', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const seen = vi.fn();
+    agent.onStats = seen;
+    expect(agent.stats).toEqual({ model: undefined, subagents: 0 });
+    await agent.send('oi', noop);
+    expect(agent.stats).toEqual({ model: 'claude-falso-1', contextTokens: 1000, contextWindow: 200000, subagents: 0 });
+    await agent.send('AGENTE', noop);
+    expect(agent.stats).toMatchObject({ contextTokens: 2000, subagents: 1 }); // o uso do subagente não conta
+    await agent.send('FIM', noop);
+    expect(agent.stats.subagents).toBe(0);
+    expect(seen).toHaveBeenLastCalledWith(agent.stats);
+    agent.reset();
+    expect(agent.stats).toMatchObject({ contextTokens: undefined, subagents: 0 });
+  });
+
+  it('falar com o Codex: a ferramenta do duo leva a mensagem e devolve a resposta dele', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const asked: string[] = [];
+    agent.askPeer = async (req) => (asked.push(req.text), 'pode subir');
+    const events: string[] = [];
+    const answer = await agent.send('CHAMA revisa o plano', (ev) => events.push(ev.kind));
+    expect(asked).toEqual(['revisa o plano']);
+    expect(answer).toBe('eco: [falar_com_codex] O Codex respondeu:\n\npode subir');
+    expect(events).not.toContain('tool'); // a tela mostra a mensagem inteira, não a linha da ferramenta
+    const args = await agent.send('ARGS', noop);
+    expect(args).toContain('--mcp-config');
+    expect(args).toContain('--append-system-prompt');
+  });
+
+  it('o Codex falha: a ferramenta devolve erro e o turno do Claude segue', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    agent.askPeer = async () => {
+      throw new Error('o Codex não conseguiu responder');
+    };
+    expect(await agent.send('CHAMA oi', noop)).toBe('eco: [falar_com_codex erro] o Codex não conseguiu responder');
+  });
+
+  it('sem ninguém do outro lado, o Claude nem ganha a ferramenta', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    expect(await agent.send('CHAMA oi', noop)).toBe('eco: sem a ferramenta do duo');
+  });
+
+  it('pedido de permissão chega a você: permitir roda o comando inteiro, sem aviso de negado', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const asked: string[] = [];
+    agent.askPermission = async (req) => (asked.push(req.text), true);
+    const events: string[] = [];
+    const cmd = 'cd "C:/projeto" && git push origin HEAD:master 2>&1 | tail -2';
+    expect(await agent.send(`PEDE ${cmd}`, (ev) => events.push(ev.kind))).toBe(`eco: rodei ${cmd}`);
+    expect(asked).toEqual([`Bash ${cmd}`]); // inteiro: você vê o que está aprovando
+    expect(events).not.toContain('error');
+  });
+
+  it('você nega: o Claude recebe o motivo e o duo não repete como "permissão negada"', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    agent.askPermission = async () => false;
+    const errors: string[] = [];
+    const answer = await agent.send('PEDE git push', (ev) => ev.kind === 'error' && errors.push(ev.text));
+    expect(answer).toBe('eco: negado (O usuário negou pela janela do duo.)');
+    expect(errors).toEqual([]);
+  });
+
+  it('sem ninguém para perguntar, nega e avisa como antes', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const errors: string[] = [];
+    await agent.send('PEDE git push', (ev) => ev.kind === 'error' && errors.push(ev.text));
+    expect(errors).toEqual(['permissão negada: Bash git push (veja --claude-permission)']);
+  });
+
+  it('o processo cai com a pergunta aberta: o pedido é cancelado', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    let signal: AbortSignal | undefined;
+    agent.askPermission = (req) => ((signal = req.signal), new Promise<boolean>(() => undefined));
+    const turn = agent.send('PEDE git push', noop).catch((e: Error) => e);
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    agent.reset();
+    await vi.waitFor(() => expect(signal!.aborted).toBe(true));
+    expect(await turn).toBeInstanceOf(Error);
+  });
 });
 
 describe('CodexAgent (app-server)', () => {
@@ -57,6 +138,45 @@ describe('CodexAgent (app-server)', () => {
     expect(pid2).toBe(pid1); // igual ao Claude: o Codex fica aberto
     expect(seen).toHaveBeenCalledTimes(1);
     expect(seen).toHaveBeenCalledWith('thread-nova');
+  });
+
+  it('rodapé: modelo, contexto da conversa principal e subagentes rodando', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    await agent.send('oi', noop);
+    expect(agent.stats).toEqual({ model: 'gpt-falso', contextTokens: 5000, contextWindow: 475000, subagents: 0 });
+    await agent.send('AGENTE', noop);
+    expect(agent.stats).toMatchObject({ contextTokens: 10000, subagents: 1 }); // a conversa do filho não conta
+    await agent.send('FIM', noop);
+    expect(agent.stats.subagents).toBe(0);
+    agent.reset();
+    expect(agent.stats.contextTokens).toBeUndefined();
+  });
+
+  it('falar com o Claude: a ferramenta do duo leva a mensagem e devolve a resposta dele', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    const asked: string[] = [];
+    agent.askPeer = async (req) => (asked.push(req.text), 'concordo');
+    const errors: string[] = [];
+    const answer = await agent.send('CHAMA revisa o diff', (ev) => ev.kind === 'error' && errors.push(ev.text));
+    expect(asked).toEqual(['revisa o diff']);
+    expect(answer).toBe('eco: [falar_com_claude] O Claude respondeu:\n\nconcordo');
+    expect(errors).toEqual([]); // não é tratado como pedido recusado
+    expect(JSON.parse(await agent.send('INIT', noop)).capabilities).toMatchObject({ experimentalApi: true });
+    expect(JSON.parse(await agent.send('PARAMS', noop)).developerInstructions).toContain('falar_com_claude');
+  });
+
+  it('o Claude falha: a ferramenta devolve erro e o turno do Codex segue', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    agent.askPeer = async () => {
+      throw new Error('o Claude não conseguiu responder');
+    };
+    expect(await agent.send('CHAMA oi', noop)).toBe('eco: [falar_com_claude erro] o Claude não conseguiu responder');
+  });
+
+  it('sem ninguém do outro lado, o Codex nem ganha a ferramenta (nem a API experimental)', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    expect(await agent.send('CHAMA oi', noop)).toBe('eco: sem a ferramenta do duo');
+    expect(JSON.parse(await agent.send('INIT', noop))).not.toHaveProperty('capabilities');
   });
 
   it('retoma pelo id guardado, sem histórico inteiro e sem trocar de conversa', async () => {

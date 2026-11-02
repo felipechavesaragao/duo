@@ -4,20 +4,26 @@ import path from 'node:path';
 import React from 'react';
 import { describe, expect, it } from 'vitest';
 import { render } from 'ink-testing-library';
-import { App } from '../src/app.js';
-import { ResumeFailedError, type Agent, type AgentId, type EmitFn } from '../src/agents/types.js';
+import { App, footerText } from '../src/app.js';
+import { ResumeFailedError, type Agent, type AgentId, type AgentStats, type EmitFn } from '../src/agents/types.js';
 import { newSessionData, Recorder, SessionStore } from '../src/persist.js';
 
 class FakeAgent implements Agent {
   prompts: string[] = [];
   resumeId: string | undefined = undefined;
   onSessionId?: (id: string) => void;
+  askPermission?: Agent['askPermission'];
+  askPeer?: Agent['askPeer'];
+  stats: AgentStats = { subagents: 0 };
+  onStats?: (stats: AgentStats) => void;
   /** próximas chamadas que devem falhar com "conversa não existe" */
   failResume = 0;
   /** respostas roteirizadas, na ordem; '!erro' faz aquela resposta falhar */
   script: string[] = [];
   /** demora de cada resposta, para dar tempo de digitar algo no meio */
   delayMs = 0;
+  /** roda no meio do turno, antes da resposta (ex.: chamar o outro pela ferramenta do duo) */
+  during?: () => Promise<void>;
 
   constructor(
     readonly id: AgentId,
@@ -36,6 +42,7 @@ class FakeAgent implements Agent {
       this.onSessionId?.(this.resumeId);
     }
     if (this.delayMs) await new Promise((r) => setTimeout(r, this.delayMs));
+    await this.during?.();
     const scripted = this.script.shift();
     if (scripted === '!erro') throw new Error('caiu');
     emit({ kind: 'tool', text: 'Bash ls' });
@@ -182,6 +189,135 @@ describe('App', () => {
     await type(stdin, '@codex segunda');
     expect(codex.prompts[0]).toContain('Claude responde 1');
     expect(codex.prompts[1]).toContain('Claude responde 1'); // não se perdeu com a falha
+  });
+});
+
+describe('o Claude chama o Codex', () => {
+  it('vira um turno do Codex na janela e a resposta volta para o Claude, sem repetir no contexto dele', async () => {
+    const { claude, codex } = fakes();
+    const { stdin, frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    await type(stdin, 'faz o plano');
+
+    const answer = await claude.askPeer!({ text: 'revisa o plano', signal: new AbortController().signal });
+    expect(answer).toBe('Codex responde 1');
+    expect(codex.prompts[0]).toContain('[duo] O Claude chamou você pela ferramenta do duo');
+    expect(codex.prompts[0]).toContain('### Claude\nClaude responde 1'); // o contexto da janela foi junto
+    expect(codex.prompts[0]).toMatch(/Mensagem do Claude para você:\n[\s\S]*revisa o plano$/);
+    const shown = frames.join('\n');
+    expect(shown).toContain('[para o Codex] revisa o plano');
+    expect(shown).toContain('Codex responde 1');
+
+    await type(stdin, 'e agora?');
+    expect(claude.prompts[1]).toBe('e agora?'); // a resposta já tinha chegado pela ferramenta
+  });
+
+  it('o Codex chama o Claude pelo mesmo caminho', async () => {
+    const { claude, codex } = fakes();
+    const { frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    const answer = await codex.askPeer!({ text: 'confere o teste', signal: new AbortController().signal });
+    expect(answer).toBe('Claude responde 1');
+    expect(claude.prompts[0]).toContain('[duo] O Codex chamou você pela ferramenta do duo');
+    expect(frames.join('\n')).toContain('[para o Claude] confere o teste');
+  });
+
+  it('quem está esperando não pode ser chamado de volta: recusa em vez de travar os dois', async () => {
+    const { claude, codex } = fakes();
+    render(<App agents={{ claude, codex }} />);
+    await tick();
+    const signal = new AbortController().signal;
+    let refused = '';
+    codex.during = async () => {
+      codex.during = undefined;
+      // no meio da resposta ao Claude, o Codex tenta chamá-lo de volta
+      await codex.askPeer!({ text: 'uma dúvida', signal }).catch((e: Error) => (refused = e.message));
+    };
+    expect(await claude.askPeer!({ text: 'revisa', signal })).toBe('Codex responde 1');
+    expect(refused).toContain('o Claude está esperando uma resposta sua');
+    expect(claude.prompts).toHaveLength(0); // a chamada de volta não entrou na fila do Claude
+
+    // terminou a chamada: o Codex pode chamar o Claude normalmente
+    expect(await codex.askPeer!({ text: 'agora sim', signal })).toBe('Claude responde 1');
+  });
+
+  it('o Codex falha: a ferramenta recebe o erro', async () => {
+    const { claude, codex } = fakes();
+    codex.script = ['!erro'];
+    render(<App agents={{ claude, codex }} />);
+    await tick();
+    await expect(claude.askPeer!({ text: 'oi', signal: new AbortController().signal })).rejects.toThrow(
+      'o Codex não conseguiu responder',
+    );
+  });
+});
+
+describe('rodapé', () => {
+  it('texto de cada um: modelo, contexto e subagentes', () => {
+    expect(footerText({ subagents: 0 })).toBe('modelo ? · — tokens · sem agent');
+    expect(footerText({ model: 'claude-opus-5-5', contextTokens: 64_300, contextWindow: 1_000_000, subagents: 1 })).toBe(
+      'claude-opus-5-5 · 64k/1M tokens (6%) · 1 agent rodando',
+    );
+    expect(footerText({ model: 'gpt-6.1-sol', contextTokens: 950, contextWindow: 1_500_000, subagents: 2 })).toBe(
+      'gpt-6.1-sol · 950/1,5M tokens (0%) · 2 agents rodando',
+    );
+    expect(footerText({ model: 'x', contextTokens: 12_000, subagents: 0 })).toBe('x · 12k tokens · sem agent');
+  });
+
+  it('mostra os dois e acompanha cada mudança', async () => {
+    const { claude, codex } = fakes();
+    claude.stats = { model: 'claude-opus-5-5', subagents: 0 };
+    const { lastFrame } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    expect(lastFrame()).toContain('Claude claude-opus-5-5 · — tokens · sem agent\nCodex  modelo ? · — tokens · sem agent');
+    codex.onStats!({ model: 'gpt-6.1-sol', contextTokens: 17_000, contextWindow: 475_000, subagents: 1 });
+    await tick();
+    expect(lastFrame()).toContain('Codex  gpt-6.1-sol · 17k/475k tokens (4%) · 1 agent rodando');
+  });
+});
+
+describe('pedido de permissão', () => {
+  it('a caixa de texto vira a pergunta, responde em ordem e devolve o que você digitava', async () => {
+    const { claude, codex } = fakes();
+    const { stdin, lastFrame, frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    stdin.write('rascunho meu');
+    await tick();
+
+    const signal = new AbortController().signal;
+    const first = claude.askPermission!({ text: 'Bash git push origin HEAD:master', signal });
+    const second = codex.askPermission!({ text: 'Bash git push origin producao', signal });
+    await tick();
+    expect(lastFrame()).toContain('? Claude pede permissão (+1 na fila): Bash git push origin HEAD:master');
+    expect(lastFrame()).toContain('permitir? s/n ›');
+
+    await type(stdin, 'segue'); // não é s nem n: não decide nada
+    expect(frames.join('\n')).toContain('responda s para permitir ou n para negar');
+    await type(stdin, 's');
+    expect(await first).toBe(true);
+    expect(lastFrame()).toContain('? Codex pede permissão: Bash git push origin producao');
+    await type(stdin, 'n');
+    expect(await second).toBe(false);
+
+    const all = frames.join('\n');
+    expect(all).toContain('você permitiu: Bash git push origin HEAD:master');
+    expect(all).toContain('você negou: Bash git push origin producao');
+    expect(lastFrame()).toContain('/claude › rascunho meu');
+  });
+
+  it('pedido cancelado (o processo caiu) sai da tela e vale como não', async () => {
+    const { claude, codex } = fakes();
+    const { lastFrame, frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    const ctrl = new AbortController();
+    const pending = claude.askPermission!({ text: 'Bash git push', signal: ctrl.signal });
+    await tick();
+    expect(lastFrame()).toContain('pede permissão');
+    ctrl.abort();
+    expect(await pending).toBe(false);
+    await tick();
+    expect(lastFrame()).not.toContain('pede permissão');
+    expect(frames.join('\n')).toContain('pedido de permissão cancelado: Bash git push');
   });
 });
 

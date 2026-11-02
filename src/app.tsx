@@ -1,7 +1,14 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Box, Static, Text, useApp, useStdout } from 'ink';
 import TextInput from 'ink-text-input';
-import { createQueue, ResumeFailedError, truncate, type Agent, type AgentId } from './agents/types.js';
+import {
+  createQueue,
+  ResumeFailedError,
+  truncate,
+  type Agent,
+  type AgentId,
+  type AgentStats,
+} from './agents/types.js';
 import {
   markInterrupted,
   newSessionData,
@@ -17,6 +24,40 @@ import { SharedLog } from './shared.js';
 
 interface Entry extends ScreenEntry {
   id: number;
+}
+
+/** Um pedido de permissão esperando a sua resposta. */
+interface Ask {
+  who: AgentId;
+  text: string;
+  answer: (ok: boolean) => void;
+}
+
+const YES = ['s', 'sim'];
+const NO = ['n', 'não', 'nao'];
+
+/** 950, 12k, 1M, 1,5M */
+function shortCount(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
+  return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '').replace('.', ',')}M`;
+}
+
+/** Uma metade do rodapé: "claude-opus-5-5 · 64k/1M tokens (6%) · 1 agent rodando". */
+export function footerText(s: AgentStats): string {
+  const model = s.model ?? 'modelo ?';
+  let tokens = '— tokens';
+  if (s.contextTokens !== undefined) {
+    tokens = shortCount(s.contextTokens);
+    if (s.contextWindow) {
+      tokens += `/${shortCount(s.contextWindow)} tokens (${Math.round((100 * s.contextTokens) / s.contextWindow)}%)`;
+    } else {
+      tokens += ' tokens';
+    }
+  }
+  const agents =
+    s.subagents === 0 ? 'sem agent' : `${s.subagents} ${s.subagents === 1 ? 'agent rodando' : 'agents rodando'}`;
+  return `${model} · ${tokens} · ${agents}`;
 }
 
 export const COLORS: Record<Who, string> = {
@@ -69,6 +110,13 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
   const [shared, setSharedState] = useState(rec.data.shared);
   const [busy, setBusy] = useState<Record<AgentId, number>>({ claude: 0, codex: 0 });
   const [frame, setFrame] = useState(0);
+  // Pedidos de permissão em fila: enquanto houver um, a caixa de texto responde a ele.
+  const [asks, setAsks] = useState<Ask[]>([]);
+  const [answer, setAnswer] = useState('');
+  const [stats, setStats] = useState<Record<AgentId, AgentStats>>(() => ({
+    claude: { ...agents.claude.stats },
+    codex: { ...agents.codex.stats },
+  }));
 
   const add = useCallback(
     (who: Who, kind: Entry['kind'], text: string) => {
@@ -105,6 +153,29 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
       rec.data.codexThreadId = id;
       rec.saveNow();
     };
+    for (const agent of Object.values(agents)) {
+      agent.onStats = (s) => setStats((prev) => ({ ...prev, [agent.id]: s }));
+      agent.askPermission = ({ text, signal }) =>
+        new Promise<boolean>((resolve) => {
+          const drop = () => setAsks((q) => q.filter((a) => a !== ask));
+          const cancel = () => {
+            drop();
+            add(agent.id, 'error', `pedido de permissão cancelado: ${truncate(text)}`);
+            resolve(false);
+          };
+          const ask: Ask = {
+            who: agent.id,
+            text,
+            answer: (ok) => {
+              signal.removeEventListener('abort', cancel);
+              drop();
+              resolve(ok);
+            },
+          };
+          signal.addEventListener('abort', cancel, { once: true });
+          setAsks((q) => [...q, ask]);
+        });
+    }
     if (resumed) {
       add('sistema', 'text', 'Conversa retomada: cada um continua de onde parou.');
       for (const t of markInterrupted(rec.data)) {
@@ -126,22 +197,31 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
    * Um turno de um agente. O prompt só é montado quando chega a vez dele na fila, e o contexto
    * só conta como entregue depois que ele responde: se falhar, vai de novo na próxima.
    * `msgIndex` = a sua mensagem (ele vê a janela até ali); sem ele, vê a janela até agora (brain).
+   * `call` = quem chamou pela ferramenta do duo: a resposta volta direto para ele.
    * Resolve com a resposta, ou null se o turno falhou.
    */
   const runTurn = useCallback(
-    (id: AgentId, turnId: number, text: string, sharedTurn: boolean, msgIndex?: number): Promise<string | null> => {
+    (
+      id: AgentId,
+      turnId: number,
+      text: string,
+      sharedTurn: boolean,
+      msgIndex?: number,
+      call?: { from: AgentId; signal: AbortSignal },
+    ): Promise<string | null> => {
       const data = rec.data;
       const myLog = log.current;
       setBusy((b) => ({ ...b, [id]: b[id] + 1 }));
       return queues[id](async (): Promise<string | null> => {
         for (let attempt = 0; ; attempt++) {
-          const prepared = myLog.prepare(id, text, sharedTurn, msgIndex);
+          const prepared = myLog.prepare(id, text, sharedTurn, msgIndex, call?.from);
           setTurn(data, turnId, 'running');
           rec.saveNow();
           try {
             const answer = await agents[id].send(prepared.prompt, (ev) => add(id, ev.kind, ev.text));
             myLog.delivered(id, prepared);
-            myLog.agentReply(id, answer, sharedTurn);
+            // quem chamou só recebeu a resposta se ainda esperava; senão ela vai no contexto dele
+            myLog.agentReply(id, answer, sharedTurn, call && !call.signal.aborted ? call.from : undefined);
             setTurn(data, turnId, 'done');
             return answer;
           } catch (e) {
@@ -168,6 +248,44 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
     },
     [agents, add, rec, queues],
   );
+
+  /** Chamadas em andamento de cada um ao outro, pela ferramenta do duo. */
+  const calling = useRef<Record<AgentId, number>>({ claude: 0, codex: 0 });
+
+  // Um agente chama o outro pela ferramenta do duo: vira um turno normal do outro, na fila dele e visível na
+  // janela, e a resposta volta como resultado da ferramenta. Segue o modo atual (compartilhado ou privado).
+  useEffect(() => {
+    for (const agent of Object.values(agents)) {
+      const to = otherOf(agent.id);
+      agent.askPeer = async ({ text, signal }) => {
+        // Se o outro está esperando este, a chamada ficaria na fila atrás do turno que espera: os dois travariam.
+        if (calling.current[to] > 0) {
+          throw new Error(
+            `o ${agents[to].name} está esperando uma resposta sua (ele te chamou); chamá-lo agora travaria os dois. ` +
+              `Termine esta resposta primeiro; se precisar perguntar algo a ele, pergunte nela.`,
+          );
+        }
+        calling.current[agent.id]++;
+        try {
+          const sharedNow = rec.data.shared;
+          add(agent.id, 'text', `[para o ${agents[to].name}] ${text}`);
+          const msgIndex = log.current.agentMessage(agent.id, to, text, sharedNow);
+          const turnId = newTurn(rec.data, to, `[do ${agents[agent.id].name}] ${text}`);
+          rec.saveNow();
+          const prompt =
+            `[duo] O ${agents[agent.id].name} chamou você pela ferramenta do duo. A sua resposta volta direto para ele, ` +
+            `e o usuário acompanha na janela.\n\n${text}`;
+          const answer = await runTurn(to, turnId, prompt, sharedNow, msgIndex, { from: agent.id, signal });
+          if (answer === null) {
+            throw new Error(`o ${agents[to].name} não conseguiu responder; o erro aparece na janela do duo`);
+          }
+          return answer;
+        } finally {
+          calling.current[agent.id]--;
+        }
+      };
+    }
+  }, [agents, add, rec, runTurn]);
 
   /** O brain em andamento (só um por vez). `stop` = /parar: encerra depois da resposta em andamento. */
   const brain = useRef<{ stop: boolean } | null>(null);
@@ -307,7 +425,26 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
     [agents, add, exit, stdout, target, shared, rec, runTurn, runBrain],
   );
 
+  /** Responde ao pedido da vez. Só s ou n: qualquer outra coisa não decide nada e ele pergunta de novo. */
+  const onAnswer = useCallback(
+    (value: string) => {
+      const ask = asks[0];
+      const reply = value.trim().toLowerCase();
+      setAnswer('');
+      if (!ask) return;
+      const ok = YES.includes(reply) ? true : NO.includes(reply) ? false : null;
+      if (ok === null) {
+        add('sistema', 'error', 'responda s para permitir ou n para negar.');
+        return;
+      }
+      add(ask.who, ok ? 'tool' : 'error', `${ok ? 'você permitiu' : 'você negou'}: ${truncate(ask.text)}`);
+      ask.answer(ok);
+    },
+    [asks, add],
+  );
+
   const promptColor = target === 'todos' ? 'white' : COLORS[target];
+  const asking = asks[0];
 
   return (
     <Box flexDirection="column">
@@ -324,12 +461,31 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
               {busy[id] > 1 ? ` (+${busy[id] - 1} na fila)` : ''}…
             </Text>
           ))}
-        <Box>
-          <Text color={promptColor} bold>
-            {shared ? '' : '🔒 '}/{target} ›{' '}
+        {asking ? (
+          <Box flexDirection="column">
+            <Text color={COLORS[asking.who]} bold>
+              ? {agents[asking.who].name} pede permissão{asks.length > 1 ? ` (+${asks.length - 1} na fila)` : ''}:{' '}
+              {asking.text}
+            </Text>
+            <Box>
+              <Text bold>permitir? s/n › </Text>
+              <TextInput value={answer} onChange={setAnswer} onSubmit={onAnswer} />
+            </Box>
+          </Box>
+        ) : (
+          <Box>
+            <Text color={promptColor} bold>
+              {shared ? '' : '🔒 '}/{target} ›{' '}
+            </Text>
+            <TextInput value={input} onChange={setInput} onSubmit={onSubmit} />
+          </Box>
+        )}
+        {(['claude', 'codex'] as AgentId[]).map((id) => (
+          <Text key={id}>
+            <Text color={COLORS[id]}>{agents[id].name.padEnd(7)}</Text>
+            <Text dimColor>{footerText(stats[id])}</Text>
           </Text>
-          <TextInput value={input} onChange={setInput} onSubmit={onSubmit} />
-        </Box>
+        ))}
       </Box>
     </Box>
   );

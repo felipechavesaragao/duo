@@ -8,13 +8,48 @@ export type AgentEvent =
 
 export type EmitFn = (event: AgentEvent) => void;
 
+/** A pergunta que o terminal do CLI faria (regra "ask" do settings, modo default...). */
+export interface PermissionRequest {
+  /** o que ele quer fazer, inteiro: "Bash git push origin master" */
+  text: string;
+  /** dispara quando o pedido deixa de valer (o processo caiu, o CLI desistiu): ninguém espera mais a resposta */
+  signal: AbortSignal;
+}
+
+/** Um agente chamando o outro pela ferramenta do duo. */
+export interface PeerRequest {
+  /** a mensagem para o outro, inteira */
+  text: string;
+  /** dispara quando ninguém mais espera a resposta (o processo de quem chamou caiu, o CLI desistiu) */
+  signal: AbortSignal;
+}
+
+/** O que o rodapé mostra de cada um. */
+export interface AgentStats {
+  /** modelo em uso, como o CLI informou; undefined = ainda não sabe (antes da primeira mensagem) */
+  model?: string;
+  /** tokens no contexto da conversa principal, pela última chamada ao modelo (subagentes não contam) */
+  contextTokens?: number;
+  /** tamanho da janela de contexto do modelo */
+  contextWindow?: number;
+  /** subagentes rodando agora */
+  subagents: number;
+}
+
 export interface Agent {
   readonly id: AgentId;
   readonly name: string;
+  readonly stats: AgentStats;
+  /** chamado a cada mudança em `stats` */
+  onStats?: (stats: AgentStats) => void;
   /** id da conversa no CLI de origem (session_id do Claude / thread_id do Codex); undefined = ainda não começou */
   readonly resumeId: string | undefined;
   /** chamado assim que o id da conversa aparece ou muda: o duo grava na hora */
   onSessionId?: (id: string) => void;
+  /** pergunta a você se ele pode fazer algo; resolve true = permitido. Sem ele, o pedido é negado. */
+  askPermission?: (req: PermissionRequest) => Promise<boolean>;
+  /** fala com o outro agente da janela; resolve com a resposta dele. Sem ele, o agente não ganha a ferramenta. */
+  askPeer?: (req: PeerRequest) => Promise<string>;
   /** Manda uma mensagem. Resolve com a resposta final em texto. Mensagens são enfileiradas. */
   send(prompt: string, emit: EmitFn): Promise<string>;
   /** Esquece a conversa: a próxima mensagem começa uma sessão nova. */
@@ -30,6 +65,14 @@ export interface Agent {
  */
 export class ResumeFailedError extends Error {
   readonly resumeFailed = true;
+}
+
+/** Junta a mudança em `stats` e avisa só se algo mudou. */
+export function patchStats(agent: Agent & { stats: AgentStats }, patch: Partial<AgentStats>): void {
+  const keys = Object.keys(patch) as (keyof AgentStats)[];
+  if (keys.every((k) => agent.stats[k] === patch[k])) return;
+  Object.assign(agent.stats, patch);
+  agent.onStats?.({ ...agent.stats });
 }
 
 /** Fila simples: garante uma mensagem por vez para cada agente. */

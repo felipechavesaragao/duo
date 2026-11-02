@@ -58,6 +58,12 @@ Depois é só rodar `duo` na pasta do projeto em que você quer trabalhar. Os do
 
 No `/todos`, os dois respondem ao mesmo tempo e nenhum vê a resposta do outro àquela mensagem. Cada um fica sabendo da resposta do outro na mensagem seguinte.
 
+**Um chama o outro sozinho**: o duo dá ao Claude a ferramenta `falar_com_codex` e ao Codex a `falar_com_claude`, e avisa os dois de que elas existem. A mensagem aparece na janela como `[para o Codex] …` (ou `[para o Claude] …`), vira um turno normal de quem foi chamado (na fila dele, com o contexto da janela) e a resposta volta para quem chamou, que continua de onde estava. Quem está esperando uma resposta não pode ser chamado de volta: o duo recusa na hora, em vez de deixar os dois travados um esperando o outro.
+
+O Codex só recebe a ferramenta numa conversa nova: o app-server aceita ferramentas do cliente só ao abrir a conversa, não ao retomar. Uma conversa do Codex aberta por uma versão anterior do duo continua sem ela até um `/novo`.
+
+O **rodapé** mostra, para cada um, o modelo, os tokens no contexto da conversa (com o tamanho da janela do modelo) e quantos subagentes estão rodando.
+
 ## Opções
 
 ```
@@ -77,12 +83,12 @@ As conversas ficam salvas em `~/.duo/`. O `duo -c` retoma a última conversa da 
 
 ## ⚠️ Permissões
 
-O duo não mostra pedidos de permissão. Por padrão:
+Por padrão:
 
-- o **Claude** segue o modo de permissão do seu `settings.json`;
+- o **Claude** segue o modo de permissão do seu `settings.json`. Quando o terminal dele perguntaria (uma regra `ask` como `Bash(git push:*)`, ou o modo `default`), a pergunta aparece no duo: a caixa de texto vira `permitir? s/n`, e o que você estava digitando fica guardado. Regras `deny` continuam negando sem perguntar;
 - o **Codex** roda **sem sandbox** e sem pedir aprovação.
 
-Ou seja, os dois podem editar arquivos e rodar comandos na pasta sem perguntar. Para restringir, use `--claude-permission default` e `--codex-sandbox read-only` (ou `workspace-write`).
+Ou seja, fora das regras `ask` do Claude, os dois podem editar arquivos e rodar comandos na pasta sem perguntar. Para restringir, use `--claude-permission default` (o duo pergunta antes de cada edição ou comando do Claude) e `--codex-sandbox read-only` (ou `workspace-write`).
 
 ## Como funciona
 
