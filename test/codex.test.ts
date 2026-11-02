@@ -1,18 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { CodexAgent, shortenCommand } from '../src/agents/codex.js';
 
-describe('CodexAgent.buildArgs', () => {
-  it('por padrão roda livre: sem sandbox e sem aprovações', () => {
-    const args = new CodexAgent({}).buildArgs();
-    expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
-    expect(args).not.toContain('--sandbox');
-    expect(args.at(-1)).toBe('-'); // prompt vem pelo stdin
+describe('CodexAgent.threadParams', () => {
+  it('por padrão roda livre: sem aprovações e sem sandbox', () => {
+    expect(new CodexAgent({ cwd: 'C:\\x' }).threadParams()).toEqual({
+      cwd: 'C:\\x',
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+    });
   });
 
-  it('com --codex-sandbox fica restrito ao modo escolhido', () => {
-    const args = new CodexAgent({ sandbox: 'workspace-write' }).buildArgs();
-    expect(args).toEqual(expect.arrayContaining(['--sandbox', 'workspace-write']));
-    expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+  it('com --codex-sandbox fica restrito ao modo escolhido, ainda sem perguntar nada', () => {
+    const params = new CodexAgent({ sandbox: 'workspace-write' }).threadParams();
+    expect(params).toMatchObject({ sandbox: 'workspace-write', approvalPolicy: 'never' });
   });
 });
 

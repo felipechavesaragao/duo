@@ -28,14 +28,20 @@ async function type(stdin: { write: (s: string) => void }, text: string) {
   await delay(300);
 }
 
-/** Espera todos os turnos terminarem (lendo o mesmo estado que o duo grava). */
+/** O que o teste cobra. Qualquer item falso faz o script sair com código 1. */
+const checks: { what: string; ok: boolean; detail?: string }[] = [];
+const check = (what: string, ok: boolean, detail?: string) => checks.push({ what, ok, detail });
+
+/** Espera todos os turnos terminarem (lendo o mesmo estado que o duo grava) e cobra que todos deram certo. */
 async function settle(rec: Recorder, label: string) {
   const t0 = Date.now();
   while (rec.data.turns.some((t) => t.status === 'pending' || t.status === 'running')) {
     if (Date.now() - t0 > 300_000) throw new Error(`${label}: demorou mais de 5 min`);
     await delay(500);
   }
-  console.log(`  ${label}: ${rec.data.turns.map((t) => `${t.agent}=${t.status}`).join(' ')} (${((Date.now() - t0) / 1000).toFixed(0)}s)`);
+  const states = rec.data.turns.map((t) => `${t.agent}=${t.status}`).join(' ');
+  console.log(`  ${label}: ${states} (${((Date.now() - t0) / 1000).toFixed(0)}s)`);
+  check(`${label}: todos os turnos concluídos`, rec.data.turns.every((t) => t.status === 'done'), states);
 }
 
 const lastText = (data: SessionData, who: 'claude' | 'codex') =>
@@ -73,9 +79,19 @@ app2.unmount();
 rec2.close();
 Object.values(agents2).forEach((a) => a.dispose());
 
-console.log(`\n  banner de retomada na tela: ${frames.includes('Conversa retomada') ? 'sim' : 'NÃO'}`);
-console.log(`  mesma conversa do Claude: ${agents2.claude.resumeId === savedClaude ? 'sim' : `NÃO (${agents2.claude.resumeId})`}`);
-console.log(`  mesma conversa do Codex:  ${agents2.codex.resumeId === savedCodex ? 'sim' : `NÃO (${agents2.codex.resumeId})`}`);
-console.log(`  Claude: ${lastText(rec2.data, 'claude')}`);
-console.log(`  Codex:  ${lastText(rec2.data, 'codex')}`);
-process.exit(0);
+const claudeSays = lastText(rec2.data, 'claude');
+const codexSays = lastText(rec2.data, 'codex');
+const knows = (t: string) => /TAMARINDO/i.test(t) && /\b42\b/.test(t);
+check('banner de retomada na tela', frames.includes('Conversa retomada'));
+check('mesma conversa do Claude', agents2.claude.resumeId === savedClaude, agents2.claude.resumeId);
+check('mesma conversa do Codex', agents2.codex.resumeId === savedCodex, agents2.codex.resumeId);
+check('Claude lembra TAMARINDO e 42', knows(claudeSays), claudeSays);
+// TAMARINDO veio da conversa do próprio Codex; o 42 só foi dito ao Claude e chega pelo contexto compartilhado gravado.
+check('Codex lembra TAMARINDO e 42', knows(codexSays), codexSays);
+
+console.log('');
+for (const c of checks) console.log(`  ${c.ok ? 'ok    ' : 'FALHOU'} ${c.what}${c.detail && !c.ok ? ` → ${c.detail}` : ''}`);
+console.log(`  Claude: ${claudeSays}\n  Codex:  ${codexSays}`);
+const failed = checks.filter((c) => !c.ok).length;
+console.log(failed ? `\nREPROVADO: ${failed} de ${checks.length} verificações falharam` : `\nAPROVADO: ${checks.length} de ${checks.length}`);
+process.exit(failed ? 1 : 0);
