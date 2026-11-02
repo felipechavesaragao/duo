@@ -51,6 +51,36 @@ describe('SharedLog', () => {
     expect(next.codex).not.toContain('opinião B');
   });
 
+  it('@todos: quem começa depois NÃO vê a resposta do outro à mesma mensagem', () => {
+    const log = new SharedLog();
+    const idx = log.userMessage(['claude', 'codex'], 'opinem', true);
+    const c = log.prepare('claude', 'opinem', true, idx);
+    log.delivered('claude', c);
+    log.agentReply('claude', 'OPINIAO-DO-CLAUDE', true); // o Claude respondeu antes de o Codex começar
+
+    const x = log.prepare('codex', 'opinem', true, idx); // o Codex estava ocupado e só começa agora
+    expect(x.prompt).not.toContain('OPINIAO-DO-CLAUDE');
+    log.delivered('codex', x);
+    log.agentReply('codex', 'OPINIAO-DO-CODEX', true);
+
+    // na mensagem seguinte cada um vê o que o outro respondeu
+    const next = turn(log, ['claude', 'codex'], 'e agora?');
+    expect(next.codex).toContain('### Claude\nOPINIAO-DO-CLAUDE');
+    expect(next.claude).toContain('### Codex\nOPINIAO-DO-CODEX');
+  });
+
+  it('resposta que chega depois do Enter fica para a próxima mensagem', () => {
+    const log = new SharedLog();
+    turn(log, ['claude'], 'PEDIDO-A');
+    const idx = log.userMessage(['codex'], 'PEDIDO-B', true); // mandado enquanto o Claude ainda trabalhava
+    log.agentReply('claude', 'RESPOSTA-A', true);
+    const p = log.prepare('codex', 'PEDIDO-B', true, idx);
+    expect(p.prompt).toContain('usuário → Claude\nPEDIDO-A');
+    expect(p.prompt).not.toContain('RESPOSTA-A');
+    log.delivered('codex', p);
+    expect(turn(log, ['codex'], 'e ele?').codex).toContain('### Claude\nRESPOSTA-A'); // não se perdeu
+  });
+
   it('modo privado manda a mensagem pura', () => {
     const log = new SharedLog();
     turn(log, ['claude'], 'a', false);

@@ -14,6 +14,10 @@ class FakeAgent implements Agent {
   onSessionId?: (id: string) => void;
   /** próximas chamadas que devem falhar com "conversa não existe" */
   failResume = 0;
+  /** respostas roteirizadas, na ordem; '!erro' faz aquela resposta falhar */
+  script: string[] = [];
+  /** demora de cada resposta, para dar tempo de digitar algo no meio */
+  delayMs = 0;
 
   constructor(
     readonly id: AgentId,
@@ -31,8 +35,11 @@ class FakeAgent implements Agent {
       this.resumeId = `sessao-${this.id}`;
       this.onSessionId?.(this.resumeId);
     }
+    if (this.delayMs) await new Promise((r) => setTimeout(r, this.delayMs));
+    const scripted = this.script.shift();
+    if (scripted === '!erro') throw new Error('caiu');
     emit({ kind: 'tool', text: 'Bash ls' });
-    const answer = `${this.name} responde ${this.prompts.length}`;
+    const answer = scripted ?? `${this.name} responde ${this.prompts.length}`;
     emit({ kind: 'text', text: answer });
     return answer;
   }
@@ -52,6 +59,14 @@ async function type(stdin: { write: (s: string) => void }, text: string) {
   await tick();
   await tick();
 }
+/** Espera a tela mostrar um texto (o brain leva vários turnos). */
+async function waitFor(frames: string[], text: string, ms = 3000) {
+  const t0 = Date.now();
+  while (!frames.join('\n').includes(text)) {
+    if (Date.now() - t0 > ms) throw new Error(`a tela não mostrou "${text}" em ${ms}ms`);
+    await tick();
+  }
+}
 
 describe('App', () => {
   it('roteia, mostra os dois e compartilha o contexto', async () => {
@@ -60,8 +75,8 @@ describe('App', () => {
     await tick();
 
     await type(stdin, 'oi claude');
-    await type(stdin, '@codex revise');
-    await type(stdin, '@todos ok');
+    await type(stdin, '/codex revise'); // com / (principal)
+    await type(stdin, '@todos ok'); // com @ também funciona
 
     expect(claude.prompts).toHaveLength(2);
     expect(codex.prompts).toHaveLength(2);
@@ -72,7 +87,7 @@ describe('App', () => {
     expect(all).toContain('● Claude');
     expect(all).toContain('● Codex');
     expect(all).toContain('↳ Bash ls');
-    expect(lastFrame()).toContain('@todos ›');
+    expect(lastFrame()).toContain('/todos ›');
   });
 
   it('/privado desliga o compartilhamento', async () => {
@@ -84,7 +99,7 @@ describe('App', () => {
     await type(stdin, 'oi');
     await type(stdin, '@codex oi');
     expect(codex.prompts[0]).toBe('oi');
-    expect(lastFrame()).toContain('🔒 @codex ›');
+    expect(lastFrame()).toContain('🔒 /codex ›');
   });
 
   it('grava a conversa e o `duo -c` retoma: tela, ids, modo e memória compartilhada', async () => {
@@ -110,7 +125,7 @@ describe('App', () => {
     const shown = app2.frames.join('\n');
     expect(shown).toContain('Conversa retomada');
     expect(shown).toContain('Claude responde 1'); // a tela voltou
-    expect(app2.lastFrame()).toContain('🔒 @claude ›'); // modo e destino voltaram
+    expect(app2.lastFrame()).toContain('🔒 /claude ›'); // modo e destino voltaram
 
     await type(app2.stdin, '/compartilhado');
     await type(app2.stdin, '@codex o que ele disse?');
@@ -167,5 +182,80 @@ describe('App', () => {
     await type(stdin, '@codex segunda');
     expect(codex.prompts[0]).toContain('Claude responde 1');
     expect(codex.prompts[1]).toContain('Claude responde 1'); // não se perdeu com a falha
+  });
+});
+
+describe('/brain', () => {
+  it('quem foi marcado responde, o outro avalia vendo a resposta, e param quando um concorda', async () => {
+    const { claude, codex } = fakes();
+    claude.script = ['PROPOSTA-A', 'aceito o ajuste\n[CONCORDO]'];
+    codex.script = ['troque o banco\n[DISCORDO]'];
+    const { stdin, frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    await type(stdin, '/brain /cla qual banco usar?');
+    await waitFor(frames, 'concordaram');
+
+    expect(claude.prompts).toHaveLength(2);
+    expect(codex.prompts).toHaveLength(1);
+    expect(claude.prompts[0]).toContain('[duo · brain] Você responde primeiro');
+    expect(claude.prompts[0]).toContain('qual banco usar?');
+    expect(codex.prompts[0]).toContain('qual banco usar?'); // a pergunta, pelo contexto
+    expect(codex.prompts[0]).toContain('### Claude\nPROPOSTA-A'); // e a resposta que ele avalia
+    expect(codex.prompts[0]).toContain('A última resposta do Claude');
+    expect(claude.prompts[1]).toContain('### Codex\ntroque o banco');
+    expect(claude.prompts[1]).not.toContain('PROPOSTA-A'); // a dele mesmo não volta
+    expect(frames.join('\n')).toContain('o Claude concordou com o Codex (3 respostas)');
+  });
+
+  it('/brain /fog: o Codex começa', async () => {
+    const { claude, codex } = fakes();
+    codex.script = ['PLANO-DO-CODEX'];
+    claude.script = ['perfeito\n[CONCORDO]'];
+    const { stdin, frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    await type(stdin, '/brain /fog revisa o plano');
+    await waitFor(frames, 'concordaram');
+    expect(codex.prompts).toHaveLength(1);
+    expect(claude.prompts[0]).toContain('### Codex\nPLANO-DO-CODEX');
+    expect(frames.join('\n')).toContain('o Claude concordou com o Codex (2 respostas)');
+  });
+
+  it('sem acordo para no limite de 6 respostas, 3 de cada', async () => {
+    const { claude, codex } = fakes();
+    claude.script = Array(3).fill('não\n[DISCORDO]');
+    codex.script = Array(3).fill('também não\n[DISCORDO]');
+    const { stdin, frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    await type(stdin, '/brain /cla discutam');
+    await waitFor(frames, 'sem acordo em 6 respostas');
+    expect(claude.prompts).toHaveLength(3);
+    expect(codex.prompts).toHaveLength(3);
+  });
+
+  it('/parar encerra depois da resposta em andamento', async () => {
+    const { claude, codex } = fakes();
+    codex.delayMs = 400;
+    const { stdin, frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    await type(stdin, '/brain /fog pensa nisso');
+    await type(stdin, '/parar'); // o Codex ainda está respondendo
+    await waitFor(frames, 'brain encerrado por você depois de 1 resposta');
+    await new Promise((r) => setTimeout(r, 300));
+    expect(codex.prompts).toHaveLength(1);
+    expect(claude.prompts).toHaveLength(0); // não chamou o outro
+  });
+
+  it('resposta que falha encerra o brain; outro /brain no meio é recusado', async () => {
+    const { claude, codex } = fakes();
+    claude.delayMs = 200;
+    claude.script = ['PROPOSTA'];
+    codex.script = ['!erro'];
+    const { stdin, frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    await type(stdin, '/brain /cla primeiro');
+    await type(stdin, '/brain /fog segundo');
+    expect(frames.join('\n')).toContain('já tem um brain rodando');
+    await waitFor(frames, 'brain parou: a resposta do Codex falhou');
+    expect(claude.prompts).toHaveLength(1);
   });
 });

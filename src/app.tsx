@@ -11,6 +11,7 @@ import {
   type TurnStatus,
   type Who,
 } from './persist.js';
+import { BRAIN_MAX, brainOpening, brainReview, brainVerdict, otherOf } from './brain.js';
 import { HELP_TEXT, parseInput, type Target } from './router.js';
 import { SharedLog } from './shared.js';
 
@@ -124,13 +125,15 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
   /**
    * Um turno de um agente. O prompt só é montado quando chega a vez dele na fila, e o contexto
    * só conta como entregue depois que ele responde: se falhar, vai de novo na próxima.
+   * `msgIndex` = a sua mensagem (ele vê a janela até ali); sem ele, vê a janela até agora (brain).
+   * Resolve com a resposta, ou null se o turno falhou.
    */
   const runTurn = useCallback(
-    (id: AgentId, turnId: number, text: string, sharedTurn: boolean, msgIndex: number) => {
+    (id: AgentId, turnId: number, text: string, sharedTurn: boolean, msgIndex?: number): Promise<string | null> => {
       const data = rec.data;
       const myLog = log.current;
       setBusy((b) => ({ ...b, [id]: b[id] + 1 }));
-      queues[id](async () => {
+      return queues[id](async (): Promise<string | null> => {
         for (let attempt = 0; ; attempt++) {
           const prepared = myLog.prepare(id, text, sharedTurn, msgIndex);
           setTurn(data, turnId, 'running');
@@ -140,7 +143,7 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
             myLog.delivered(id, prepared);
             myLog.agentReply(id, answer, sharedTurn);
             setTurn(data, turnId, 'done');
-            return;
+            return answer;
           } catch (e) {
             const err = e instanceof Error ? e : new Error(String(e));
             if (err instanceof ResumeFailedError && attempt === 0) {
@@ -155,7 +158,7 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
             }
             add(id, 'error', err.message);
             setTurn(data, turnId, 'failed');
-            return;
+            return null;
           }
         }
       }).finally(() => {
@@ -164,6 +167,62 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
       });
     },
     [agents, add, rec, queues],
+  );
+
+  /** O brain em andamento (só um por vez). `stop` = /parar: encerra depois da resposta em andamento. */
+  const brain = useRef<{ stop: boolean } | null>(null);
+
+  /**
+   * /brain: quem foi marcado responde, o outro avalia, e revezam até um concordar com a última resposta
+   * do outro, ou até BRAIN_MAX respostas. Os dois participam, então a conversa do brain é sempre
+   * compartilhada entre eles, mesmo no modo privado.
+   */
+  const runBrain = useCallback(
+    async (first: AgentId, question: string) => {
+      const state = { stop: false };
+      brain.current = state;
+      const data = rec.data;
+      const name = (id: AgentId) => agents[id].name;
+      add(
+        'sistema',
+        'text',
+        `🧠 brain: o ${name(first)} responde, o ${name(otherOf(first))} avalia, e eles revezam até concordarem ` +
+          `(no máximo ${BRAIN_MAX} respostas). /parar encerra.${shared ? '' : ' Os dois veem o brain, mesmo no modo privado.'}`,
+      );
+      add('voce', 'text', `[brain · ${name(first)} começa] ${question}`);
+      const msgIndex = log.current.userMessage([first], question, true);
+      rec.saveNow();
+
+      let who = first;
+      try {
+        for (let n = 1; n <= BRAIN_MAX; n++) {
+          const turnId = newTurn(data, who, n === 1 ? question : `[brain] avaliar a resposta do ${name(otherOf(who))}`);
+          rec.saveNow();
+          const answer =
+            n === 1
+              ? await runTurn(who, turnId, brainOpening(who, question), true, msgIndex)
+              : await runTurn(who, turnId, brainReview(who), true);
+          if (answer === null) {
+            add('sistema', 'error', `🧠 brain parou: a resposta do ${name(who)} falhou.`);
+            return;
+          }
+          if (n > 1 && brainVerdict(answer) === 'concordo') {
+            add('sistema', 'text', `🧠 concordaram: o ${name(who)} concordou com o ${name(otherOf(who))} (${n} respostas).`);
+            return;
+          }
+          if (state.stop) {
+            add('sistema', 'text', `🧠 brain encerrado por você depois de ${n} ${n === 1 ? 'resposta' : 'respostas'}.`);
+            return;
+          }
+          who = otherOf(who);
+        }
+        add('sistema', 'text', `🧠 sem acordo em ${BRAIN_MAX} respostas. Mande /brain de novo para continuar.`);
+      } finally {
+        if (brain.current === state) brain.current = null;
+        rec.saveNow();
+      }
+    },
+    [agents, add, rec, runTurn, shared],
   );
 
   const onSubmit = useCallback(
@@ -201,6 +260,21 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
         case 'invalid':
           add('sistema', 'error', cmd.message);
           return;
+        case 'brain':
+          if (brain.current) {
+            add('sistema', 'error', 'já tem um brain rodando: espere terminar ou digite /parar.');
+            return;
+          }
+          void runBrain(cmd.first, cmd.prompt);
+          return;
+        case 'stop':
+          if (!brain.current) {
+            add('sistema', 'error', 'não tem nenhum brain rodando.');
+          } else if (!brain.current.stop) {
+            brain.current.stop = true;
+            add('sistema', 'text', '🧠 o brain para depois da resposta em andamento.');
+          }
+          return;
         case 'share':
           rec.data.shared = cmd.on;
           setSharedState(cmd.on);
@@ -216,7 +290,7 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
         case 'ask': {
           setTarget(cmd.newDefault);
           if (cmd.targets.length === 0) {
-            add('sistema', 'text', `destino padrão agora: @${cmd.newDefault}`);
+            add('sistema', 'text', `destino padrão agora: /${cmd.newDefault}`);
             rec.saveNow();
             return;
           }
@@ -230,7 +304,7 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
         }
       }
     },
-    [agents, add, exit, stdout, target, shared, rec, runTurn],
+    [agents, add, exit, stdout, target, shared, rec, runTurn, runBrain],
   );
 
   const promptColor = target === 'todos' ? 'white' : COLORS[target];
@@ -252,7 +326,7 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
           ))}
         <Box>
           <Text color={promptColor} bold>
-            {shared ? '' : '🔒 '}@{target} ›{' '}
+            {shared ? '' : '🔒 '}/{target} ›{' '}
           </Text>
           <TextInput value={input} onChange={setInput} onSubmit={onSubmit} />
         </Box>

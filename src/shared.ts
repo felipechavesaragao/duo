@@ -57,18 +57,22 @@ export class SharedLog {
     return this.state.items.length - 1;
   }
 
+  /**
+   * `msgIndex` = posição da mensagem (de userMessage). O agente vê a janela como ela estava quando você
+   * apertou Enter: o que chegou depois fica para a próxima mensagem dele. É isso que deixa as respostas
+   * do @todos independentes — nenhum dos dois vê a resposta do outro à MESMA mensagem, mesmo que um
+   * deles só comece depois (fila ocupada com uma mensagem anterior).
+   */
   prepare(id: AgentId, text: string, shared: boolean, msgIndex?: number): Prepared {
-    const upTo = this.state.items.length;
     if (!shared) return { prompt: text, upTo: this.state.seen[id], intro: false, amnesia: false };
+    const end = msgIndex ?? this.state.items.length; // contexto = [seen, end); a mensagem vai no fim
+    const upTo = msgIndex === undefined ? end : msgIndex + 1;
 
     const amnesia = Boolean(this.state.amnesia?.[id]);
     const from = this.state.seen[id];
-    const missed = this.state.items.slice(from, upTo).filter((item, k) => {
-      const i = from + k;
-      if (i === msgIndex) return false; // a própria mensagem vai no fim, não no contexto
+    const missed = this.state.items.slice(from, end).filter((item) => {
       if (item.onlyFor && !item.onlyFor.includes(id)) return false;
       const toMe = item.from === 'voce' && item.to?.includes(id);
-      if (toMe && msgIndex !== undefined && i > msgIndex) return false; // ainda na fila: vem depois
       if (amnesia) return true;
       return item.from !== id && !toMe;
     });
