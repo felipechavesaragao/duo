@@ -1,11 +1,13 @@
 import spawn from 'cross-spawn';
 import type { ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { killTree, onJsonLines, stderrTail } from './process.js';
 import {
   createQueue,
   ResumeFailedError,
   truncate,
   patchStats,
+  peerLoopHint,
   type Agent,
   type AgentStats,
   type EmitFn,
@@ -30,7 +32,8 @@ const PEER_TOOL = {
 const PEER_HINT =
   '[duo] Você está no duo, numa janela compartilhada com o usuário e com o Codex (o Fog). Para falar com o Codex ' +
   '(pedir revisão, segunda opinião ou uma tarefa), use a ferramenta mcp__duo__falar_com_codex: a resposta dele ' +
-  'volta para você, e o usuário acompanha tudo na janela.';
+  'volta para você, e o usuário acompanha tudo na janela. ' +
+  peerLoopHint('Codex');
 
 export interface ClaudeOptions {
   /** default | acceptEdits | plan | bypassPermissions. Vazio = segue o defaultMode do seu settings.json. */
@@ -56,10 +59,16 @@ interface Running {
   deniedByYou: Set<string>;
   /** task_id dos subagentes rodando */
   subagents: Set<string>;
+  /** textos do turno que o CLI abriu sozinho, até o result dele */
+  own: string[];
 }
 
 interface Turn {
   proc: ChildProcess;
+  /** uuid da mensagem do duo: o eco dela marca onde começa este turno */
+  uuid: string;
+  /** o CLI já leu a mensagem; antes disso, o que chega é de um turno que ele abriu sozinho */
+  started: boolean;
   emit: EmitFn;
   texts: string[];
   resolve: (text: string) => void;
@@ -84,6 +93,12 @@ interface Turn {
  * em `result.modelUsage[modelo].contextWindow`; subagente começa em `system/task_started` (task_type
  * "local_agent") e termina em `system/task_notification`.
  *
+ * Turno que ele abre sozinho (medido em 02/11/2026, 2.1.316): quando um subagente ou comando em segundo
+ * plano termina depois do `result`, ele manda `task_notification`, um `system/init` novo e um turno inteiro
+ * com `result` próprio, sem mensagem nenhuma no stdin. Uma mensagem que chega no meio desse turno entra
+ * nele: um `result` só para os dois. Com `--replay-user-messages` ele ecoa a mensagem (com o `uuid` que
+ * mandamos) no ponto em que a lê; é esse eco que separa o turno dele do turno do duo.
+ *
  * Retomada que falha (medido em 02/11/2026, Claude Code 2.1.316): com um id inexistente ele manda
  * um `result` de erro SEM o `system/init`, escreve "No conversation found with session ID" no
  * stderr e sai sozinho ~1,4s depois, mesmo com o stdin aberto.
@@ -94,6 +109,8 @@ export class ClaudeAgent implements Agent {
   onSessionId?: (id: string) => void;
   askPermission?: (req: PermissionRequest) => Promise<boolean>;
   askPeer?: (req: PeerRequest) => Promise<string>;
+  onOwnTurnEvent?: EmitFn;
+  onOwnTurnReply?: (text: string) => void;
   onStats?: (stats: AgentStats) => void;
   readonly stats: AgentStats;
   private run?: Running;
@@ -115,8 +132,9 @@ export class ClaudeAgent implements Agent {
       () =>
         new Promise<string>((resolve, reject) => {
           const run = this.ensureProcess();
-          this.turn = { proc: run.proc, emit, texts: [], resolve, reject };
-          const line = JSON.stringify({ type: 'user', message: { role: 'user', content: prompt } });
+          const uuid = randomUUID();
+          this.turn = { proc: run.proc, uuid, started: false, emit, texts: [], resolve, reject };
+          const line = JSON.stringify({ type: 'user', uuid, message: { role: 'user', content: prompt } });
           run.proc.stdin?.write(line + '\n');
         }),
     );
@@ -141,7 +159,7 @@ export class ClaudeAgent implements Agent {
   private ensureProcess(): Running {
     if (this.run) return this.run;
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'];
-    args.push('--permission-prompt-tool', 'stdio');
+    args.push('--replay-user-messages', '--permission-prompt-tool', 'stdio');
     if (this.askPeer) {
       args.push('--mcp-config', JSON.stringify({ mcpServers: { duo: { type: 'sdk', name: 'duo' } } }));
       args.push('--append-system-prompt', PEER_HINT);
@@ -165,6 +183,7 @@ export class ClaudeAgent implements Agent {
       asks: new Map(),
       deniedByYou: new Set(),
       subagents: new Set(),
+      own: [],
     };
     onJsonLines(proc, (msg) => this.handle(run, msg));
     proc.on('error', (err) => this.fail(run, new Error(`não consegui iniciar o claude: ${err.message}`)));
@@ -219,42 +238,64 @@ export class ClaudeAgent implements Agent {
     }
     this.trackStats(run, msg);
 
-    const turn = this.turn;
-    if (!turn || turn.proc !== run.proc) return;
+    const turn = this.turn?.proc === run.proc ? this.turn : undefined;
+    if (msg.type === 'user') {
+      // o eco da mensagem do duo: o turno que ele abriu sozinho (se havia) acabou de receber a mensagem
+      if (turn && msg.isReplay && msg.uuid === turn.uuid) {
+        this.finishOwnTurn(run);
+        turn.started = true;
+      }
+      return;
+    }
+    if (msg.type === 'result' && resumeFailed) {
+      if (!turn) return;
+      // Pode ser "conversa não existe": quem decide é o stderr, quando o processo sair.
+      turn.resumeError = resultError(msg);
+      setTimeout(() => killTree(run.proc), 5000).unref(); // ele sai sozinho; se não sair, forçamos
+      return;
+    }
+
+    // antes do eco, o que chega é de um turno que o CLI abriu sozinho: vai para a tela do mesmo jeito
+    const mine = turn?.started ? turn : undefined;
+    const emit: EmitFn = mine ? mine.emit : (ev) => this.onOwnTurnEvent?.(ev);
+    const texts = mine ? mine.texts : run.own;
 
     if (msg.type === 'assistant') {
       for (const block of msg.message?.content ?? []) {
         if (block.type === 'text' && block.text?.trim()) {
-          turn.texts.push(block.text);
-          turn.emit({ kind: 'text', text: block.text });
+          texts.push(block.text);
+          emit({ kind: 'text', text: block.text });
         } else if (block.type === 'tool_use' && !String(block.name).startsWith('mcp__duo__')) {
           // a ferramenta do duo não entra aqui: a tela mostra a mensagem inteira quando ela chega ao Codex
-          turn.emit({ kind: 'tool', text: describeTool(block.name, block.input) });
+          emit({ kind: 'tool', text: describeTool(block.name, block.input) });
         }
       }
       return;
     }
 
     if (msg.type === 'result') {
-      if (resumeFailed) {
-        // Pode ser "conversa não existe": quem decide é o stderr, quando o processo sair.
-        turn.resumeError = typeof msg.result === 'string' && msg.result ? msg.result : String(msg.subtype);
-        setTimeout(() => killTree(run.proc), 5000).unref(); // ele sai sozinho; se não sair, forçamos
-        return;
-      }
       for (const denial of msg.permission_denials ?? []) {
         if (run.deniedByYou.has(denial.tool_use_id)) continue;
-        turn.emit({
+        emit({
           kind: 'error',
           text: `permissão negada: ${describeTool(denial.tool_name, denial.tool_input)} (veja --claude-permission)`,
         });
       }
-      if (msg.is_error) {
-        this.settle(turn, new Error(typeof msg.result === 'string' && msg.result ? msg.result : String(msg.subtype)));
-      } else {
-        this.settle(turn, turn.texts.join('\n\n'));
+      if (!mine) {
+        if (msg.is_error) emit({ kind: 'error', text: resultError(msg) });
+        this.finishOwnTurn(run);
+        return;
       }
+      this.settle(mine, msg.is_error ? new Error(resultError(msg)) : mine.texts.join('\n\n'));
     }
+  }
+
+  /** O turno que o CLI abriu sozinho terminou (ou a mensagem do duo entrou nele): a resposta vai para a janela. */
+  private finishOwnTurn(run: Running): void {
+    if (!run.own.length) return;
+    const text = run.own.join('\n\n');
+    run.own = [];
+    this.onOwnTurnReply?.(text);
   }
 
   /** Modelo, contexto e subagentes, para o rodapé. Vale também fora de um turno (subagente em segundo plano). */
@@ -354,6 +395,10 @@ export class ClaudeAgent implements Agent {
         return { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: `o duo não trata ${message.method}` } };
     }
   }
+}
+
+function resultError(msg: any): string {
+  return typeof msg.result === 'string' && msg.result ? msg.result : String(msg.subtype);
 }
 
 /** "Bash git push origin master": a ferramenta e o argumento que importa, inteiro. */

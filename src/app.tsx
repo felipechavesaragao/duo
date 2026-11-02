@@ -155,6 +155,12 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
     };
     for (const agent of Object.values(agents)) {
       agent.onStats = (s) => setStats((prev) => ({ ...prev, [agent.id]: s }));
+      // turno que ele abriu sozinho (terminou um subagente em segundo plano): aparece e entra na janela como os outros
+      agent.onOwnTurnEvent = (ev) => add(agent.id, ev.kind, ev.text);
+      agent.onOwnTurnReply = (text) => {
+        log.current.agentReply(agent.id, text, rec.data.shared);
+        rec.saveSoon();
+      };
       agent.askPermission = ({ text, signal }) =>
         new Promise<boolean>((resolve) => {
           const drop = () => setAsks((q) => q.filter((a) => a !== ask));
@@ -274,7 +280,9 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
           rec.saveNow();
           const prompt =
             `[duo] O ${agents[agent.id].name} chamou você pela ferramenta do duo. A sua resposta volta direto para ele, ` +
-            `e o usuário acompanha na janela.\n\n${text}`;
+            `e o usuário acompanha na janela. Termine dizendo claramente se concorda sem ressalvas ou o que ainda ` +
+            `falta: é assim que ele sabe se chama você de novo. Não o chame de volta agora (ele está esperando você); ` +
+            `se precisar perguntar algo, pergunte na resposta.\n\n${text}`;
           const answer = await runTurn(to, turnId, prompt, sharedNow, msgIndex, { from: agent.id, signal });
           if (answer === null) {
             throw new Error(`o ${agents[to].name} não conseguiu responder; o erro aparece na janela do duo`);

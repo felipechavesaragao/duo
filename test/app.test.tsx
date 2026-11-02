@@ -252,6 +252,25 @@ describe('o Claude chama o Codex', () => {
   });
 });
 
+describe('turno que o agente abre sozinho', () => {
+  it('aparece na janela e o outro recebe a resposta como contexto', async () => {
+    const { claude, codex } = fakes();
+    const { stdin, frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    // um subagente em segundo plano terminou e o Claude continuou sem mensagem nenhuma
+    claude.onOwnTurnEvent!({ kind: 'tool', text: 'Read devil.md' });
+    claude.onOwnTurnEvent!({ kind: 'text', text: 'O DEVIL APROVOU' });
+    claude.onOwnTurnReply!('O DEVIL APROVOU');
+    await tick();
+    const shown = frames.join('\n');
+    expect(shown).toContain('Read devil.md');
+    expect(shown).toContain('O DEVIL APROVOU');
+
+    await type(stdin, '/codex e você?');
+    expect(codex.prompts[0]).toContain('### Claude\nO DEVIL APROVOU');
+  });
+});
+
 describe('rodapé', () => {
   it('texto de cada um: modelo, contexto e subagentes', () => {
     expect(footerText({ subagents: 0 })).toBe('modelo ? · — tokens · sem agent');
@@ -383,7 +402,7 @@ describe('/brain', () => {
 
   it('resposta que falha encerra o brain; outro /brain no meio é recusado', async () => {
     const { claude, codex } = fakes();
-    claude.delayMs = 200;
+    claude.delayMs = 1000; // folga: o segundo /brain tem de chegar com o primeiro ainda rodando
     claude.script = ['PROPOSTA'];
     codex.script = ['!erro'];
     const { stdin, frames } = render(<App agents={{ claude, codex }} />);

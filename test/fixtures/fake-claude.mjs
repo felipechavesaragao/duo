@@ -9,6 +9,10 @@
 // "AGENTE" / "FIM" → um subagente começa (task_started, mais uma mensagem dele com parent_tool_use_id)
 //                   e termina (task_notification), como no 2.1.316.
 // "ARGS"           → responde com os argumentos da linha de comando.
+// "SOZINHO <texto>" → responde, e logo depois abre um turno sozinho, como o 2.1.316 quando uma tarefa em
+//                   segundo plano termina: task_notification, init, a resposta dele e o result. Mensagem que
+//                   chega nesses 300ms entra no mesmo turno: eco dela, a resposta e um result só para os dois.
+// Com --replay-user-messages, ecoa cada mensagem lida (com o uuid dela), como o 2.1.316.
 // Toda resposta traz usage (contexto = 1000 × número da mensagem) e o result traz o contextWindow.
 import readline from 'node:readline';
 
@@ -16,6 +20,7 @@ const args = process.argv.slice(2);
 const i = args.indexOf('--resume');
 const resume = i >= 0 ? args[i + 1] : undefined;
 const canAsk = args.includes('--permission-prompt-tool');
+const replay = args.includes('--replay-user-messages');
 const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 
 if (resume === 'sumiu') {
@@ -40,8 +45,9 @@ if (resume === 'sumiu') {
 
   const model = 'claude-falso-1';
   const usage = () => ({ input_tokens: 10, cache_creation_input_tokens: 90, cache_read_input_tokens: 1000 * n - 110, output_tokens: 10 });
-  const reply = (text, denials = []) => {
+  const say = (text) =>
     out({ type: 'assistant', session_id: sid, message: { model, usage: usage(), content: [{ type: 'text', text }] } });
+  const done = (denials = []) =>
     out({
       type: 'result',
       subtype: 'success',
@@ -51,7 +57,29 @@ if (resume === 'sumiu') {
       permission_denials: denials,
       modelUsage: { [model]: { contextWindow: 200000 } },
     });
+  const reply = (text, denials = []) => {
+    say(text);
+    done(denials);
   };
+  const echo = (msg) =>
+    replay && out({ type: 'user', session_id: sid, uuid: msg.uuid, isReplay: true, parent_tool_use_id: null, message: msg.message });
+
+  /** mensagens que chegaram no meio do turno que ele abriu sozinho; null = nenhum aberto */
+  let own = null;
+  const ownTurn = async (text) => {
+    own = [];
+    out({ type: 'system', subtype: 'task_notification', task_id: 'tarefa-bg', status: 'completed', session_id: sid });
+    out({ type: 'system', subtype: 'init', session_id: sid, model });
+    say(`sozinho: ${text}`);
+    await new Promise((r) => setTimeout(r, 300));
+    for (const msg of own) {
+      echo(msg);
+      say(`eco: ${msg.message.content}`);
+    }
+    own = null;
+    done();
+  };
+
   readline.createInterface({ input: process.stdin }).on('line', async (line) => {
     const msg = JSON.parse(line);
     if (msg.type === 'control_response') {
@@ -59,9 +87,16 @@ if (resume === 'sumiu') {
       pending.delete(msg.response.request_id);
       return resolve?.(msg.response);
     }
+    if (own) return void own.push(msg);
     if (++n === 1) out({ type: 'system', subtype: 'init', session_id: sid, model });
+    echo(msg);
     const text = msg.message.content;
     if (text === 'ARGS') return reply(`eco: ${JSON.stringify(args)}`);
+    if (text.startsWith('SOZINHO ')) {
+      reply('eco: lancei');
+      setTimeout(() => ownTurn(text.slice(8)), 100);
+      return;
+    }
     if (text === 'AGENTE') {
       out({ type: 'system', subtype: 'task_started', task_id: 'tarefa-1', tool_use_id: 'toolu_a', task_type: 'local_agent', session_id: sid });
       const big = { input_tokens: 999999, output_tokens: 1 }; // do subagente: não é o contexto da conversa

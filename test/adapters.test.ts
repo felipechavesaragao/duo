@@ -113,6 +113,33 @@ describe('ClaudeAgent', () => {
     expect(errors).toEqual(['permissão negada: Bash git push (veja --claude-permission)']);
   });
 
+  it('turno que ele abre sozinho (tarefa em segundo plano terminou) aparece, e a próxima mensagem não leva a resposta dele', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const own: string[] = [];
+    const replies: string[] = [];
+    agent.onOwnTurnEvent = (ev) => own.push(ev.text);
+    agent.onOwnTurnReply = (text) => replies.push(text);
+    expect(await agent.send('SOZINHO o devil aprovou', noop)).toBe('eco: lancei');
+    await vi.waitFor(() => expect(replies).toEqual(['sozinho: o devil aprovou']));
+    expect(own).toEqual(['sozinho: o devil aprovou']);
+    expect(await agent.send('e agora?', noop)).toBe('eco: e agora?');
+  });
+
+  it('mensagem que chega no meio do turno que ele abriu sozinho: cada resposta vai para o seu lugar', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const seen: string[] = [];
+    const replies: string[] = [];
+    agent.onOwnTurnEvent = (ev) => seen.push(ev.text);
+    agent.onOwnTurnReply = (text) => replies.push(text);
+    await agent.send('SOZINHO o Fog respondeu', noop);
+    await vi.waitFor(() => expect(seen).toContain('sozinho: o Fog respondeu')); // o turno dele está aberto
+    const texts: string[] = [];
+    const answer = await agent.send('devil?', (ev) => texts.push(ev.text)); // o CLI junta os dois num result só
+    expect(answer).toBe('eco: devil?');
+    expect(texts).toEqual(['eco: devil?']);
+    expect(replies).toEqual(['sozinho: o Fog respondeu']);
+  });
+
   it('o processo cai com a pergunta aberta: o pedido é cancelado', async () => {
     const agent = track(new ClaudeAgent({ bin: fakeClaude }));
     let signal: AbortSignal | undefined;

@@ -50,6 +50,12 @@ export interface Agent {
   askPermission?: (req: PermissionRequest) => Promise<boolean>;
   /** fala com o outro agente da janela; resolve com a resposta dele. Sem ele, o agente não ganha a ferramenta. */
   askPeer?: (req: PeerRequest) => Promise<string>;
+  /**
+   * Turno que o próprio CLI abre, sem mensagem do duo (o Claude é avisado de que um subagente ou comando em
+   * segundo plano terminou e continua sozinho): `onOwnTurnEvent` recebe o que ele faz; `onOwnTurnReply`, a resposta.
+   */
+  onOwnTurnEvent?: EmitFn;
+  onOwnTurnReply?: (text: string) => void;
   /** Manda uma mensagem. Resolve com a resposta final em texto. Mensagens são enfileiradas. */
   send(prompt: string, emit: EmitFn): Promise<string>;
   /** Esquece a conversa: a próxima mensagem começa uma sessão nova. */
@@ -83,6 +89,16 @@ export function createQueue() {
     chain = p.catch(() => undefined);
     return p;
   };
+}
+
+/** Quando continuar e quando parar o vaivém com o outro agente (vai na instrução de cada um). */
+export function peerLoopHint(other: string): string {
+  return (
+    `Numa revisão ou discussão com o ${other}, persista no vaivém: resolva o que ele apontou (corrija, ou rebata com ` +
+    `prova) e chame de novo, até ele concordar sem ressalvas (convergiram) ou ficar claro que não vão convergir; aí ` +
+    `pare e leve a divergência ao usuário. Não pare no meio esperando o usuário mandar continuar. Se o projeto tem um ` +
+    `protocolo próprio de revisão (rodadas, limites), siga o dele.`
+  );
 }
 
 export function truncate(s: string, max = 120): string {

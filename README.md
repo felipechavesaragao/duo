@@ -58,7 +58,9 @@ Depois é só rodar `duo` na pasta do projeto em que você quer trabalhar. Os do
 
 No `/todos`, os dois respondem ao mesmo tempo e nenhum vê a resposta do outro àquela mensagem. Cada um fica sabendo da resposta do outro na mensagem seguinte.
 
-**Um chama o outro sozinho**: o duo dá ao Claude a ferramenta `falar_com_codex` e ao Codex a `falar_com_claude`, e avisa os dois de que elas existem. A mensagem aparece na janela como `[para o Codex] …` (ou `[para o Claude] …`), vira um turno normal de quem foi chamado (na fila dele, com o contexto da janela) e a resposta volta para quem chamou, que continua de onde estava. Quem está esperando uma resposta não pode ser chamado de volta: o duo recusa na hora, em vez de deixar os dois travados um esperando o outro.
+**Um chama o outro sozinho**: o duo dá ao Claude a ferramenta `falar_com_codex` e ao Codex a `falar_com_claude`, e avisa os dois de que elas existem. A mensagem aparece na janela como `[para o Codex] …` (ou `[para o Claude] …`), vira um turno normal de quem foi chamado (na fila dele, com o contexto da janela) e a resposta volta para quem chamou, que continua de onde estava. Quem está esperando uma resposta não pode ser chamado de volta: o duo recusa na hora, em vez de deixar os dois travados um esperando o outro. Numa revisão, quem chamou insiste até os dois convergirem ou ficar claro que não vão convergir (aí a divergência vai para você); quem foi chamado termina dizendo se concorda ou o que ainda falta. Se o projeto tem um protocolo de revisão próprio, vale o dele.
+
+Quando um subagente ou comando do Claude em segundo plano termina, ele continua sozinho, sem mensagem sua. Esse turno aparece na janela como os outros, e a resposta entra no contexto do Codex.
 
 O Codex só recebe a ferramenta numa conversa nova: o app-server aceita ferramentas do cliente só ao abrir a conversa, não ao retomar. Uma conversa do Codex aberta por uma versão anterior do duo continua sem ela até um `/novo`.
 

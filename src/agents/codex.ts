@@ -4,6 +4,7 @@ import { killTree, onJsonLines, stderrTail } from './process.js';
 import {
   createQueue,
   patchStats,
+  peerLoopHint,
   ResumeFailedError,
   truncate,
   type Agent,
@@ -31,7 +32,8 @@ const PEER_HINT =
   '[duo] Você está no duo, numa janela compartilhada com o usuário e com o Claude (o Cla). Para falar com o Claude ' +
   '(pedir revisão, segunda opinião ou uma tarefa), use a ferramenta falar_com_claude: a resposta dele volta para você, ' +
   'e o usuário acompanha tudo na janela. Se a ferramenta não estiver na sua lista, esta conversa começou antes dela ' +
-  'existir: avise o usuário que só uma conversa nova (/novo no duo) a recebe.';
+  'existir: avise o usuário que só uma conversa nova (/novo no duo) a recebe. ' +
+  peerLoopHint('Claude');
 
 export interface CodexOptions {
   /** read-only | workspace-write | danger-full-access. Vazio = livre: sem sandbox e sem aprovações. */
