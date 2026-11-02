@@ -2,6 +2,7 @@
   "name": "duo",
   "version": "0.1.0",
   "description": "Claude Code e Codex na mesma janela do terminal",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "duo": "dist/cli.js"
