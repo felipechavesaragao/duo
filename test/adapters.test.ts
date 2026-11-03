@@ -72,7 +72,7 @@ describe('ClaudeAgent', () => {
     agent.onStats = seen;
     expect(agent.stats).toEqual({ model: undefined, subagents: 0 });
     await agent.send('oi', noop);
-    expect(agent.stats).toEqual({ model: 'claude-falso-1', contextTokens: 1000, contextWindow: 200000, subagents: 0 });
+    expect(agent.stats).toMatchObject({ model: 'claude-falso-1', contextTokens: 1000, contextWindow: 200000, subagents: 0 });
     const shown: string[] = [];
     // o texto do subagente não vira resposta do Claude nem aparece como dele
     expect(await agent.send('AGENTE', (ev) => shown.push(ev.text))).toBe('eco: AGENTE');
@@ -83,6 +83,90 @@ describe('ClaudeAgent', () => {
     expect(seen).toHaveBeenLastCalledWith(agent.stats);
     agent.reset();
     expect(agent.stats).toMatchObject({ contextTokens: undefined, subagents: 0 });
+  });
+
+  it('seletor de modelo: a lista do CLI, o que vale antes da primeira mensagem, e a troca sem abrir turno', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const lists: unknown[] = [];
+    agent.onModels = (m) => lists.push(m);
+    const replies: string[] = [];
+    agent.onOwnTurnReply = (text) => replies.push(text);
+    agent.warmUp();
+    await vi.waitFor(() => expect(agent.stats).toMatchObject({ model: 'claude-falso-1', effort: 'medium' }));
+    expect(agent.models).toEqual([
+      { id: 'default', resolved: 'claude-falso-1', name: 'Padrão (recomendado)', description: 'Falso 1 · o de sempre', efforts: ['low', 'medium', 'high'], fast: false },
+      { id: 'ligeiro', resolved: 'claude-ligeiro-1', name: 'Ligeiro 1', description: 'o rápido', efforts: ['low', 'high'], fast: false },
+      { id: 'claude-velho-1', resolved: 'claude-velho-1', name: 'Velho 1', description: 'sem esforço', efforts: [], fast: false },
+    ]);
+    expect(lists).toEqual([agent.models]);
+
+    await agent.setModel({ model: 'ligeiro', effort: 'high' });
+    expect(agent.stats).toMatchObject({ model: 'claude-ligeiro-1', selected: 'ligeiro', effort: 'high' });
+    expect(await agent.send('MODELO', noop)).toBe('eco: claude-ligeiro-1 high');
+    await agent.setModel({ effort: 'low' });
+    expect(agent.stats).toMatchObject({ model: 'claude-ligeiro-1', selected: 'ligeiro', effort: 'low' });
+    // modelo sem esforço: o CLI diz null, e o rodapé fica sem
+    await agent.setModel({ model: 'claude-velho-1' });
+    expect(agent.stats).toMatchObject({ model: 'claude-velho-1', selected: 'claude-velho-1', effort: undefined });
+    expect(replies).toEqual([]); // nenhuma troca abriu turno
+  });
+
+  it('seletor de modelo: o processo seguinte sobe com o que foi escolhido', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude, model: 'default' }));
+    agent.warmUp();
+    await vi.waitFor(() => expect(agent.models).toHaveLength(3));
+    await agent.setModel({ model: 'ligeiro', effort: 'high' });
+    agent.reset(); // o /novo derruba o processo
+    const args = JSON.parse((await agent.send('ARGS', noop)).slice('eco: '.length));
+    expect(args.slice(args.indexOf('--model'), args.indexOf('--model') + 2)).toEqual(['--model', 'ligeiro']);
+    expect(args.slice(args.indexOf('--effort'), args.indexOf('--effort') + 2)).toEqual(['--effort', 'high']);
+    expect(await agent.send('MODELO', noop)).toBe('eco: claude-ligeiro-1 high');
+    expect(agent.stats).toMatchObject({ model: 'claude-ligeiro-1', selected: 'ligeiro', effort: 'high' });
+  });
+
+  it('seletor de modelo: o que o CLI recusa rejeita com o motivo e não fica para o próximo processo', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    agent.warmUp();
+    await vi.waitFor(() => expect(agent.stats.effort).toBe('medium'));
+    await expect(agent.setModel({ model: 'nao-existe' })).rejects.toThrow('not_found');
+    expect(agent.stats).toMatchObject({ model: 'claude-falso-1', selected: undefined });
+    agent.reset();
+    expect(await agent.send('ARGS', noop)).not.toContain('--model');
+  });
+
+  it('seletor de modelo: o esforço que o modelo novo não aceita não volta no processo seguinte', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    agent.warmUp();
+    await vi.waitFor(() => expect(agent.models).toHaveLength(3));
+    await agent.setModel({ effort: 'medium' });
+    await agent.setModel({ model: 'ligeiro' }); // o Ligeiro não tem medium: o CLI fica com o low
+    expect(agent.stats).toMatchObject({ model: 'claude-ligeiro-1', effort: 'low' });
+    agent.reset();
+    const args: string[] = JSON.parse((await agent.send('ARGS', noop)).slice('eco: '.length));
+    expect(args.slice(args.indexOf('--effort'), args.indexOf('--effort') + 2)).toEqual(['--effort', 'low']);
+    await agent.setModel({ model: 'claude-velho-1' }); // sem esforço: o próximo processo sobe sem --effort
+    agent.reset();
+    expect(await agent.send('ARGS', noop)).not.toContain('--effort');
+  });
+
+  it('seletor de modelo: o modelo trocado por fora do seletor traz o esforço que vale nele', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    agent.warmUp();
+    await vi.waitFor(() => expect(agent.stats).toMatchObject({ model: 'claude-falso-1', effort: 'medium' }));
+    await agent.send('TROCA claude-velho-1', noop); // um /model mandado como mensagem
+    await agent.send('MODELO', noop); // o turno seguinte abre com o system/init do Velho, que não tem esforço
+    await vi.waitFor(() => expect(agent.stats).toMatchObject({ model: 'claude-velho-1', effort: undefined }));
+    await agent.send('TROCA ligeiro', noop); // o Ligeiro não tem medium: o CLI fica com o low
+    await agent.send('MODELO', noop);
+    await vi.waitFor(() => expect(agent.stats).toMatchObject({ model: 'claude-ligeiro-1', effort: 'low' }));
+  });
+
+  it('seletor de modelo: o processo que não sobe (error sem exit) solta a troca pendente com o motivo', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const run = (agent as any).ensureProcess();
+    const pending = (agent as any).control(run, { subtype: 'get_settings' });
+    run.proc.emit('error', new Error('spawn falhou'));
+    await expect(pending).rejects.toThrow('não consegui iniciar o claude: spawn falhou');
   });
 
   it('segundo plano: o subagente aparece com o que faz, o tipo e o progresso, e sai quando termina', async () => {
@@ -414,13 +498,38 @@ describe('CodexAgent (app-server)', () => {
   it('rodapé: modelo, contexto da conversa principal e subagentes rodando', async () => {
     const agent = track(new CodexAgent({ bin: fakeCodex }));
     await agent.send('oi', noop);
-    expect(agent.stats).toEqual({ model: 'gpt-falso', contextTokens: 5000, contextWindow: 475000, subagents: 0 });
+    expect(agent.stats).toEqual({ model: 'gpt-falso', effort: 'high', fast: true, contextTokens: 5000, contextWindow: 475000, subagents: 0 });
     await agent.send('AGENTE', noop);
     expect(agent.stats).toMatchObject({ contextTokens: 10000, subagents: 1 }); // a conversa do filho não conta
     await agent.send('FIM', noop);
     expect(agent.stats.subagents).toBe(0);
     agent.reset();
     expect(agent.stats.contextTokens).toBeUndefined();
+  });
+
+  it('seletor de modelo: a lista do model/list, o que vale antes da conversa, e a troca vai em cada turn/start', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    agent.warmUp();
+    // todas as páginas, sem o escondido; e o config/read antes de abrir a conversa
+    await vi.waitFor(() => expect(agent.models).toHaveLength(2));
+    expect(agent.models).toEqual([
+      { id: 'gpt-falso', resolved: 'gpt-falso', name: 'GPT Falso', description: 'o de sempre', efforts: ['low', 'high'], defaultEffort: 'low', fast: true },
+      { id: 'gpt-mini', resolved: 'gpt-mini', name: 'GPT Mini', description: 'o pequeno', efforts: ['medium'], defaultEffort: 'medium', fast: false },
+    ]);
+    await vi.waitFor(() => expect(agent.stats).toMatchObject({ model: 'gpt-falso', effort: 'high', fast: true }));
+    expect(await agent.send('TURNO', noop)).toBe('{}'); // nada escolhido: o turno segue a conversa
+
+    await agent.setModel({ model: 'gpt-mini', effort: 'medium', fast: false });
+    expect(agent.stats).toMatchObject({ model: 'gpt-mini', selected: 'gpt-mini', effort: 'medium', fast: undefined });
+    expect(JSON.parse(await agent.send('TURNO', noop))).toEqual({ model: 'gpt-mini', effort: 'medium', serviceTier: null });
+    // conversa nova: o thread/start diz o que o config.toml manda, e o escolhido continua por cima
+    agent.reset();
+    expect(JSON.parse(await agent.send('TURNO', noop))).toEqual({ model: 'gpt-mini', effort: 'medium', serviceTier: null });
+    expect(agent.stats).toMatchObject({ model: 'gpt-mini', selected: 'gpt-mini', effort: 'medium' });
+
+    await agent.setModel({ model: 'gpt-falso', effort: 'low', fast: true });
+    expect(agent.stats).toMatchObject({ model: 'gpt-falso', effort: 'low', fast: true });
+    expect(JSON.parse(await agent.send('TURNO', noop))).toEqual({ model: 'gpt-falso', effort: 'low', serviceTier: 'priority' });
   });
 
   it('segundo plano: o subagente aparece com o nome e o modelo, e sai quando termina', async () => {

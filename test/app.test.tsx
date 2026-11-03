@@ -25,6 +25,8 @@ class FakeAgent implements Agent {
   onStats?: (stats: AgentStats) => void;
   commands: AgentCommand[] = [];
   onCommands?: (commands: AgentCommand[]) => void;
+  models = [];
+  async setModel() {}
   onOwnTurnEvent?: Agent['onOwnTurnEvent'];
   onOwnTurnReply?: Agent['onOwnTurnReply'];
   onRemoteMessage?: Agent['onRemoteMessage'];

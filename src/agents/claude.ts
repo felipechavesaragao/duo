@@ -11,10 +11,12 @@ import {
   peerLoopHint,
   type Agent,
   type AgentCommand,
+  type AgentModel,
   type AgentStats,
   type AgentTask,
   type EmitFn,
   type ImageInput,
+  type ModelChoice,
   type PeerRequest,
   type PermissionRequest,
 } from './types.js';
@@ -81,6 +83,8 @@ interface Running {
   remoteControlRequest?: string;
   /** request_id do initialize, que traz a lista de comandos */
   initRequest: string;
+  /** pedidos de controle do duo esperando a resposta do CLI (o seletor de modelo), por request_id */
+  controls: Map<string, { resolve: (response: any) => void; reject: (err: Error) => void }>;
 }
 
 interface Turn {
@@ -136,6 +140,13 @@ interface Turn {
  * saída vem como resposta. Os `terminal_slash_commands` do `system/init` (doctor, color, focus...) também
  * rodam no `-p` (o /doctor vira um prompt) ou respondem que não estão disponíveis: ficam na lista.
  *
+ * Modelo e esforço (medido em 03/11/2026, 2.1.316): o initialize traz `models` [{value, resolvedModel,
+ * displayName, description, supportedEffortLevels, supportsFastMode}]; o `control_request` set_model {model} troca
+ * o modelo e responde com o id resolvido, o apply_flag_settings {settings: {effortLevel}} troca o esforço (valor
+ * que o modelo não aceita é ignorado sem erro), e o get_settings diz em `applied` {model, effort} o que ficou. Nada
+ * disso abre turno, e vale só para o processo: o próximo sobe com --model e --effort. O modo rápido não liga no
+ * `-p` (sdk_opt_in_required).
+ *
  * Retomada que falha (medido em 02/11/2026, Claude Code 2.1.316): com um id inexistente ele manda
  * um `result` de erro SEM o `system/init`, escreve "No conversation found with session ID" no
  * stderr e sai sozinho ~1,4s depois, mesmo com o stdin aberto.
@@ -152,10 +163,14 @@ export class ClaudeAgent implements Agent {
   onNotice?: EmitFn;
   onStats?: (stats: AgentStats) => void;
   onCommands?: (commands: AgentCommand[]) => void;
+  onModels?: (models: AgentModel[]) => void;
   onTasks?: (tasks: AgentTask[]) => void;
   onSignal?: () => void;
   commands: AgentCommand[] = [];
+  models: AgentModel[] = [];
   readonly stats: AgentStats;
+  /** o modelo e o esforço escolhidos no duo: cada processo novo sobe com eles */
+  private choice: { model?: string; effort?: string };
   private run?: Running;
   private sessionId?: string;
   private turn?: Turn;
@@ -165,7 +180,8 @@ export class ClaudeAgent implements Agent {
 
   constructor(private readonly opts: ClaudeOptions) {
     this.sessionId = opts.resumeId;
-    this.stats = { model: opts.model, subagents: 0 };
+    this.choice = { model: opts.model };
+    this.stats = { model: opts.model, selected: opts.model, subagents: 0 };
   }
 
   get resumeId(): string | undefined {
@@ -205,6 +221,41 @@ export class ClaudeAgent implements Agent {
     this.ensureProcess();
   }
 
+  async setModel(choice: ModelChoice): Promise<void> {
+    const run = this.ensureProcess();
+    if (choice.model !== undefined) {
+      await this.control(run, { subtype: 'set_model', model: choice.model });
+      this.choice.model = choice.model;
+    }
+    if (choice.effort !== undefined) {
+      await this.control(run, { subtype: 'apply_flag_settings', settings: { effortLevel: choice.effort } });
+      this.choice.effort = choice.effort;
+    }
+    this.applySettings(await this.control(run, { subtype: 'get_settings' }));
+  }
+
+  /** Um pedido de controle ao processo; resolve com a resposta dele, rejeita se ele recusar ou cair antes. */
+  private control(run: Running, request: object): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const id = `duo-ctl-${randomUUID()}`;
+      run.controls.set(id, { resolve, reject });
+      run.proc.stdin?.write(JSON.stringify({ type: 'control_request', request_id: id, request }) + '\n');
+    });
+  }
+
+  /** O que ficou valendo, pelo get_settings: o modelo resolvido e o esforço (o modelo sem esforço volta null). */
+  private applySettings(response: any): void {
+    const applied = response?.applied ?? {};
+    const effort = typeof applied.effort === 'string' ? applied.effort : undefined;
+    // o esforço que o modelo não aceita o CLI ignora: o próximo processo sobe com o que ficou, não com o recusado
+    if (this.choice.effort !== undefined && this.choice.effort !== effort) this.choice.effort = effort;
+    patchStats(this, {
+      ...(typeof applied.model === 'string' ? { model: applied.model } : {}),
+      effort,
+      selected: this.choice.model,
+    });
+  }
+
   reset(): void {
     this.stop();
     this.sessionId = undefined;
@@ -231,7 +282,8 @@ export class ClaudeAgent implements Agent {
       args.push('--append-system-prompt', PEER_HINT);
     }
     if (this.opts.permissionMode) args.push('--permission-mode', this.opts.permissionMode);
-    if (this.opts.model) args.push('--model', this.opts.model);
+    if (this.choice.model) args.push('--model', this.choice.model);
+    if (this.choice.effort) args.push('--effort', this.choice.effort);
     if (this.sessionId) args.push('--resume', this.sessionId);
 
     const [cmd, ...pre] = this.opts.bin ?? ['claude'];
@@ -255,6 +307,7 @@ export class ClaudeAgent implements Agent {
       ownFromApp: false,
       taskShared: new Map(),
       initRequest: `duo-init-${randomUUID()}`,
+      controls: new Map(),
     };
     onJsonLines(proc, (msg) => {
       if (this.run === run) this.onSignal?.();
@@ -275,6 +328,7 @@ export class ClaudeAgent implements Agent {
 
   private onExit(run: Running, code: number | null): void {
     for (const ask of run.asks.values()) ask.abort(); // a pergunta sai da tela: ninguém mais espera a resposta
+    this.dropControls(run, new Error(`o processo do claude encerrou (código ${code ?? '?'})`));
     if (this.run === run || !this.run) {
       patchStats(this, { subagents: 0 }); // os subagentes morreram junto
       if (run.tasks.size > 0) this.onTasks?.([]);
@@ -298,8 +352,15 @@ export class ClaudeAgent implements Agent {
     this.fail(run, err);
   }
 
-  /** O processo morreu: esquece ele e derruba o turno que dependia dele. */
+  /** Os pedidos de controle esperando este processo não vão ter resposta: rejeita cada um com o motivo. */
+  private dropControls(run: Running, err: Error): void {
+    for (const ctl of run.controls.values()) ctl.reject(err);
+    run.controls.clear();
+  }
+
+  /** O processo morreu (ou nem subiu: `error` sem `exit`): esquece ele e derruba o que dependia dele. */
   private fail(run: Running, err: Error): void {
+    this.dropControls(run, err);
     if (this.run === run) this.run = undefined;
     if (this.turn?.proc === run.proc) this.settle(this.turn, err);
   }
@@ -323,7 +384,18 @@ export class ClaudeAgent implements Agent {
     if (msg.type === 'control_response') {
       const res = msg.response ?? {};
       if (res.request_id === run.initRequest) {
-        if (res.subtype === 'success') this.setCommands(res.response?.commands);
+        if (res.subtype !== 'success') return;
+        this.setCommands(res.response?.commands);
+        this.setModels(res.response?.models);
+        // o modelo e o esforço que ficaram valendo, já antes da primeira mensagem (o chip da janela)
+        this.control(run, { subtype: 'get_settings' }).then((r) => this.run === run && this.applySettings(r), () => undefined);
+        return;
+      }
+      const ctl = run.controls.get(res.request_id);
+      if (ctl) {
+        run.controls.delete(res.request_id);
+        if (res.subtype === 'success') ctl.resolve(res.response ?? {});
+        else ctl.reject(new Error(res.error ?? 'o claude recusou sem dizer o motivo'));
         return;
       }
       if (res.request_id !== run.remoteControlRequest) return;
@@ -434,6 +506,25 @@ export class ClaudeAgent implements Agent {
     this.onCommands?.(this.commands);
   }
 
+  /** Os modelos do initialize. Avisa só se a lista mudou (cada processo novo manda a mesma). */
+  private setModels(list: unknown): void {
+    if (!Array.isArray(list)) return;
+    const str = (v: unknown, fallback: string) => (typeof v === 'string' ? v : fallback);
+    const models: AgentModel[] = list
+      .filter((m) => typeof m?.value === 'string')
+      .map((m) => ({
+        id: m.value,
+        resolved: str(m.resolvedModel, m.value),
+        name: str(m.displayName, m.value),
+        description: str(m.description, ''),
+        efforts: Array.isArray(m.supportedEffortLevels) ? m.supportedEffortLevels.filter((e: unknown) => typeof e === 'string') : [],
+        fast: false, // o supportsFastMode vem, mas o `-p` não liga o modo rápido
+      }));
+    if (JSON.stringify(models) === JSON.stringify(this.models)) return;
+    this.models = models;
+    this.onModels?.(models);
+  }
+
   /** O CLI leu a mensagem do duo: o turno que ele abriu sozinho (se havia) termina aqui, e o do duo começa. */
   private startTurn(run: Running, turn: Turn): void {
     if (turn.started) return;
@@ -506,7 +597,10 @@ export class ClaudeAgent implements Agent {
   /** Modelo, contexto e subagentes, para o rodapé. Vale também fora de um turno (subagente em segundo plano). */
   private trackStats(run: Running, msg: any): void {
     if (msg.type === 'system' && msg.subtype === 'init' && typeof msg.model === 'string') {
+      const changed = msg.model !== this.stats.model;
       patchStats(this, { model: msg.model });
+      // trocado por fora do seletor (um /model mandado como mensagem): o esforço que vale agora só o get_settings diz
+      if (changed) this.control(run, { subtype: 'get_settings' }).then((r) => this.run === run && this.applySettings(r), () => undefined);
     } else if (msg.type === 'assistant' && !msg.parent_tool_use_id && msg.message?.usage) {
       const u = msg.message.usage;
       const tokens =

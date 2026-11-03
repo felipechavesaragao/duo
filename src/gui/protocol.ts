@@ -1,4 +1,4 @@
-import type { AgentCommand, AgentId, ImageInput } from '../agents/types.js';
+import type { AgentCommand, AgentId, AgentModel, ImageInput, ModelChoice } from '../agents/types.js';
 import type { DuoState, Entry } from '../core.js';
 
 /** O que passa entre o duo e a janela. Só tipos: a janela importa sem levar nada de Node. */
@@ -9,7 +9,7 @@ export interface Snapshot extends DuoState {
   cwd: string;
 }
 
-/** O estado que muda sem linha nova na tela. A lista de comandos vai à parte (é grande e quase não muda). */
+/** O estado que muda sem linha nova na tela. As listas de comandos e de modelos vão à parte (são grandes e quase não mudam). */
 export type Status = Pick<
   DuoState,
   'target' | 'shared' | 'busy' | 'asks' | 'stats' | 'brain' | 'tasks' | 'runningSince' | 'lastSignal'
@@ -22,6 +22,7 @@ export interface ServerEvents {
   clear: null;
   status: Status;
   commands: Record<AgentId, AgentCommand[]>;
+  models: Record<AgentId, AgentModel[]>;
   /** /sair: o duo encerrou */
   quit: null;
 }
@@ -36,6 +37,11 @@ export interface PastedImage {
 export interface SubmitBody {
   text: string;
   images?: PastedImage[];
+}
+
+/** POST /api/modelo: o seletor da janela. O resultado aparece na conversa. */
+export interface ModelBody extends ModelChoice {
+  agent: AgentId;
 }
 
 /** POST /api/answer */

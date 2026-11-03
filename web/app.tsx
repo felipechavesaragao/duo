@@ -10,12 +10,20 @@ import React, {
   type RefObject,
   type SetStateAction,
 } from 'react';
-import { truncate, type AgentCommand, type AgentId, type AgentStats, type AgentTask } from '../src/agents/types.js';
+import {
+  truncate,
+  type AgentCommand,
+  type AgentId,
+  type AgentModel,
+  type AgentStats,
+  type AgentTask,
+  type ModelChoice,
+} from '../src/agents/types.js';
 import type { Ask, Entry } from '../src/core.js';
-import { COLORS, footerText, NAMES } from '../src/display.js';
+import { COLORS, currentModel, footerText, modelLabel, NAMES } from '../src/display.js';
 import type { Who } from '../src/persist.js';
-import type { PastedImage, ServerEvents, Snapshot } from '../src/gui/protocol.js';
-import { agentCommandQuery, matchCommands, type Target } from '../src/router.js';
+import type { ModelBody, PastedImage, ServerEvents, Snapshot } from '../src/gui/protocol.js';
+import { agentCommandQuery, matchCommands, targetsOf, type Target } from '../src/router.js';
 
 /**
  * A janela: barra lateral com as ações do duo, a conversa no meio e o painel com o que está rodando, a pasta, o modo e
@@ -67,6 +75,7 @@ function useDuo(): [Snapshot | null, Conn] {
     on('clear', () => setSnap((s) => s && { ...s, entries: [] }));
     on('status', (status) => setSnap((s) => s && { ...s, ...status }));
     on('commands', (commands) => setSnap((s) => s && { ...s, commands }));
+    on('models', (models) => setSnap((s) => s && { ...s, models }));
     on('quit', () => {
       es.close();
       setConn('encerrado');
@@ -186,6 +195,8 @@ export function App() {
     run('/api/submit', images.length ? { text: value, images } : { text: value });
   const command = (cmd: string) => void send(cmd).catch(() => undefined);
   const answer = (ask: Ask, ok: boolean) => void run('/api/answer', { id: ask.id, ok }).catch(() => undefined);
+  const setModel = (agent: AgentId, choice: ModelChoice) =>
+    void run('/api/modelo', { agent, ...choice } satisfies ModelBody).catch(() => undefined);
   /** começa a mensagem por você (o brain, a lista de comandos) e põe o cursor no fim */
   const prefill = (value: string) => {
     setText(value);
@@ -259,6 +270,7 @@ export function App() {
             inputRef={inputRef}
             send={send}
             command={command}
+            setModel={setModel}
             prefill={prefill}
             onError={setError}
           />
@@ -713,11 +725,12 @@ function Composer(props: {
   inputRef: RefObject<HTMLTextAreaElement>;
   send: (text: string, images?: PastedImage[]) => Promise<boolean>;
   command: (cmd: string) => void;
+  setModel: (agent: AgentId, choice: ModelChoice) => void;
   prefill: (text: string) => void;
   onError: (msg: string) => void;
 }) {
-  const { snap, disabled, text, setText, inputRef, send, command, prefill, onError } = props;
-  const [menu, setMenu] = useState<'mais' | 'destino' | null>(null);
+  const { snap, disabled, text, setText, inputRef, send, command, setModel, prefill, onError } = props;
+  const [menu, setMenu] = useState<'mais' | 'destino' | AgentId | null>(null);
   const [images, setImages] = useState<Pasted[]>([]);
   /** prints colados que ainda estão sendo preparados (lidos, reduzidos) */
   const [preparing, setPreparing] = useState(0);
@@ -849,6 +862,18 @@ function Composer(props: {
           </button>
         </div>
       )}
+      {(menu === 'claude' || menu === 'codex') && (
+        <ModelMenu
+          key={menu}
+          name={snap.names[menu]}
+          models={snap.models[menu]}
+          stats={snap.stats[menu]}
+          onPick={(choice, close) => {
+            if (close) setMenu(null);
+            setModel(menu, choice);
+          }}
+        />
+      )}
       {menu === 'destino' && (
         <div className="menu menu-target">
           {TARGETS.map((t) => (
@@ -923,6 +948,24 @@ function Composer(props: {
           Para {targetName(snap.target)}
           {icons.chevronDown}
         </button>
+        {targetsOf(snap.target).map((id) => (
+          <button
+            key={id}
+            className="chip chip-model"
+            disabled={disabled || snap.models[id].length === 0}
+            style={tint(COLORS[id])}
+            title={
+              snap.models[id].length === 0
+                ? `a lista de modelos do ${snap.names[id]} ainda não carregou`
+                : `Modelo e esforço do ${snap.names[id]}`
+            }
+            onClick={() => setMenu((m) => (m === id ? null : id))}
+          >
+            {snap.target === 'todos' && <span className="menu-dot" />}
+            <span className="chip-label">{modelLabel(snap.models[id], snap.stats[id])}</span>
+            {icons.chevronDown}
+          </button>
+        ))}
         <button
           className={`chip${snap.shared ? '' : ' strong'}`}
           disabled={disabled}
@@ -935,6 +978,72 @@ function Composer(props: {
         <span className="spacer" />
         <span className="hint">Ctrl+V cola print · Shift+Enter quebra a linha · /ajuda</span>
       </div>
+    </div>
+  );
+}
+
+/**
+ * O seletor de modelo de um deles: os modelos que o CLI dele informa e, do modelo em uso, o submenu de esforço e o modo
+ * rápido (só se ele tem). `onPick` manda a troca; `close` = fechar o menu junto (o modo rápido deixa aberto).
+ */
+function ModelMenu(props: {
+  name: string;
+  models: AgentModel[];
+  stats: AgentStats;
+  onPick: (choice: ModelChoice, close: boolean) => void;
+}) {
+  const { name, models, stats, onPick } = props;
+  const [view, setView] = useState<'modelos' | 'esforco'>('modelos');
+  const current = currentModel(models, stats);
+  if (view === 'esforco' && current) {
+    return (
+      <div className="menu menu-model">
+        <button className="menu-back" onClick={() => setView('modelos')}>
+          {icons.chevronLeft}
+          Esforço do {current.name}
+        </button>
+        {current.efforts.map((e) => (
+          <button key={e} className={stats.effort === e ? 'on' : ''} onClick={() => onPick({ effort: e }, true)}>
+            {e}
+            {stats.effort === e && <span className="check">✓</span>}
+          </button>
+        ))}
+      </div>
+    );
+  }
+  return (
+    <div className="menu menu-model">
+      <div className="menu-title">Modelo do {name}</div>
+      <div className="menu-models">
+        {models.map((m) => (
+          <button
+            key={m.id}
+            className={m === current ? 'on' : ''}
+            title={m.id}
+            onClick={() => m !== current && onPick({ model: m.id }, true)}
+          >
+            <span className="model-text">
+              <span>{m.name}</span>
+              {m.description && <span className="model-desc">{m.description}</span>}
+            </span>
+            {m === current && <span className="check">✓</span>}
+          </button>
+        ))}
+      </div>
+      {current && (current.efforts.length > 0 || current.fast) && <div className="menu-sep" />}
+      {current && current.efforts.length > 0 && (
+        <button onClick={() => setView('esforco')}>
+          Esforço
+          <span className="menu-value">{stats.effort ?? '—'}</span>
+          {icons.chevronRight}
+        </button>
+      )}
+      {current?.fast && (
+        <div className="menu-row">
+          Modo rápido
+          <Switch on={stats.fast === true} label="Modo rápido" onClick={() => onPick({ fast: stats.fast !== true }, false)} />
+        </div>
+      )}
     </div>
   );
 }
@@ -1062,4 +1171,5 @@ const icons = {
   enter: svg(<path d="M19 5v6a3 3 0 01-3 3H6M10 10l-4 4 4 4" />),
   chevronDown: svg(<path d="M7 10l5 5 5-5" />),
   chevronRight: svg(<path d="M10 7l5 5-5 5" />),
+  chevronLeft: svg(<path d="M14 7l-5 5 5 5" />),
 };

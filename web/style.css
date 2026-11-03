@@ -731,6 +731,81 @@ textarea::placeholder {
   min-width: 200px;
 }
 
+/* o seletor de modelo */
+
+.chip-label {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu-model {
+  left: 0;
+  width: min(340px, calc(100vw - 32px));
+}
+
+.menu-title {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 6px 10px 4px;
+}
+
+.menu-models {
+  max-height: min(340px, 50vh);
+  overflow-y: auto;
+}
+
+.model-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.model-desc {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.menu-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 6px 4px;
+}
+
+.menu-value {
+  margin-left: auto;
+  color: var(--muted);
+}
+
+.menu-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 10px;
+  font-size: 14px;
+}
+
+.menu .menu-back {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* o interruptor do modo rápido não é um item do menu: fica do tamanho dele, e a cor é a do trilho */
+.menu .switch {
+  display: block;
+  width: 38px;
+  padding: 0;
+}
+
+.menu .switch:not(:disabled):hover {
+  background: var(--border);
+}
+
+.menu .switch.on:not(:disabled):hover {
+  background: var(--switch-on);
+}
+
 .menu-dot {
   width: 8px;
   height: 8px;

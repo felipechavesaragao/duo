@@ -3,8 +3,9 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { Agent, AgentCommand, AgentId, AgentStats, AgentTask, EmitFn, ImageInput } from '../src/agents/types.js';
+import type { Agent, AgentCommand, AgentId, AgentModel, AgentStats, AgentTask, EmitFn, ImageInput, ModelChoice } from '../src/agents/types.js';
 import { Duo } from '../src/core.js';
+import { currentModel, modelLabel } from '../src/display.js';
 import { startGui, type Gui } from '../src/gui/server.js';
 
 class FakeAgent implements Agent {
@@ -13,6 +14,14 @@ class FakeAgent implements Agent {
   resumeId: string | undefined = undefined;
   stats: AgentStats = { subagents: 0 };
   commands: AgentCommand[] = [];
+  models: AgentModel[] = [];
+  onModels?: Agent['onModels'];
+  onStats?: Agent['onStats'];
+  /** o que o seletor pediu, na ordem; `modelFails` faz a próxima troca falhar com essa mensagem */
+  choices: ModelChoice[] = [];
+  modelFails?: string;
+  /** enquanto existir, a troca espera por ele (o CLI ainda não respondeu) */
+  modelGate?: Promise<void>;
   disposed = 0;
   /** enquanto existir, o turno espera por ele */
   gate?: Promise<void>;
@@ -33,6 +42,19 @@ class FakeAgent implements Agent {
     const answer = `${this.name} responde ${this.prompts.length}`;
     emit({ kind: 'text', text: answer });
     return answer;
+  }
+  async setModel(choice: ModelChoice) {
+    this.choices.push(choice);
+    await this.modelGate;
+    if (this.modelFails) throw new Error(this.modelFails);
+    const { model, effort, fast } = choice;
+    this.stats = {
+      ...this.stats,
+      ...(model !== undefined ? { model, selected: model } : {}),
+      ...(effort !== undefined ? { effort } : {}),
+      ...(fast !== undefined ? { fast } : {}),
+    };
+    this.onStats?.({ ...this.stats });
   }
   warmUp() {}
   reset() {}
@@ -594,5 +616,116 @@ describe('janela: print colado', () => {
     expect(await bad([{ mediaType: 'image/png', data: big }])).toBe(413);
     expect(agents.claude.prompts).toHaveLength(0);
     expect(filesIn(imagesDir)).toHaveLength(0);
+  });
+});
+
+describe('janela: seletor de modelo', () => {
+  const list = (): AgentModel[] => [
+    { id: 'a', resolved: 'modelo-a', name: 'A', description: 'o primeiro', efforts: ['low', 'high', 'max'], defaultEffort: 'low', fast: true },
+    { id: 'b', resolved: 'modelo-b', name: 'B', description: 'o segundo', efforts: ['low'], defaultEffort: 'low', fast: false },
+  ];
+  /** o Codex com a lista e o que vale agora, como o adaptador avisa */
+  const ready = (agent: FakeAgent, stats: Partial<AgentStats>) => {
+    agent.models = list();
+    agent.onModels?.(agent.models);
+    agent.stats = { subagents: 0, ...stats };
+    agent.onStats?.({ ...agent.stats });
+  };
+  const last = (duo: Duo) => duo.getState().entries.at(-1);
+
+  it('a lista chega na janela, e a troca vai para o agente e aparece na conversa', async () => {
+    const { agents, duo, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    ready(agents.codex, { model: 'modelo-a', effort: 'high', fast: true });
+    expect(await events.next('models')).toEqual({ claude: [], codex: list() });
+
+    expect((await post('/api/modelo', { agent: 'codex', effort: 'max' })).status).toBe(200);
+    await vi.waitFor(() => expect(last(duo)).toMatchObject({ who: 'sistema', kind: 'text', text: 'modelo do Codex agora: A · max · rápido' }));
+    expect(agents.codex.choices).toEqual([{ effort: 'max' }]);
+    await events.next('status', (s) => s.stats.codex.effort === 'max');
+
+    await post('/api/modelo', { agent: 'codex', fast: false });
+    await vi.waitFor(() => expect(last(duo)?.text).toBe('modelo do Codex agora: A · max'));
+    expect(agents.codex.prompts).toEqual([]); // nenhuma troca virou mensagem
+    events.close();
+  });
+
+  it('trocar de modelo leva junto o que o novo não tem: o esforço vai para o padrão dele, e o rápido desliga', async () => {
+    const { agents, duo, post } = await setup();
+    ready(agents.codex, { model: 'modelo-a', effort: 'high', fast: true });
+    await post('/api/modelo', { agent: 'codex', model: 'b' });
+    await vi.waitFor(() => expect(last(duo)?.text).toBe('modelo do Codex agora: B · low'));
+    expect(agents.codex.choices).toEqual([{ model: 'b', effort: 'low', fast: false }]);
+    // o que o novo tem fica como está
+    await post('/api/modelo', { agent: 'codex', model: 'a' });
+    await vi.waitFor(() => expect(agents.codex.choices).toHaveLength(2));
+    expect(agents.codex.choices[1]).toEqual({ model: 'a' });
+  });
+
+  it('o que ele não oferece não chega nele, e a conversa diz por quê', async () => {
+    const { agents, duo, post } = await setup();
+    ready(agents.codex, { model: 'modelo-a', effort: 'high' });
+    const refused = async (body: object, why: string) => {
+      expect((await post('/api/modelo', body)).status).toBe(200);
+      await vi.waitFor(() => expect(last(duo)).toMatchObject({ who: 'sistema', kind: 'error', text: why }));
+    };
+    await refused({ agent: 'codex', model: 'z' }, 'não troquei o modelo do Codex: ele não oferece z');
+    await refused({ agent: 'codex', effort: 'ultra' }, 'não troquei o modelo do Codex: o A não tem o esforço ultra');
+    await refused({ agent: 'codex', model: 'b', effort: 'max' }, 'não troquei o modelo do Codex: o B não tem o esforço max');
+    await refused({ agent: 'codex', model: 'b', fast: true }, 'não troquei o modelo do Codex: o B não tem modo rápido');
+    await refused({ agent: 'claude', effort: 'low' }, 'não troquei o modelo do Claude: a lista de modelos dele ainda não carregou');
+    expect(agents.codex.choices).toEqual([]);
+    expect(agents.claude.choices).toEqual([]);
+  });
+
+  it('troca pedida antes de a anterior terminar confere contra o que a anterior deixou', async () => {
+    const { agents, duo, post } = await setup();
+    ready(agents.codex, { model: 'modelo-a', effort: 'high' });
+    let release!: () => void;
+    agents.codex.modelGate = new Promise<void>((r) => (release = r));
+    await post('/api/modelo', { agent: 'codex', model: 'b' }); // fica esperando o CLI
+    await post('/api/modelo', { agent: 'codex', effort: 'high' }); // valia no A, não vale no B
+    expect(agents.codex.choices).toEqual([{ model: 'b', effort: 'low' }]);
+    release();
+    await vi.waitFor(() =>
+      expect(last(duo)).toMatchObject({ kind: 'error', text: 'não troquei o modelo do Codex: o B não tem o esforço high' }),
+    );
+    expect(agents.codex.choices).toHaveLength(1);
+  });
+
+  it('o chip mostra o modelo que o CLI diz que está em uso, mesmo trocado por fora do seletor', async () => {
+    const { agents } = await setup();
+    ready(agents.codex, { model: 'modelo-b', selected: 'a', effort: 'low' }); // escolheu A, e um /model mandado por fora pôs o B
+    expect(currentModel(agents.codex.models, agents.codex.stats)?.id).toBe('b');
+    expect(modelLabel(agents.codex.models, agents.codex.stats)).toBe('B · low');
+    ready(agents.codex, { model: 'modelo-a', selected: 'a' });
+    expect(currentModel(agents.codex.models, agents.codex.stats)?.id).toBe('a');
+  });
+
+  it('o agente recusa: o motivo aparece na conversa', async () => {
+    const { agents, duo, post } = await setup();
+    ready(agents.codex, { model: 'modelo-a', effort: 'high' });
+    agents.codex.modelFails = 'not_found';
+    await post('/api/modelo', { agent: 'codex', model: 'b' });
+    await vi.waitFor(() =>
+      expect(last(duo)).toMatchObject({ who: 'sistema', kind: 'error', text: 'não troquei o modelo do Codex: not_found' }),
+    );
+  });
+
+  it('pedido malformado: 400, e nada chega no agente', async () => {
+    const { agents, post } = await setup();
+    ready(agents.codex, { model: 'modelo-a', effort: 'high' });
+    for (const body of [
+      { agent: 'outro', model: 'a' },
+      { agent: 'codex' },
+      { agent: 'codex', model: '' },
+      { agent: 'codex', effort: 7 },
+      { agent: 'codex', fast: 'sim' },
+      { agent: 'codex', model: 'a'.repeat(201) },
+    ]) {
+      expect((await post('/api/modelo', body)).status).toBe(400);
+    }
+    expect(agents.codex.choices).toEqual([]);
   });
 });

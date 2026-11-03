@@ -54,10 +54,39 @@ export interface AgentTask {
   lastAt: number;
 }
 
+/** Um modelo que o agente oferece, como o próprio CLI informa: o menu do seletor da janela. */
+export interface AgentModel {
+  /** o que vai para o CLI ao escolher (o Claude aceita apelidos: "opus", "default") */
+  id: string;
+  /** o modelo em que esse id dá, como o CLI informa o modelo em uso */
+  resolved: string;
+  name: string;
+  description: string;
+  /** os níveis de esforço que ele aceita, na ordem do CLI; vazio = não tem esforço para escolher */
+  efforts: string[];
+  /** o esforço que ele usa quando ninguém escolheu, quando o CLI informa */
+  defaultEffort?: string;
+  /** tem modo rápido, e o duo consegue ligar */
+  fast: boolean;
+}
+
+/** O que trocar no seletor da janela: o que fica de fora continua como está. */
+export interface ModelChoice {
+  model?: string;
+  effort?: string;
+  fast?: boolean;
+}
+
 /** O que o rodapé mostra de cada um. */
 export interface AgentStats {
   /** modelo em uso, como o CLI informou; undefined = ainda não sabe (antes da primeira mensagem) */
   model?: string;
+  /** o id da lista escolhido no duo (pelo seletor ou pela opção de linha de comando); undefined = o padrão do CLI */
+  selected?: string;
+  /** esforço em uso; undefined = não sabe, ou o modelo não tem */
+  effort?: string;
+  /** modo rápido ligado; undefined = não sabe, ou o modelo não tem */
+  fast?: boolean;
   /** tokens no contexto da conversa principal, pela última chamada ao modelo (subagentes não contam) */
   contextTokens?: number;
   /** tamanho da janela de contexto do modelo */
@@ -76,6 +105,16 @@ export interface Agent {
   readonly commands: AgentCommand[];
   /** chamado quando a lista de comandos muda */
   onCommands?: (commands: AgentCommand[]) => void;
+  /** os modelos que ele oferece; vazio até ele subir */
+  readonly models: AgentModel[];
+  /** chamado quando a lista de modelos chega ou muda */
+  onModels?: (models: AgentModel[]) => void;
+  /**
+   * Troca o modelo, o esforço ou o modo rápido, sem abrir turno; vale para as próximas mensagens e para os
+   * processos que ele subir depois (o /novo, uma queda). Resolve com `stats` já mostrando o que ficou; rejeita com o
+   * motivo. Quem chama manda só o que veio em `models` (o esforço da lista do modelo, o rápido só se ele tem).
+   */
+  setModel(choice: ModelChoice): Promise<void>;
   /** chamado quando um subagente ou comando em segundo plano começa, dá sinal de vida ou termina: a lista toda */
   onTasks?: (tasks: AgentTask[]) => void;
   /** chamado a cada coisa que chega do processo dele: é o sinal de vida que mostra se ele está travado */

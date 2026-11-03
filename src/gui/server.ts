@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ImageInput } from '../agents/types.js';
 import type { Duo, DuoState } from '../core.js';
-import type { ServerEvents, Snapshot, Status } from './protocol.js';
+import type { ModelBody, ServerEvents, Snapshot, Status } from './protocol.js';
 
 /**
  * A janela do duo: um servidor só para este computador (127.0.0.1) que entrega a página e liga ela ao duo.
@@ -156,6 +156,19 @@ const statusOf = (s: DuoState): Status => ({
   lastSignal: s.lastSignal,
 });
 
+/** O pedido do seletor: de quem, e ao menos uma coisa a trocar. Se o agente oferece aquilo, o duo confere. */
+function isModelBody(body: any): body is ModelBody {
+  const optional = (v: unknown, type: 'string' | 'boolean') =>
+    v === undefined || (typeof v === type && (type === 'boolean' || ((v as string).length > 0 && (v as string).length <= 200)));
+  return (
+    (body?.agent === 'claude' || body?.agent === 'codex') &&
+    optional(body.model, 'string') &&
+    optional(body.effort, 'string') &&
+    optional(body.fast, 'boolean') &&
+    (body.model !== undefined || body.effort !== undefined || body.fast !== undefined)
+  );
+}
+
 /** Confere os prints que vieram na mensagem e devolve cada um decodificado. Nada é gravado aqui. */
 function parseImages(raw: unknown): { type: ImageInput['mediaType']; body: Buffer }[] {
   if (raw === undefined) return [];
@@ -200,6 +213,7 @@ export async function startGui(duo: Duo, opts: GuiOptions = {}): Promise<Gui> {
   });
 
   let lastCommands = duo.getState().commands;
+  let lastModels = duo.getState().models;
   let lastStatus = JSON.stringify(statusOf(duo.getState()));
   const off = duo.subscribe((ev) => {
     switch (ev.type) {
@@ -214,6 +228,10 @@ export async function startGui(duo: Duo, opts: GuiOptions = {}): Promise<Gui> {
         if (state.commands !== lastCommands) {
           lastCommands = state.commands;
           broadcast('commands', state.commands);
+        }
+        if (state.models !== lastModels) {
+          lastModels = state.models;
+          broadcast('models', state.models);
         }
         const status = JSON.stringify(statusOf(state));
         if (status !== lastStatus) {
@@ -318,6 +336,10 @@ export async function startGui(duo: Duo, opts: GuiOptions = {}): Promise<Gui> {
         if (!ok) drop();
       } else if (url.pathname === '/api/answer' && Number.isInteger(body?.id) && typeof body?.ok === 'boolean') {
         ok = duo.answer(body.id, body.ok);
+      } else if (url.pathname === '/api/modelo' && isModelBody(body)) {
+        const { agent, model, effort, fast } = body;
+        void duo.setModel(agent, { model, effort, fast });
+        ok = true;
       } else {
         throw new HttpError(400, 'pedido inválido');
       }

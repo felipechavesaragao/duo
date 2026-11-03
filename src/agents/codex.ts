@@ -9,10 +9,12 @@ import {
   truncate,
   type Agent,
   type AgentCommand,
+  type AgentModel,
   type AgentStats,
   type AgentTask,
   type EmitFn,
   type ImageInput,
+  type ModelChoice,
   type PeerRequest,
 } from './types.js';
 
@@ -79,6 +81,14 @@ const RPC_TIMEOUT_MS = 120_000;
  * são as skills (`skills/list`, com name, description e o caminho do SKILL.md; `skills/changed` avisa que
  * mudaram). O terminal aciona uma skill mandando "$nome …" e o item {type: "skill", name, path} no turn/start.
  *
+ * Modelo e esforço (medido em 03/11/2026, 0.166.0): `model/list` traz cada modelo com os esforços que aceita
+ * (`supportedReasoningEfforts`), o padrão dele e os `serviceTiers` (o "priority", de nome "Fast", é o modo rápido);
+ * o `config/read` diz o que vale antes de abrir a conversa (model, model_reasoning_effort, service_tier), e a
+ * resposta do thread/start e do thread/resume, o que vale nela (model, reasoningEffort, serviceTier). Trocar é só
+ * pelo turn/start (`model`, `effort`, `serviceTier`, que valem para este turno e os seguintes): o rollout grava
+ * `thread_settings_applied` com o modelo, o esforço e o service_tier ("default" com serviceTier null, "priority" com
+ * o rápido). O que você escolhe vai no próximo turno, e em todos depois dele (uma conversa nova também).
+ *
  * Turnos (0.166.0): a resposta do turn/start traz `turn.id`; os itens e o `error` trazem `turnId`, e o
  * turn/completed traz `turn.id`. É por ele que cada turno só aceita os próprios eventos. `turn/interrupt`
  * {threadId, turnId} responde {} e o turno termina com status "interrupted" (medido: ~0,6s, com um comando
@@ -91,9 +101,11 @@ export class CodexAgent implements Agent {
   askPeer?: (req: PeerRequest) => Promise<string>;
   onStats?: (stats: AgentStats) => void;
   onCommands?: (commands: AgentCommand[]) => void;
+  onModels?: (models: AgentModel[]) => void;
   onTasks?: (tasks: AgentTask[]) => void;
   onSignal?: () => void;
   commands: AgentCommand[] = [];
+  models: AgentModel[] = [];
   readonly stats: AgentStats;
   /** espera máxima por uma resposta de controle, lida a cada pedido. Os testes encurtam depois que a conexão sobe. */
   rpcTimeoutMs = RPC_TIMEOUT_MS;
@@ -112,6 +124,12 @@ export class CodexAgent implements Agent {
   /** os mesmos subagentes, para o quadro de segundo plano da janela */
   private tasks = new Map<string, AgentTask>();
   private enqueue = createQueue();
+  /** o serviceTier do modo rápido de cada modelo, por id */
+  private fastTiers = new Map<string, string>();
+  /** o que o Codex diz que vale (config/read antes da conversa, depois a resposta dela); tier null = normal */
+  private current: { model?: string; effort?: string; tier?: string | null } = {};
+  /** o que você escolheu no duo: vai em cada turn/start */
+  private choice: { model?: string; effort?: string; tier?: string | null } = {};
 
   constructor(private readonly opts: CodexOptions) {
     this.threadId = opts.resumeId;
@@ -129,6 +147,34 @@ export class CodexAgent implements Agent {
   warmUp(): void {
     // falha aqui aparece na primeira mensagem, que tenta de novo
     this.connect().catch(() => undefined);
+  }
+
+  async setModel(choice: ModelChoice): Promise<void> {
+    if (choice.model !== undefined) this.choice.model = choice.model;
+    if (choice.effort !== undefined) this.choice.effort = choice.effort;
+    if (choice.fast !== undefined) {
+      this.choice.tier = choice.fast ? (this.fastTiers.get(this.choice.model ?? this.current.model ?? '') ?? null) : null;
+    }
+    this.showModel();
+  }
+
+  /** O chip e o rodapé: o que o Codex disse que vale, com o que você escolheu por cima (vai no próximo turno). */
+  private showModel(): void {
+    const model = this.choice.model ?? this.current.model ?? this.opts.model;
+    const fastTier = model === undefined ? undefined : this.fastTiers.get(model);
+    const tier = this.choice.tier !== undefined ? this.choice.tier : this.current.tier;
+    patchStats(this, {
+      model,
+      selected: this.choice.model ?? this.opts.model,
+      effort: this.choice.effort ?? this.current.effort,
+      fast: fastTier === undefined || tier === undefined ? undefined : tier === fastTier,
+    });
+  }
+
+  /** O que você escolheu, para o turn/start. */
+  private overrides(): Record<string, unknown> {
+    const { model, effort, tier } = this.choice;
+    return { ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(tier !== undefined ? { serviceTier: tier } : {}) };
   }
 
   reset(): void {
@@ -205,7 +251,49 @@ export class CodexAgent implements Agent {
     }
     conn.notify('initialized');
     void this.loadSkills(conn);
+    void this.loadModels(conn);
     return conn;
+  }
+
+  /** Os modelos (`model/list`, sem os escondidos) e o que vale antes de abrir a conversa (`config/read`). */
+  private async loadModels(conn: Connection): Promise<void> {
+    try {
+      const list: any[] = [];
+      let cursor: string | null = null;
+      do {
+        const page: any = await conn.request('model/list', cursor ? { cursor } : {});
+        list.push(...(page?.data ?? []));
+        cursor = typeof page?.nextCursor === 'string' ? page.nextCursor : null;
+      } while (cursor);
+      const shown = list.filter((m) => typeof m?.model === 'string' && !m.hidden);
+      this.fastTiers = new Map();
+      for (const m of shown) {
+        const tier = (m.serviceTiers ?? []).find((t: any) => /^fast$/i.test(t?.name ?? ''));
+        if (typeof tier?.id === 'string') this.fastTiers.set(m.model, tier.id);
+      }
+      const models: AgentModel[] = shown.map((m) => ({
+        id: m.model,
+        resolved: m.model,
+        name: typeof m.displayName === 'string' ? m.displayName : m.model,
+        description: typeof m.description === 'string' ? m.description : '',
+        efforts: (m.supportedReasoningEfforts ?? []).map((e: any) => e?.reasoningEffort).filter((e: unknown) => typeof e === 'string'),
+        defaultEffort: typeof m.defaultReasoningEffort === 'string' ? m.defaultReasoningEffort : undefined,
+        fast: this.fastTiers.has(m.model),
+      }));
+      if (JSON.stringify(models) !== JSON.stringify(this.models)) {
+        this.models = models;
+        this.onModels?.(models);
+      }
+      this.showModel(); // o modo rápido depende da lista: a conversa pode ter aberto antes dela
+      const config = (await conn.request('config/read', { cwd: this.opts.cwd ?? process.cwd() }))?.config ?? {};
+      if (this.opened || this.conn !== conn) return; // a conversa já disse o que vale nela
+      const model = this.opts.model ?? config.model ?? shown.find((m) => m.isDefault)?.model;
+      const effort = config.model_reasoning_effort ?? shown.find((m) => m.model === model)?.defaultReasoningEffort;
+      this.current = { model, effort: effort ?? undefined, tier: config.service_tier ?? null };
+      this.showModel();
+    } catch {
+      // codex sem model/list ou config/read: o seletor fica sem lista, e o chip, só com o modelo
+    }
   }
 
   /** As skills do Codex são a lista de comandos dele: `skills/list`, só as ligadas. */
@@ -301,8 +389,13 @@ export class CodexAgent implements Agent {
       this.threadId = id;
       this.onSessionId?.(id);
     }
-    if (typeof result.model === 'string') patchStats(this, { model: result.model });
+    this.current = {
+      model: typeof result.model === 'string' ? result.model : this.current.model,
+      effort: typeof result.reasoningEffort === 'string' ? result.reasoningEffort : this.current.effort,
+      tier: 'serviceTier' in result ? result.serviceTier : this.current.tier,
+    };
     this.opened = true;
+    this.showModel();
     return id;
   }
 
@@ -408,7 +501,8 @@ export class CodexAgent implements Agent {
         const id = late?.turn?.id;
         if (typeof id === 'string') conn.request('turn/interrupt', { threadId, turnId: id }).catch(() => undefined);
       };
-      conn.request('turn/start', { threadId, input: this.turnInput(prompt, images) }, interruptLate).then(
+      const params = { threadId, input: this.turnInput(prompt, images), ...this.overrides() };
+      conn.request('turn/start', params, interruptLate).then(
         (result: any) => {
           turnId = typeof result?.turn?.id === 'string' ? result.turn.id : undefined; // sem id: aceita todos
           waiting.turnId = turnId;

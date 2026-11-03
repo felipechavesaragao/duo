@@ -23,7 +23,13 @@
 // "/<comando>"     → comando local, como o /context no 2.1.316: "started", a saída (modelo <synthetic>), o eco
 //                   e o result, nessa ordem.
 // control_request "remote_control" → liga a ponte, como o 2.1.316: session_url na resposta e bridge_state.
-// control_request "initialize" → responde com a lista de comandos, como o 2.1.316.
+// control_request "initialize" → responde com a lista de comandos e a de modelos, como o 2.1.316.
+// control_request "set_model" / "apply_flag_settings" {effortLevel} / "get_settings" → como o 2.1.316: o set_model
+//                   responde com o id resolvido (o que não está na lista: erro), o esforço que o modelo não aceita é
+//                   ignorado sem erro, e o get_settings diz em `applied` o modelo e o esforço (null no modelo sem
+//                   esforço). --model e --effort valem desde o começo. "MODELO" → responde com o modelo e o esforço.
+// "TROCA <modelo>" → troca o modelo como um /model mandado como mensagem: o turno seguinte abre com o system/init
+//                   do modelo novo.
 // "MUDA"           → system/commands_changed com um comando a mais.
 // "APP <texto>"    → responde, e logo depois chega <texto> como se você tivesse digitado no app (Remote
 //                   Control): o eco dela com um uuid que não é do duo, e um turno inteiro respondendo.
@@ -59,7 +65,22 @@ if (resume === 'sumiu') {
     (await control({ subtype: 'mcp_message', server_name: 'duo', message: { jsonrpc: '2.0', ...message } })).response
       .mcp_response;
 
-  const model = 'claude-falso-1';
+  const models = [
+    { value: 'default', resolvedModel: 'claude-falso-1', displayName: 'Padrão (recomendado)', description: 'Falso 1 · o de sempre', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high'], supportsFastMode: true },
+    { value: 'ligeiro', resolvedModel: 'claude-ligeiro-1', displayName: 'Ligeiro 1', description: 'o rápido', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+    { value: 'claude-velho-1', resolvedModel: 'claude-velho-1', displayName: 'Velho 1', description: 'sem esforço' },
+  ];
+  const resolve = (value) => models.find((m) => m.value === value)?.resolvedModel;
+  const flag = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
+  let model = resolve(flag('--model') ?? 'default') ?? flag('--model');
+  let effort = flag('--effort') ?? 'medium';
+  /** o modelo do último system/init */
+  let announced;
+  /** o esforço que vale: o escolhido, se o modelo aceita; senão o primeiro dele; null no modelo sem esforço */
+  const appliedEffort = () => {
+    const levels = models.find((m) => m.resolvedModel === model)?.supportedEffortLevels;
+    return levels ? (levels.includes(effort) ? effort : levels[0]) : null;
+  };
   const commands = [
     { name: 'compact', description: 'Resume a conversa', argumentHint: '<instruções>' },
     { name: 'context', description: 'Mostra o uso de contexto', argumentHint: '' },
@@ -118,8 +139,23 @@ if (resume === 'sumiu') {
       return resolve?.(msg.response);
     }
     if (msg.type === 'control_request' && msg.request.subtype === 'initialize') {
-      const response = { commands, models: [], pid: process.pid };
+      const response = { commands, models, pid: process.pid };
       return out({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id, response } });
+    }
+    if (msg.type === 'control_request' && ['set_model', 'apply_flag_settings', 'get_settings'].includes(msg.request.subtype)) {
+      const ok = (response) => out({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id, response } });
+      const { subtype } = msg.request;
+      if (subtype === 'set_model') {
+        const resolved = resolve(msg.request.model);
+        if (!resolved) return out({ type: 'control_response', response: { subtype: 'error', request_id: msg.request_id, error: 'not_found' } });
+        model = resolved;
+        return ok({ model });
+      }
+      if (subtype === 'apply_flag_settings') {
+        if (typeof msg.request.settings?.effortLevel === 'string') effort = msg.request.settings.effortLevel;
+        return out({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id } });
+      }
+      return ok({ effective: { effortLevel: effort }, applied: { model, effort: appliedEffort() } });
     }
     if (msg.type === 'control_request' && msg.request.subtype === 'remote_control') {
       const response = { session_url: 'https://claude.ai/code/session_falsa', bridge_session_id: 'cse_falsa' };
@@ -132,7 +168,8 @@ if (resume === 'sumiu') {
     if (before) echo({ uuid: 'mensagem-do-app', message: { role: 'user', content: msg.message.content.slice(10) } });
     started(msg);
     const apiKeySource = process.env.ANTHROPIC_API_KEY ? 'ANTHROPIC_API_KEY' : 'none';
-    if (++n === 1) out({ type: 'system', subtype: 'init', session_id: sid, model, apiKeySource });
+    if (++n === 1 || model !== announced) out({ type: 'system', subtype: 'init', session_id: sid, model, apiKeySource });
+    announced = model;
     if (Array.isArray(msg.message.content)) {
       echo(msg);
       const blocks = msg.message.content;
@@ -150,6 +187,11 @@ if (resume === 'sumiu') {
     }
     echo(msg);
     if (text === 'ARGS') return reply(`eco: ${JSON.stringify(args)}`);
+    if (text === 'MODELO') return reply(`eco: ${model} ${appliedEffort()}`);
+    if (text.startsWith('TROCA ')) {
+      model = resolve(text.slice(6)) ?? model;
+      return reply('eco: troquei');
+    }
     if (text === 'MUDA') {
       commands.push({ name: 'nova', description: 'chegou depois', argumentHint: '' });
       out({ type: 'system', subtype: 'commands_changed', commands, session_id: sid });

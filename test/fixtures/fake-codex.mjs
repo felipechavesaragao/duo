@@ -19,6 +19,10 @@
 // ATRASA <texto> → a resposta do turn/start atrasa 600ms; aos 300ms o turno chama a ferramenta do cliente com <texto>.
 // RESPOSTAS → responde com o que o cliente devolveu às chamadas da ferramenta feitas pelo ATRASA.
 // --thread-delay <ms> → demora para responder o thread/start e o thread/resume.
+// model/list → três modelos em duas páginas (nextCursor), um deles escondido, como o 0.166.0: esforços, o padrão e
+// os serviceTiers (o "priority", de nome "Fast"). config/read → o que o config.toml diz (esforço high, tier
+// priority, sem modelo). O thread/start responde com model, reasoningEffort e serviceTier. TURNO → responde com o
+// model, o effort e o serviceTier que vieram no turn/start deste turno.
 import readline from 'node:readline';
 
 const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
@@ -38,6 +42,7 @@ const waiting = new Map(); // respostas do cliente a pedidos do servidor
 const cancel = new Map(); // turnos que podem ser interrompidos, por id
 
 let images = [];
+let overrides = {}; // model, effort e serviceTier do último turn/start
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   const msg = JSON.parse(line);
@@ -59,11 +64,23 @@ rl.on('line', (line) => {
       const skill = (name, enabled) => ({ name, description: `a skill ${name}`, path: `C:/skills/${name}/SKILL.md`, enabled, scope: 'user' });
       return reply({ data: [{ cwd: params.cwds?.[0], skills: [skill('revisar', true), skill('desligada', false)], errors: [] }] });
     }
+    case 'model/list': {
+      const efforts = (list) => list.map((reasoningEffort) => ({ reasoningEffort, description: `esforço ${reasoningEffort}` }));
+      const fast = [{ id: 'priority', name: 'Fast', description: 'mais rápido' }];
+      const all = [
+        { id: 'gpt-falso', model: 'gpt-falso', displayName: 'GPT Falso', description: 'o de sempre', hidden: false, isDefault: true, supportedReasoningEfforts: efforts(['low', 'high']), defaultReasoningEffort: 'low', serviceTiers: fast },
+        { id: 'gpt-escondido', model: 'gpt-escondido', displayName: 'Escondido', description: '', hidden: true, isDefault: false, supportedReasoningEfforts: [], defaultReasoningEffort: 'low', serviceTiers: [] },
+        { id: 'gpt-mini', model: 'gpt-mini', displayName: 'GPT Mini', description: 'o pequeno', hidden: false, isDefault: false, supportedReasoningEfforts: efforts(['medium']), defaultReasoningEffort: 'medium', serviceTiers: [] },
+      ];
+      return reply(params.cursor === 'p2' ? { data: all.slice(2), nextCursor: null } : { data: all.slice(0, 2), nextCursor: 'p2' });
+    }
+    case 'config/read':
+      return reply({ config: { model: null, model_reasoning_effort: 'high', service_tier: 'priority' }, origins: {}, layers: null });
     case 'thread/start':
       thread = 'thread-nova';
       threadParams = params;
       tools = params.dynamicTools ?? [];
-      return setTimeout(() => reply({ thread: { id: thread }, model: 'gpt-falso' }), threadDelay);
+      return setTimeout(() => reply({ thread: { id: thread }, model: 'gpt-falso', reasoningEffort: 'high', serviceTier: 'priority' }), threadDelay);
     case 'thread/resume':
       if (params.threadId === 'sumiu') return fail('no rollout found for thread id sumiu');
       if (params.threadId === 'ruim') return fail('invalid session id: invalid character: found `r` at 1');
@@ -81,6 +98,7 @@ rl.on('line', (line) => {
       const text = params.input?.[0]?.text ?? '';
       const skill = params.input?.find((i) => i.type === 'skill');
       images = (params.input ?? []).filter((i) => i.type === 'localImage').map((i) => i.path);
+      overrides = { model: params.model, effort: params.effort, serviceTier: params.serviceTier };
       if (text === 'DEMORA') return slowTurn(id, turnId);
       if (text.startsWith('ATRASA ')) return lateCall(id, turnId, text.slice(7));
       if (text === 'ANTES') {
@@ -139,6 +157,7 @@ async function runTurn(turnId, text, skill) {
   if (text === 'INIT') answer = JSON.stringify(initParams);
   if (text === 'INTERROMPIDOS') answer = JSON.stringify(interrupted);
   if (text === 'RESPOSTAS') answer = JSON.stringify(toolReplies);
+  if (text === 'TURNO') answer = JSON.stringify(overrides);
   if (text === 'INTRUSO') {
     note('item/completed', { turnId: 'turno-velho', item: { id: 'v', type: 'agentMessage', text: 'NAO-E-MEU' } });
     note('turn/completed', { turn: { id: 'turno-velho', status: 'completed' } });

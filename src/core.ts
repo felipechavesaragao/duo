@@ -6,10 +6,12 @@ import {
   type Agent,
   type AgentCommand,
   type AgentId,
+  type AgentModel,
   type AgentStats,
   type AgentTask,
   type EmitFn,
   type ImageInput,
+  type ModelChoice,
 } from './agents/types.js';
 import {
   markInterrupted,
@@ -21,6 +23,7 @@ import {
   type Who,
 } from './persist.js';
 import { BRAIN_MAX, brainOpening, brainReview, brainVerdict, otherOf } from './brain.js';
+import { currentModel, modelLabel } from './display.js';
 import { HELP_TEXT, parseInput, targetsOf, type Target } from './router.js';
 import { SharedLog } from './shared.js';
 
@@ -50,6 +53,8 @@ export interface DuoState {
   asks: Ask[];
   stats: Record<AgentId, AgentStats>;
   commands: Record<AgentId, AgentCommand[]>;
+  /** os modelos que cada um oferece (o seletor da janela) */
+  models: Record<AgentId, AgentModel[]>;
   /** tem um /brain rodando */
   brain: boolean;
   /** o que cada um pôs para rodar em segundo plano (subagentes, comandos) */
@@ -117,6 +122,8 @@ export class Duo {
     claude: { duo: false, own: false },
     codex: { duo: false, own: false },
   };
+  /** Uma troca de modelo por vez para cada um: a seguinte confere contra o que a anterior deixou. */
+  private readonly modelQueues = { claude: createQueue(), codex: createQueue() };
   /** Chamadas em andamento de cada um ao outro, pela ferramenta do duo. */
   private readonly calling: Record<AgentId, number> = { claude: 0, codex: 0 };
   /** O brain em andamento (só um por vez). `stop` = /parar: encerra depois da resposta em andamento. */
@@ -143,6 +150,7 @@ export class Duo {
       asks: [],
       stats: { claude: { ...agents.claude.stats }, codex: { ...agents.codex.stats } },
       commands: { claude: agents.claude.commands, codex: agents.codex.commands },
+      models: { claude: agents.claude.models, codex: agents.codex.models },
       brain: false,
       tasks: { claude: [], codex: [] },
       runningSince: { claude: null, codex: null },
@@ -235,6 +243,7 @@ export class Duo {
     for (const agent of Object.values(agents)) {
       agent.onStats = (s) => this.update({ stats: { ...this.state.stats, [agent.id]: s } });
       agent.onCommands = (list) => this.update({ commands: { ...this.state.commands, [agent.id]: list } });
+      agent.onModels = (list) => this.update({ models: { ...this.state.models, [agent.id]: list } });
       agent.onTasks = (list) => this.update({ tasks: { ...this.state.tasks, [agent.id]: list } });
       agent.onSignal = () => this.signal(agent.id);
       // turno que ele abriu sozinho (terminou um subagente em segundo plano): aparece e entra na janela como os outros
@@ -580,6 +589,40 @@ export class Duo {
         return true;
       }
     }
+  }
+
+  /**
+   * O seletor da janela: troca o modelo, o esforço ou o modo rápido de um deles, sem abrir turno. Só o que ele
+   * oferece. Trocar de modelo leva junto o que o novo não tem: o esforço vai para o padrão dele, e o rápido desliga.
+   * O que ficou (ou por que não trocou) aparece na conversa. As trocas de cada um vão em fila.
+   */
+  setModel(id: AgentId, choice: ModelChoice): Promise<void> {
+    return this.modelQueues[id](() => this.applyModel(id, choice));
+  }
+
+  private async applyModel(id: AgentId, choice: ModelChoice): Promise<void> {
+    const agent = this.agents[id];
+    const fail = (why: string) => this.add('sistema', 'error', `não troquei o modelo do ${agent.name}: ${why}`);
+    const target = choice.model === undefined ? currentModel(agent.models, agent.stats) : agent.models.find((m) => m.id === choice.model);
+    if (!target) return fail(choice.model === undefined ? 'a lista de modelos dele ainda não carregou' : `ele não oferece ${choice.model}`);
+    if (choice.effort !== undefined && !target.efforts.includes(choice.effort)) {
+      return fail(`o ${target.name} não tem o esforço ${choice.effort}`);
+    }
+    if (choice.fast === true && !target.fast) return fail(`o ${target.name} não tem modo rápido`);
+    const next = { ...choice };
+    if (choice.model !== undefined) {
+      const { effort, fast } = agent.stats;
+      if (next.effort === undefined && effort && !target.efforts.includes(effort) && target.defaultEffort) {
+        next.effort = target.defaultEffort;
+      }
+      if (next.fast === undefined && fast && !target.fast) next.fast = false;
+    }
+    try {
+      await agent.setModel(next);
+    } catch (e) {
+      return fail(e instanceof Error ? e.message : String(e));
+    }
+    this.add('sistema', 'text', `modelo do ${agent.name} agora: ${modelLabel(agent.models, agent.stats)}`);
   }
 
   /** Responde a um pedido da fila. false = ele já não espera (respondido em outra tela, ou cancelado). */

@@ -1,4 +1,4 @@
-import type { AgentStats } from './agents/types.js';
+import type { AgentModel, AgentStats } from './agents/types.js';
 import type { Who } from './persist.js';
 
 /** O que as duas telas (terminal e janela) mostram do mesmo jeito. Sem nada de Node: a janela também usa. */
@@ -25,6 +25,25 @@ export function footerText(s: AgentStats): string {
   const agents =
     s.subagents === 0 ? 'sem agent' : `${s.subagents} ${s.subagents === 1 ? 'agent rodando' : 'agents rodando'}`;
   return `${model} · ${tokens} · ${agents}`;
+}
+
+/**
+ * O modelo da lista que está valendo: o escolhido no duo, se é ele que o CLI diz que está em uso (um /model mandado
+ * como mensagem troca por fora); senão o que bate com o que o CLI informou.
+ */
+export function currentModel(models: AgentModel[], stats: AgentStats): AgentModel | undefined {
+  const inUse = (m: AgentModel) => stats.model === undefined || m.id === stats.model || m.resolved === stats.model;
+  return (
+    models.find((m) => m.id === stats.selected && inUse(m)) ??
+    models.find((m) => m.id === stats.model) ??
+    models.find((m) => m.resolved === stats.model)
+  );
+}
+
+/** "Sonnet 5.5 · high · rápido": o chip do seletor e o aviso de troca na conversa. */
+export function modelLabel(models: AgentModel[], stats: AgentStats): string {
+  const name = currentModel(models, stats)?.name ?? stats.model ?? 'modelo padrão';
+  return [name, stats.effort, stats.fast ? 'rápido' : undefined].filter(Boolean).join(' · ');
 }
 
 export const COLORS: Record<Who, string> = {
