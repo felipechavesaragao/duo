@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentId } from '../src/agents/types.js';
-import { SharedLog } from '../src/shared.js';
+import { clip, SharedLog } from '../src/shared.js';
 
 /** Faz o que o duo faz quando dá certo: registra, monta o prompt de cada um e marca como entregue. */
 function turn(log: SharedLog, to: AgentId[], text: string, shared = true): Record<AgentId, string> {
@@ -216,6 +216,21 @@ describe('SharedLog', () => {
     const next = turn(log, ['claude'], 'e agora?').claude;
     expect(next).toContain('### Codex\nPARECER-DO-CODEX');
     expect(next).toContain('janela de terminal compartilhada'); // a apresentação também esperou
+  });
+
+  it('resposta longa: o log guarda inteira; o outro recebe o começo e o fim (a conclusão), e só o meio sai', () => {
+    const log = new SharedLog();
+    turn(log, ['claude'], 'analisa');
+    const longa = `INICIO ${'a'.repeat(3000)} MEIO ${'b'.repeat(3000)} CONCLUSAO-FINAL`;
+    log.agentReply('claude', longa, true);
+    expect(log.state.items.at(-1)!.text).toBe(longa); // a retomada e o próximo prompt partem do texto inteiro
+    const p = turn(log, ['codex'], 'e então?').codex;
+    expect(p).toContain('INICIO');
+    expect(p).toContain('CONCLUSAO-FINAL');
+    expect(p).not.toContain('MEIO');
+    expect(p).toMatch(/\[…\d+ caracteres cortados…\]/);
+    expect(clip('curta')).toBe('curta');
+    expect(clip('x'.repeat(4000))).toBe('x'.repeat(4000)); // até 4 mil, inteira
   });
 
   it('chamada no modo privado: só os dois veem', () => {

@@ -25,6 +25,10 @@ class FakeAgent implements Agent {
   onStats?: (stats: AgentStats) => void;
   commands: AgentCommand[] = [];
   onCommands?: (commands: AgentCommand[]) => void;
+  onOwnTurnEvent?: Agent['onOwnTurnEvent'];
+  onOwnTurnReply?: Agent['onOwnTurnReply'];
+  onRemoteMessage?: Agent['onRemoteMessage'];
+  onNotice?: Agent['onNotice'];
   warmed = 0;
   /** próximas chamadas que devem falhar com "conversa não existe" */
   failResume = 0;
@@ -203,6 +207,30 @@ describe('App', () => {
     expect(codex.prompts[0]).toContain('Claude responde 1');
     expect(codex.prompts[1]).toContain('Claude responde 1'); // não se perdeu com a falha
   });
+
+  it('/novo descarta o que ainda era da conversa anterior: a fila não roda e nada aparece na nova', async () => {
+    const store = tmpStore();
+    const data = newSessionData('/projeto');
+    const { claude, codex } = fakes();
+    claude.delayMs = 1000;
+    const { stdin, frames } = render(<App agents={{ claude, codex }} recorder={new Recorder(data, store)} />);
+    await tick();
+    await type(stdin, 'PRIMEIRA'); // rodando
+    await type(stdin, 'SEGUNDA'); // na fila
+    await type(stdin, '/novo');
+    await new Promise((r) => setTimeout(r, 900)); // a primeira termina depois do /novo
+    expect(claude.prompts).toHaveLength(1); // a da fila nunca saiu
+    expect(claude.prompts[0]).toContain('PRIMEIRA');
+    const shown = frames.join('\n');
+    expect(shown).not.toContain('Claude responde');
+    expect(shown).not.toContain('Bash ls');
+    expect(shown).toContain('ainda estavam rodando ou na fila foram descartadas.'); // a linha quebra em "As 2"
+    expect(store.load(data.id)!.turns.map((t) => t.status)).toEqual(['cancelled', 'cancelled']);
+
+    await type(stdin, '@codex e agora?');
+    expect(codex.prompts[0]).not.toContain('PRIMEIRA'); // a conversa nova começa limpa
+    expect(codex.prompts[0]).not.toContain('SEGUNDA');
+  });
 });
 
 describe('o Claude chama o Codex', () => {
@@ -298,6 +326,81 @@ describe('turno que o agente abre sozinho', () => {
     await type(stdin, '/codex viu?');
     expect(codex.prompts[0]).toContain('usuário → Claude\nOI DO CELULAR');
     expect(codex.prompts[0]).toContain('### Claude\nRESPOSTA NO CELULAR');
+  });
+
+  it('a resposta segue o modo de quando o turno começou, mesmo que você troque antes de ela chegar', async () => {
+    const { claude, codex } = fakes();
+    const { stdin } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    // pelo app, no privado; a resposta chega depois de você voltar ao compartilhado
+    await type(stdin, '/privado');
+    claude.onRemoteMessage!('SEGREDO DO CELULAR');
+    await type(stdin, '/compartilhado');
+    claude.onOwnTurnEvent!({ kind: 'text', text: 'RESPOSTA DO SEGREDO' });
+    claude.onOwnTurnReply!('RESPOSTA DO SEGREDO');
+    // tarefa lançada numa mensagem privada; depois, já no compartilhado, uma pública ao mesmo agente; aí a tarefa
+    // termina: o adaptador diz que ela veio da privada
+    await type(stdin, '/privado');
+    await type(stdin, '@claude lança a tarefa');
+    await type(stdin, '/compartilhado');
+    await type(stdin, '@claude pergunta pública');
+    claude.onOwnTurnEvent!({ kind: 'text', text: 'TAREFA PRIVADA PRONTA' });
+    claude.onOwnTurnReply!('TAREFA PRIVADA PRONTA', false);
+    // sem origem conhecida, depois de uma mensagem privada a ele: não compartilha
+    claude.onOwnTurnReply!('SEM ORIGEM', undefined);
+    // tarefa que veio de mensagem compartilhada: compartilha
+    claude.onOwnTurnReply!('TAREFA PUBLICA PRONTA', true);
+
+    await type(stdin, '@codex viu algo?');
+    expect(codex.prompts[0]).not.toContain('SEGREDO');
+    expect(codex.prompts[0]).not.toContain('TAREFA PRIVADA');
+    expect(codex.prompts[0]).not.toContain('SEM ORIGEM');
+    expect(codex.prompts[0]).not.toContain('lança a tarefa');
+    expect(codex.prompts[0]).toContain('pergunta pública');
+    expect(codex.prompts[0]).toContain('TAREFA PUBLICA PRONTA');
+  });
+
+  it('turno dele só de ferramenta encerra o modo dele: o seguinte começa com o modo da hora dele', async () => {
+    const { claude, codex } = fakes();
+    const { stdin } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    // primeiro turno, no compartilhado: só ferramenta, e o adaptador avisa o fim com texto vazio
+    claude.onOwnTurnEvent!({ kind: 'tool', text: 'Read saida.txt' });
+    claude.onOwnTurnReply!('', true);
+    // o segundo começa no privado; você volta ao compartilhado antes de ele responder
+    await type(stdin, '/privado');
+    claude.onOwnTurnEvent!({ kind: 'text', text: 'SEGUNDO TURNO' });
+    await type(stdin, '/compartilhado');
+    claude.onOwnTurnReply!('SEGUNDO TURNO', true);
+
+    await type(stdin, '@codex viu algo?');
+    expect(codex.prompts[0]).not.toContain('SEGUNDO TURNO');
+  });
+
+  it('sem origem conhecida: conta o privado da conversa retomada e o que veio pelo app', async () => {
+    // retomada: a conversa já tinha uma mensagem privada ao Claude
+    const data = newSessionData('/projeto');
+    data.log.items.push({ from: 'voce', to: ['claude'], text: 'segredo antigo', onlyFor: ['claude'] });
+    const first = fakes();
+    const app1 = render(<App agents={first} recorder={new Recorder(data)} resumed />);
+    await tick();
+    first.claude.onOwnTurnReply!('SEM ORIGEM NA RETOMADA', undefined);
+    await type(app1.stdin, '@codex viu algo?');
+    expect(first.codex.prompts[0]).not.toContain('SEM ORIGEM NA RETOMADA');
+    app1.unmount();
+
+    // conversa nova: a única coisa privada foi pelo app (Remote Control)
+    const second = fakes();
+    const app2 = render(<App agents={second} />);
+    await tick();
+    await type(app2.stdin, '/privado');
+    second.claude.onRemoteMessage!('segredo do celular');
+    second.claude.onOwnTurnReply!('resposta do celular');
+    await type(app2.stdin, '/compartilhado');
+    second.claude.onOwnTurnReply!('SEM ORIGEM DEPOIS DO APP', undefined);
+    await type(app2.stdin, '@codex viu algo?');
+    expect(second.codex.prompts[0]).not.toContain('segredo do celular');
+    expect(second.codex.prompts[0]).not.toContain('SEM ORIGEM DEPOIS DO APP');
   });
 });
 
@@ -410,6 +513,28 @@ describe('pedido de permissão', () => {
     expect(lastFrame()).not.toContain('pede permissão');
     expect(frames.join('\n')).toContain('pedido de permissão cancelado: Bash git push');
   });
+
+  it('o que você digitou para um pedido cancelado não responde o próximo', async () => {
+    const { claude, codex } = fakes();
+    const { stdin, lastFrame } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    const ctrl = new AbortController();
+    const first = claude.askPermission!({ text: 'Bash git push origin um', signal: ctrl.signal });
+    const second = codex.askPermission!({ text: 'Bash git push origin dois', signal: new AbortController().signal });
+    let decided = false;
+    void second.then(() => (decided = true));
+    await tick();
+    stdin.write('s'); // ainda sem Enter
+    await tick();
+    ctrl.abort(); // o primeiro sai: o processo caiu
+    expect(await first).toBe(false);
+    await tick();
+    expect(lastFrame()).toContain('? Codex pede permissão: Bash git push origin dois');
+    stdin.write('\r');
+    await tick();
+    expect(decided).toBe(false);
+    expect(lastFrame()).toContain('permitir? s/n ›');
+  });
 });
 
 describe('/brain', () => {
@@ -484,5 +609,19 @@ describe('/brain', () => {
     expect(frames.join('\n')).toContain('já tem um brain rodando');
     await waitFor(frames, 'brain parou: a resposta do Codex falhou');
     expect(claude.prompts).toHaveLength(1);
+  });
+
+  it('/novo no meio: o brain da conversa anterior para calado, e outro pode começar', async () => {
+    const { claude, codex } = fakes();
+    claude.delayMs = 600;
+    const { stdin, frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    await type(stdin, '/brain /cla pensa nisso');
+    await type(stdin, '/novo');
+    await new Promise((r) => setTimeout(r, 700)); // a resposta do Claude chega depois do /novo
+    expect(codex.prompts).toHaveLength(0); // não passou a vez
+    expect(frames.join('\n')).not.toContain('brain parou');
+    await type(stdin, '/brain /fog de novo');
+    expect(frames.join('\n')).not.toContain('já tem um brain rodando');
   });
 });

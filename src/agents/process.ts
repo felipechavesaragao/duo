@@ -1,11 +1,22 @@
 import { spawnSync, type ChildProcess } from 'node:child_process';
 import readline from 'node:readline';
 
-/** Mata o processo e seus filhos (no Windows, o codex roda via .cmd → node). */
+/** Prazo do taskkill: a tela trava enquanto ele roda (é síncrono, para valer também no 'exit' do duo). */
+const TASKKILL_TIMEOUT_MS = 5000;
+
+/**
+ * Mata o processo e seus filhos (no Windows, o codex roda via .cmd → node). Se o taskkill falhar ou estourar o
+ * prazo, mata ao menos o processo direto: os filhos dele podem sobrar, mas o duo não segue falando com ele.
+ */
 export function killTree(proc: ChildProcess | undefined): void {
   if (!proc || proc.exitCode !== null || proc.pid === undefined) return;
   if (process.platform === 'win32') {
-    spawnSync('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { stdio: 'ignore' });
+    const r = spawnSync('taskkill', ['/pid', String(proc.pid), '/T', '/F'], {
+      stdio: 'ignore',
+      timeout: TASKKILL_TIMEOUT_MS,
+      windowsHide: true,
+    });
+    if (r.error || r.status !== 0) proc.kill();
   } else {
     proc.kill('SIGTERM');
   }

@@ -19,7 +19,8 @@ uso: duo [opções]
   --codex-sandbox <modo>           read-only | workspace-write | danger-full-access (padrão: livre, sem sandbox)
   --claude-model <modelo>          modelo do Claude
   --codex-model <modelo>           modelo do Codex
-  --yolo                           força os dois sem restrição, ignorando as duas opções acima
+  --yolo                           Claude em bypassPermissions e Codex sem sandbox, ignorando as duas opções
+                                   acima (as regras deny e ask do settings do Claude continuam valendo)
   -h, --help                       esta ajuda
 
 Os dois trabalham na pasta onde você rodou o duo. As conversas ficam salvas em ~/.duo/.`;
@@ -42,6 +43,12 @@ if (values.help) {
   process.exit(0);
 }
 
+const TARGETS: Target[] = ['claude', 'codex', 'todos'];
+if (values.para !== undefined && !TARGETS.includes(values.para as Target)) {
+  console.error(`--para aceita ${TARGETS.join(', ')} (veio "${values.para}").`);
+  process.exit(1);
+}
+
 const cwd = process.cwd();
 const store = new SessionStore();
 
@@ -53,12 +60,15 @@ if (values.continuar) {
 }
 const resumed = data !== undefined;
 data ??= newSessionData(cwd);
-if (['claude', 'codex', 'todos'].includes(values.para ?? '')) data.target = values.para as Target;
+if (values.para !== undefined) data.target = values.para as Target;
 
 const lock = store.lock(data.id);
 if (!lock.ok) {
   console.error(
-    `Essa conversa já está aberta em outro duo (processo ${lock.pid}). Feche aquele primeiro, ou rode só "duo" para abrir uma nova.`,
+    lock.stuck
+      ? `A trava dessa conversa ficou pela metade: o duo que a tomava fechou no meio. Se nenhum outro duo está com ela ` +
+          `aberta, apague ${lock.stuck} e rode de novo; ou rode só "duo" para abrir uma nova.`
+      : `Essa conversa já está aberta em outro duo (processo ${lock.pid}). Feche aquele primeiro, ou rode só "duo" para abrir uma nova.`,
   );
   process.exit(1);
 }

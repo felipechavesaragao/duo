@@ -64,6 +64,12 @@ interface Running {
   subagents: Set<string>;
   /** textos do turno que o CLI abriu sozinho, até o result dele */
   own: string[];
+  /** o turno que o CLI abriu sozinho já mandou algo (texto, ferramenta ou o result): o fim dele tem de ser avisado */
+  ownOpen: boolean;
+  /** task_id de cada tarefa em segundo plano rodando → o modo do turno do duo que a lançou */
+  taskShared: Map<string, boolean>;
+  /** as tarefas que terminaram e abrem (ou abriram) o turno dele: todas vieram de turnos compartilhados? */
+  ownTasksShared?: boolean;
   /** request_id do pedido que liga o Remote Control */
   remoteControlRequest?: string;
   /** request_id do initialize, que traz a lista de comandos */
@@ -77,6 +83,8 @@ interface Turn {
   /** o CLI já leu a mensagem; antes disso, o que chega é de um turno que ele abriu sozinho */
   started: boolean;
   emit: EmitFn;
+  /** o modo do duo em que a mensagem foi: tarefa em segundo plano lançada neste turno o herda */
+  shared: boolean;
   texts: string[];
   resolve: (text: string) => void;
   reject: (err: Error) => void;
@@ -102,7 +110,9 @@ interface Turn {
  *
  * Turno que ele abre sozinho (medido em 02/11/2026, 2.1.316): quando um subagente ou comando em segundo
  * plano termina depois do `result`, ele manda `task_notification`, um `system/init` novo e um turno inteiro
- * com `result` próprio, sem mensagem nenhuma no stdin. Uma mensagem que chega no meio desse turno entra
+ * com `result` próprio, sem mensagem nenhuma no stdin. Bash em segundo plano manda `system/task_started` (task_type
+ * "local_bash", com `task_id`) ainda no turno que o lançou, e o `task_notification` traz o mesmo `task_id`: é
+ * assim que o turno dele sabe de qual turno do duo veio. Uma mensagem que chega no meio desse turno entra
  * nele: um `result` só para os dois. Com `--replay-user-messages` ele ecoa a mensagem (com o `uuid` que
  * mandamos) no ponto em que a lê; é esse eco que separa o turno dele do turno do duo. O `command_lifecycle`
  * "started" com o mesmo uuid marca o mesmo ponto: logo depois do eco na mensagem que entra num turno dele,
@@ -130,7 +140,7 @@ export class ClaudeAgent implements Agent {
   askPermission?: (req: PermissionRequest) => Promise<boolean>;
   askPeer?: (req: PeerRequest) => Promise<string>;
   onOwnTurnEvent?: EmitFn;
-  onOwnTurnReply?: (text: string) => void;
+  onOwnTurnReply?: (text: string, tasksShared?: boolean) => void;
   onRemoteMessage?: (text: string) => void;
   onNotice?: EmitFn;
   onStats?: (stats: AgentStats) => void;
@@ -141,6 +151,8 @@ export class ClaudeAgent implements Agent {
   private sessionId?: string;
   private turn?: Turn;
   private enqueue = createQueue();
+  /** o aviso da ANTHROPIC_API_KEY já apareceu (uma vez por duo, não a cada processo) */
+  private warnedApiKey = false;
 
   constructor(private readonly opts: ClaudeOptions) {
     this.sessionId = opts.resumeId;
@@ -151,13 +163,13 @@ export class ClaudeAgent implements Agent {
     return this.sessionId;
   }
 
-  send(prompt: string, emit: EmitFn): Promise<string> {
+  send(prompt: string, emit: EmitFn, shared = true): Promise<string> {
     return this.enqueue(
       () =>
         new Promise<string>((resolve, reject) => {
           const run = this.ensureProcess();
           const uuid = randomUUID();
-          this.turn = { proc: run.proc, uuid, started: false, emit, texts: [], resolve, reject };
+          this.turn = { proc: run.proc, uuid, started: false, emit, shared, texts: [], resolve, reject };
           const line = JSON.stringify({ type: 'user', uuid, message: { role: 'user', content: prompt } });
           run.proc.stdin?.write(line + '\n');
         }),
@@ -212,6 +224,8 @@ export class ClaudeAgent implements Agent {
       deniedByYou: new Set(),
       subagents: new Set(),
       own: [],
+      ownOpen: false,
+      taskShared: new Map(),
       initRequest: `duo-init-${randomUUID()}`,
     };
     onJsonLines(proc, (msg) => this.handle(run, msg));
@@ -279,7 +293,18 @@ export class ClaudeAgent implements Agent {
       }
       return;
     }
-    if (msg.type === 'system' && msg.subtype === 'init') run.sawInit = true;
+    if (msg.type === 'system' && msg.subtype === 'init') {
+      run.sawInit = true;
+      if (msg.apiKeySource === 'ANTHROPIC_API_KEY' && !this.warnedApiKey) {
+        this.warnedApiKey = true;
+        this.onNotice?.({
+          kind: 'error',
+          text:
+            'o Claude Code está vendo a ANTHROPIC_API_KEY do seu ambiente: se ela for válida, o uso pode ser cobrado ' +
+            'pela API em vez do seu login. Para usar só o login, abra o duo sem essa variável.',
+        });
+      }
+    }
     if (msg.type === 'system' && msg.subtype === 'commands_changed') this.setCommands(msg.commands);
     const resumeFailed = msg.type === 'result' && msg.is_error && run.resumedWith !== undefined && !run.sawInit;
 
@@ -288,8 +313,11 @@ export class ClaudeAgent implements Agent {
       this.onSessionId?.(msg.session_id);
     }
     this.trackStats(run, msg);
+    // mensagem de um subagente (traz parent_tool_use_id): é trabalho dele, não a resposta do Claude
+    if (msg.type === 'assistant' && msg.parent_tool_use_id) return;
 
     const turn = this.turn?.proc === run.proc ? this.turn : undefined;
+    if (msg.type === 'system' && typeof msg.task_id === 'string') this.trackTask(run, turn, msg);
     if (msg.type === 'command_lifecycle') {
       if (turn && msg.state === 'started' && msg.command_uuid === turn.uuid) this.startTurn(run, turn);
       return;
@@ -317,6 +345,7 @@ export class ClaudeAgent implements Agent {
     const mine = turn?.started ? turn : undefined;
     const emit: EmitFn = mine ? mine.emit : (ev) => this.onOwnTurnEvent?.(ev);
     const texts = mine ? mine.texts : run.own;
+    if (!mine && (msg.type === 'assistant' || msg.type === 'result')) run.ownOpen = true;
 
     if (msg.type === 'assistant') {
       for (const block of msg.message?.content ?? []) {
@@ -364,12 +393,33 @@ export class ClaudeAgent implements Agent {
     turn.started = true;
   }
 
-  /** O turno que o CLI abriu sozinho terminou (ou a mensagem do duo entrou nele): a resposta vai para a janela. */
+  /**
+   * O turno que o CLI abriu sozinho terminou (ou a mensagem do duo entrou nele): a resposta vai para a janela. Turno
+   * sem texto (só ferramenta) também avisa, com texto vazio: o modo dele acaba aqui e não passa para o próximo.
+   */
   private finishOwnTurn(run: Running): void {
-    if (!run.own.length) return;
+    const tasksShared = run.ownTasksShared;
+    run.ownTasksShared = undefined;
+    if (!run.ownOpen) return;
     const text = run.own.join('\n\n');
     run.own = [];
-    this.onOwnTurnReply?.(text);
+    run.ownOpen = false;
+    this.onOwnTurnReply?.(text, tasksShared);
+  }
+
+  /**
+   * De onde veio cada tarefa em segundo plano: a que começa num turno do duo leva o modo dele; a que começa num
+   * turno dele herda o das tarefas que o abriram (sem nenhuma conhecida, conta como privada). Quando ela termina,
+   * o modo vai para o turno que ela abre. Se terminar no meio de um turno do duo, não decide nada: o turno dele
+   * que vier depois fica sem origem conhecida (o app trata como privado se já houve algo privado com ele).
+   */
+  private trackTask(run: Running, turn: Turn | undefined, msg: any): void {
+    if (msg.subtype === 'task_started') {
+      run.taskShared.set(msg.task_id, turn?.started ? turn.shared : (run.ownTasksShared ?? false));
+    } else if (msg.subtype === 'task_notification') {
+      if (!turn?.started) run.ownTasksShared = (run.ownTasksShared ?? true) && (run.taskShared.get(msg.task_id) ?? false);
+      run.taskShared.delete(msg.task_id);
+    }
   }
 
   /** Modelo, contexto e subagentes, para o rodapé. Vale também fora de um turno (subagente em segundo plano). */

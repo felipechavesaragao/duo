@@ -14,6 +14,17 @@ const live: Agent[] = [];
 const track = <T extends Agent>(a: T) => (live.push(a), a);
 afterEach(() => live.splice(0).forEach((a) => a.dispose()));
 
+/**
+ * Prazo curto só depois que a conexão subiu: o initialize inclui subir o processo, que com a máquina ocupada (os
+ * arquivos de teste rodam em paralelo) passa de 150ms.
+ */
+async function shortDeadline(agent: CodexAgent, ms: number) {
+  agent.warmUp();
+  // as skills só carregam depois do initialize
+  await vi.waitFor(() => expect(agent.commands.length).toBeGreaterThan(0), { timeout: 4000 });
+  agent.rpcTimeoutMs = ms;
+}
+
 describe('ClaudeAgent', () => {
   it('conversa nova: avisa o id assim que aparece e mantém o processo entre mensagens', async () => {
     const agent = track(new ClaudeAgent({ bin: fakeClaude }));
@@ -50,7 +61,10 @@ describe('ClaudeAgent', () => {
     expect(agent.stats).toEqual({ model: undefined, subagents: 0 });
     await agent.send('oi', noop);
     expect(agent.stats).toEqual({ model: 'claude-falso-1', contextTokens: 1000, contextWindow: 200000, subagents: 0 });
-    await agent.send('AGENTE', noop);
+    const shown: string[] = [];
+    // o texto do subagente não vira resposta do Claude nem aparece como dele
+    expect(await agent.send('AGENTE', (ev) => shown.push(ev.text))).toBe('eco: AGENTE');
+    expect(shown).toEqual(['eco: AGENTE']);
     expect(agent.stats).toMatchObject({ contextTokens: 2000, subagents: 1 }); // o uso do subagente não conta
     await agent.send('FIM', noop);
     expect(agent.stats.subagents).toBe(0);
@@ -125,6 +139,41 @@ describe('ClaudeAgent', () => {
     expect(await agent.send('e agora?', noop)).toBe('eco: e agora?');
   });
 
+  it('o turno que ele abre sozinho diz o modo da mensagem que lançou a tarefa, não o da última', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const replies: [string, boolean | undefined][] = [];
+    agent.onOwnTurnReply = (text, tasksShared) => replies.push([text, tasksShared]);
+    await agent.send('SOZINHO da privada', noop, false);
+    await agent.send('pública no meio', noop, true); // antes de a tarefa terminar
+    await vi.waitFor(() => expect(replies).toEqual([['sozinho: da privada', false]]));
+    await agent.send('SOZINHO da pública', noop, true);
+    await vi.waitFor(() => expect(replies).toHaveLength(2));
+    expect(replies[1]).toEqual(['sozinho: da pública', true]);
+  });
+
+  it('subagente privado que termina no meio de um turno público não decide a origem do turno dele seguinte', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const replies: [string, boolean | undefined][] = [];
+    agent.onOwnTurnReply = (text, tasksShared) => replies.push([text, tasksShared]);
+    await agent.send('AGENTE', noop, false); // subagente lançado no privado
+    await agent.send('SOZINHO FIM da pública', noop, true); // a pública lança a tarefa; o subagente termina nela
+    await vi.waitFor(() => expect(replies).toEqual([['sozinho: FIM da pública', true]]));
+  });
+
+  it('turno dele sem texto (só ferramenta) também avisa o fim, com texto vazio', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const seen: string[] = [];
+    const replies: [string, boolean | undefined][] = [];
+    agent.onOwnTurnEvent = (ev) => seen.push(`${ev.kind}: ${ev.text}`);
+    agent.onOwnTurnReply = (text, tasksShared) => replies.push([text, tasksShared]);
+    await agent.send('CALADO', noop, true);
+    await vi.waitFor(() => expect(replies).toEqual([['', true]]));
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatch(/^tool: /);
+    await agent.send('depois', noop); // a mensagem seguinte não reabre o aviso
+    expect(replies).toHaveLength(1);
+  });
+
   it('mensagem que chega no meio do turno que ele abriu sozinho: cada resposta vai para o seu lugar', async () => {
     const agent = track(new ClaudeAgent({ bin: fakeClaude }));
     const seen: string[] = [];
@@ -181,6 +230,31 @@ describe('ClaudeAgent', () => {
     expect(await agent.send('/context', (ev) => emitted.push(ev))).toBe('saída do /context');
     expect(emitted).toEqual([{ kind: 'text', text: 'saída do /context' }]);
     expect(own).toEqual([]);
+  });
+
+  it('ANTHROPIC_API_KEY no ambiente: avisa uma vez que o uso pode ser cobrado pela API; sem ela, nada', async () => {
+    const before = process.env.ANTHROPIC_API_KEY;
+    try {
+      process.env.ANTHROPIC_API_KEY = 'sk-falsa';
+      const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+      const notices: string[] = [];
+      agent.onNotice = (ev) => notices.push(ev.text);
+      await agent.send('oi', noop);
+      agent.reset(); // processo novo, novo system/init: o aviso não repete
+      await agent.send('de novo', noop);
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain('ANTHROPIC_API_KEY');
+
+      delete process.env.ANTHROPIC_API_KEY;
+      const clean = track(new ClaudeAgent({ bin: fakeClaude }));
+      const none: string[] = [];
+      clean.onNotice = (ev) => none.push(ev.text);
+      await clean.send('oi', noop);
+      expect(none).toEqual([]);
+    } finally {
+      if (before === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = before;
+    }
   });
 
   it('sem Remote Control, não pede a ponte', async () => {
@@ -335,6 +409,51 @@ describe('CodexAgent (app-server)', () => {
     const answer = await agent.send('PEDE', (ev) => emitted.push(ev));
     expect(answer).toMatch(/^recusado:/);
     expect(emitted.some((e) => e.kind === 'error' && e.text.includes('item/commandExecution/requestApproval'))).toBe(true);
+  });
+
+  it('mensagem logo depois do warmUp espera o initialize (o app-server recusa qualquer pedido antes dele)', async () => {
+    const agent = track(new CodexAgent({ bin: [...fakeCodex, '--init-delay', '300'] }));
+    agent.warmUp();
+    expect(await agent.send('oi', noop)).toBe('eco: oi');
+    expect(await agent.send('de novo', noop)).toBe('eco: de novo');
+  });
+
+  it('evento de outro turno não entra no turno atual', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    const shown: string[] = [];
+    expect(await agent.send('INTRUSO', (ev) => shown.push(ev.text))).toBe('eco: INTRUSO');
+    expect(shown).not.toContain('NAO-E-MEU');
+  });
+
+  it('eventos que chegam antes da resposta do turn/start esperam e entram no turno certo', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    expect(await agent.send('ANTES', noop)).toBe('eco: ANTES');
+    expect(await agent.send('depois', noop)).toBe('eco: depois');
+  });
+
+  it('turn/start que estoura o prazo: falha, e quando a resposta chega atrasada o turno é interrompido', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    await shortDeadline(agent, 150);
+    await expect(agent.send('DEMORA', noop)).rejects.toThrow(/não respondeu a turn\/start/);
+    expect(await agent.send('oi', noop)).toBe('eco: oi'); // a resposta do turno demorado não vem para cá
+    await new Promise((r) => setTimeout(r, 500)); // a resposta atrasada chega aos 400ms
+    expect(JSON.parse(await agent.send('INTERROMPIDOS', noop))).toEqual(['turno-1']);
+  });
+
+  it('turno que estourou o prazo não chama o Claude: a ferramenta recusa', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    const asked: string[] = [];
+    agent.askPeer = async ({ text }) => {
+      asked.push(text);
+      return 'NAO-DEVIA';
+    };
+    await shortDeadline(agent, 150);
+    await expect(agent.send('ATRASA oi claude', noop)).rejects.toThrow(/não respondeu a turn\/start/);
+    await new Promise((r) => setTimeout(r, 450)); // a chamada chega aos 300ms, sem a resposta do turn/start
+    expect(asked).toEqual([]);
+    const [res] = JSON.parse(await agent.send('RESPOSTAS', noop));
+    expect(res.success).toBe(false);
+    expect(res.contentItems[0].text).toMatch(/não espera mais este turno/);
   });
 
   it('comandos: as skills ligadas carregam ao subir, e "/skill" manda a skill junto', async () => {

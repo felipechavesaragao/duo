@@ -32,14 +32,20 @@ export interface Prepared {
 }
 
 const NAMES: Record<AgentId, string> = { claude: 'Claude', codex: 'Codex' };
-const MAX_ITEM_CHARS = 4000;
+/** Quanto de cada mensagem longa vai para o contexto: o começo e o fim, onde costuma estar a conclusão. */
+const HEAD_CHARS = 1500;
+const TAIL_CHARS = 2500;
 
 export function emptyLogState(): SharedLogState {
   return { items: [], seen: { claude: 0, codex: 0 }, introduced: { claude: false, codex: false } };
 }
 
-/** Guarda só o que algum dia vai para um prompt (o contexto corta em MAX_ITEM_CHARS). */
-const clip = (text: string) => (text.length > MAX_ITEM_CHARS ? text.slice(0, MAX_ITEM_CHARS + 1) : text);
+/** O que vai para o prompt: mensagem longa perde o meio, nunca o fim. O log guarda o texto inteiro. */
+export function clip(text: string): string {
+  const cut = text.length - HEAD_CHARS - TAIL_CHARS;
+  if (cut <= 0) return text;
+  return `${text.slice(0, HEAD_CHARS)}\n[…${cut} caracteres cortados…]\n${text.slice(-TAIL_CHARS)}`;
+}
 
 /**
  * Memória comum da janela. Cada agente tem a própria sessão; aqui se monta, antes de cada
@@ -56,13 +62,13 @@ export class SharedLog {
 
   /** Registra a sua mensagem. Devolve a posição dela, para não repeti-la no contexto. */
   userMessage(to: AgentId[], text: string, shared: boolean): number {
-    this.state.items.push({ from: 'voce', to, text: clip(text), onlyFor: shared ? undefined : to });
+    this.state.items.push({ from: 'voce', to, text, onlyFor: shared ? undefined : to });
     return this.state.items.length - 1;
   }
 
   /** Um agente chamou o outro pela ferramenta do duo. Devolve a posição, como userMessage. */
   agentMessage(from: AgentId, to: AgentId, text: string, shared: boolean): number {
-    this.state.items.push({ from, to: [to], text: clip(text), onlyFor: shared ? undefined : [from, to] });
+    this.state.items.push({ from, to: [to], text, onlyFor: shared ? undefined : [from, to] });
     return this.state.items.length - 1;
   }
 
@@ -112,8 +118,7 @@ export class SharedLog {
             : item.from === id
               ? `você (${NAMES[id]})${to}, antes`
               : `${NAMES[item.from]}${to}`;
-        const body = item.text.length > MAX_ITEM_CHARS ? item.text.slice(0, MAX_ITEM_CHARS) + '\n[…cortado]' : item.text;
-        return `### ${who}\n${body}`;
+        return `### ${who}\n${clip(item.text)}`;
       });
       parts.push(`[duo] Contexto da janela desde a sua última mensagem:\n\n${lines.join('\n\n')}\n\n[duo] fim do contexto.`);
     }
@@ -137,7 +142,7 @@ export class SharedLog {
     if (!text.trim()) return;
     // Não precisa avançar seen[id]: prepare() já ignora o que veio do próprio agente.
     const to = replyTo ? [replyTo] : undefined;
-    this.state.items.push({ from: id, to, text: clip(text), onlyFor: shared ? undefined : [id, ...(to ?? [])] });
+    this.state.items.push({ from: id, to, text, onlyFor: shared ? undefined : [id, ...(to ?? [])] });
   }
 
   /** O agente perdeu a memória (conversa nova): a próxima mensagem leva a janela inteira. */

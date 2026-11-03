@@ -76,6 +76,11 @@ const RPC_TIMEOUT_MS = 120_000;
  * Comandos (medido em 02/11/2026, 0.166.0): o app-server não tem os "/" do terminal do Codex; o que ele lista
  * são as skills (`skills/list`, com name, description e o caminho do SKILL.md; `skills/changed` avisa que
  * mudaram). O terminal aciona uma skill mandando "$nome …" e o item {type: "skill", name, path} no turn/start.
+ *
+ * Turnos (0.166.0): a resposta do turn/start traz `turn.id`; os itens e o `error` trazem `turnId`, e o
+ * turn/completed traz `turn.id`. É por ele que cada turno só aceita os próprios eventos. `turn/interrupt`
+ * {threadId, turnId} responde {} e o turno termina com status "interrupted" (medido: ~0,6s, com um comando
+ * rodando). Nada pode ir antes do initialize (o app-server responde "Not initialized").
  */
 export class CodexAgent implements Agent {
   readonly id = 'codex' as const;
@@ -86,12 +91,18 @@ export class CodexAgent implements Agent {
   onCommands?: (commands: AgentCommand[]) => void;
   commands: AgentCommand[] = [];
   readonly stats: AgentStats;
+  /** espera máxima por uma resposta de controle, lida a cada pedido. Os testes encurtam depois que a conexão sobe. */
+  rpcTimeoutMs = RPC_TIMEOUT_MS;
   /** caminho do SKILL.md de cada skill, por nome: "/nome" vira a skill no turno */
   private skills = new Map<string, string>();
   private threadId?: string;
   private conn?: Connection;
+  /** o handshake (initialize) da conexão atual: quem chega no meio espera por ele, nada vai antes */
+  private connecting?: Promise<Connection>;
   /** a conversa já foi aberta (thread/start ou thread/resume) no processo atual */
   private opened = false;
+  /** o turno que o duo está esperando agora (só ele pode chamar o Claude) */
+  private waiting?: Waiting;
   /** agentThreadId dos subagentes rodando */
   private subagents = new Set<string>();
   private enqueue = createQueue();
@@ -140,17 +151,23 @@ export class CodexAgent implements Agent {
   private closeConnection(): void {
     const conn = this.conn;
     this.conn = undefined;
+    this.connecting = undefined;
     this.opened = false;
     conn?.kill();
   }
 
-  private async connect(): Promise<Connection> {
-    if (this.conn && !this.conn.closed) return this.conn;
-    const conn = new Connection(this.opts.bin ?? ['codex'], this.opts.cwd ?? process.cwd());
+  /**
+   * A conexão pronta para uso: o app-server recusa qualquer pedido antes do initialize ("Not initialized"), então
+   * o warmUp e a primeira mensagem esperam o mesmo handshake.
+   */
+  private connect(): Promise<Connection> {
+    if (this.conn && !this.conn.closed && this.connecting) return this.connecting;
+    const conn = new Connection(this.opts.bin ?? ['codex'], this.opts.cwd ?? process.cwd(), () => this.rpcTimeoutMs);
     conn.onClose(() => {
       // Caiu (ou foi fechado): a próxima mensagem sobe outro processo e retoma a mesma conversa.
       if (this.conn === conn) {
         this.conn = undefined;
+        this.connecting = undefined;
         this.opened = false;
       }
       if (!this.conn) {
@@ -162,11 +179,22 @@ export class CodexAgent implements Agent {
     conn.on((method) => method === 'skills/changed' && void this.loadSkills(conn));
     conn.handleRequest = (method, p) => (method === 'item/tool/call' ? this.answerTool(conn, p) : undefined);
     this.conn = conn;
-    await conn.request('initialize', {
-      clientInfo: { name: 'duo', title: 'duo', version: '0.1.0' },
-      // dynamicTools (a ferramenta de falar com o Claude) é da API experimental
-      ...(this.askPeer ? { capabilities: { experimentalApi: true, requestAttestation: false } } : {}),
-    });
+    this.connecting = this.handshake(conn);
+    return this.connecting;
+  }
+
+  private async handshake(conn: Connection): Promise<Connection> {
+    try {
+      await conn.request('initialize', {
+        clientInfo: { name: 'duo', title: 'duo', version: '0.1.0' },
+        // dynamicTools (a ferramenta de falar com o Claude) é da API experimental
+        ...(this.askPeer ? { capabilities: { experimentalApi: true, requestAttestation: false } } : {}),
+      });
+    } catch (e) {
+      // conexão sem handshake não serve para nada: a próxima mensagem sobe outra
+      if (this.conn === conn) this.closeConnection();
+      throw e;
+    }
     conn.notify('initialized');
     void this.loadSkills(conn);
     return conn;
@@ -203,6 +231,14 @@ export class CodexAgent implements Agent {
     const text = String(p.arguments?.mensagem ?? '').trim();
     if (p.tool !== PEER_TOOL.name || !text || !this.askPeer) {
       return reply('chamada inválida: a ferramenta do duo precisa de uma mensagem para o Claude', false);
+    }
+    // Só o turno que o duo está esperando fala com o Claude: um que estourou o prazo (ou foi trocado) não tem mais
+    // quem leia a resposta. O id do turno chega com a resposta do turn/start: a chamada espera por ele.
+    const waiting = this.waiting;
+    if (waiting && waiting.threadId === p.threadId) await waiting.known;
+    const ours = waiting && this.waiting === waiting && p.threadId === waiting.threadId;
+    if (!ours || (waiting.turnId && p.turnId !== waiting.turnId)) {
+      return reply('o duo não espera mais este turno do Codex (estourou o prazo); a mensagem não foi levada ao Claude', false);
     }
     const ctrl = new AbortController();
     const abort = () => ctrl.abort(); // o processo caiu: ninguém mais espera a resposta
@@ -276,14 +312,29 @@ export class CodexAgent implements Agent {
     return new Promise<string>((resolve, reject) => {
       const texts: string[] = [];
       let lastError: string | undefined;
+      /** id deste turno, da resposta do turn/start: evento de outro turno (um que estourou o prazo) não entra aqui */
+      let turnId: string | undefined;
+      /** eventos com id de turno que chegaram antes da resposta do turn/start: esperam até sabermos o nosso */
+      let early: [string, any][] | undefined = [];
+      let known!: () => void;
+      const waiting: Waiting = { threadId, known: new Promise<void>((r) => (known = r)) };
+      this.waiting = waiting;
       const finish = (settle: () => void) => {
         conn.off(listener);
         conn.offClose(onClose);
         conn.onServerRequest = undefined;
+        if (this.waiting === waiting) this.waiting = undefined;
+        known();
         settle();
       };
       const listener: Listener = (method, p) => {
         if (p.threadId !== undefined && p.threadId !== threadId) return;
+        const tid = p.turnId ?? p.turn?.id;
+        if (tid !== undefined && early) {
+          early.push([method, p]);
+          return;
+        }
+        if (tid !== undefined && turnId !== undefined && tid !== turnId) return;
         switch (method) {
           case 'item/started':
             if (p.item?.type === 'commandExecution') {
@@ -317,20 +368,42 @@ export class CodexAgent implements Agent {
       const onClose = (why: Error) => finish(() => reject(why));
       conn.on(listener);
       conn.onClose(onClose);
-      conn
-        .request('turn/start', { threadId, input: this.turnInput(prompt) })
-        .catch((e: unknown) => finish(() => reject(e instanceof Error ? e : new Error(String(e)))));
+      // Resposta que chega depois do prazo: o turno começou lá, mas ninguém mais espera por ele. Interrompe.
+      const interruptLate = (late: any) => {
+        const id = late?.turn?.id;
+        if (typeof id === 'string') conn.request('turn/interrupt', { threadId, turnId: id }).catch(() => undefined);
+      };
+      conn.request('turn/start', { threadId, input: this.turnInput(prompt) }, interruptLate).then(
+        (result: any) => {
+          turnId = typeof result?.turn?.id === 'string' ? result.turn.id : undefined; // sem id: aceita todos
+          waiting.turnId = turnId;
+          known();
+          const queued = early ?? [];
+          early = undefined;
+          for (const [method, p] of queued) listener(method, p);
+        },
+        (e: unknown) => finish(() => reject(e instanceof Error ? e : new Error(String(e)))),
+      );
     });
   }
 }
 
 type Listener = (method: string, params: any) => void;
 
+/** Um turno em andamento: `known` resolve quando o id dele chega (resposta do turn/start) ou quando ele acaba. */
+interface Waiting {
+  threadId: string;
+  turnId?: string;
+  known: Promise<void>;
+}
+
 /** Um processo `codex app-server` e o JSON-RPC por linhas com ele. */
 class Connection {
   private readonly proc: ChildProcess;
   private next = 0;
   private readonly pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
+  /** pedidos que estouraram o prazo mas querem saber da resposta atrasada (para desfazer o que ela começou) */
+  private readonly late = new Map<number, (result: any) => void>();
   private readonly listeners = new Set<Listener>();
   private readonly closeHandlers = new Set<(why: Error) => void>();
   private readonly tail: () => string;
@@ -340,7 +413,11 @@ class Connection {
   onServerRequest?: (method: string) => void;
   closed = false;
 
-  constructor(bin: string[], cwd: string) {
+  constructor(
+    bin: string[],
+    cwd: string,
+    private readonly timeoutMs: () => number,
+  ) {
     const [cmd, ...pre] = bin;
     this.proc = spawn(cmd, [...pre, 'app-server'], { cwd, stdio: ['pipe', 'pipe', 'pipe'], env: process.env });
     this.proc.stdin?.on('error', () => undefined); // processo que já saiu: o 'close' explica o motivo
@@ -353,14 +430,17 @@ class Connection {
     });
   }
 
-  request(method: string, params: unknown): Promise<any> {
+  /** `onLate` = recebe a resposta que chegar depois do prazo (o pedido já falhou por timeout). */
+  request(method: string, params: unknown, onLate?: (result: any) => void): Promise<any> {
     if (this.closed) return Promise.reject(new Error('o codex já tinha fechado'));
     const id = ++this.next;
+    const ms = this.timeoutMs();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`o codex não respondeu a ${method} em ${RPC_TIMEOUT_MS / 1000}s`));
-      }, RPC_TIMEOUT_MS);
+        if (onLate) this.late.set(id, onLate);
+        reject(new Error(`o codex não respondeu a ${method} em ${ms / 1000}s`));
+      }, ms);
       this.pending.set(id, { resolve, reject, timer });
       this.write({ id, method, params });
     });
@@ -383,8 +463,13 @@ class Connection {
     this.closeHandlers.delete(fn);
   }
 
+  /**
+   * Encerra o processo e, na hora, a conexão: pedido pendente falha já, e resposta que ainda estava a caminho é
+   * ignorada (senão uma abertura de conversa antiga gravaria o id dela depois do /novo).
+   */
   kill(): void {
     killTree(this.proc);
+    this.fail(new Error('o duo fechou o codex'));
   }
 
   private write(msg: unknown): void {
@@ -392,7 +477,14 @@ class Connection {
   }
 
   private dispatch(msg: any): void {
+    if (this.closed) return;
     if (msg.id !== undefined && msg.method === undefined) {
+      const lateHandler = this.late.get(msg.id);
+      if (lateHandler) {
+        this.late.delete(msg.id);
+        if (!msg.error) lateHandler(msg.result);
+        return;
+      }
       const p = this.pending.get(msg.id);
       if (!p) return;
       this.pending.delete(msg.id);
@@ -424,6 +516,7 @@ class Connection {
       p.reject(why);
     }
     this.pending.clear();
+    this.late.clear();
     for (const fn of [...this.closeHandlers]) fn(why);
     this.closeHandlers.clear();
     this.listeners.clear();

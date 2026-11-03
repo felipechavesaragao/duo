@@ -53,14 +53,18 @@ const data1 = newSessionData(work);
 const rec1 = new Recorder(data1, store);
 const agents1 = makeAgents(data1);
 const app1 = render(<App agents={agents1} recorder={rec1} />);
-await delay(500); // a tela precisa abrir antes de receber teclas
-await type(app1.stdin, '@todos Guarde a palavra-código TAMARINDO. Responda só: OK');
-await settle(rec1, 'turno 1');
-await type(app1.stdin, '@claude Guarde também: o número da sorte é 42. Responda só: OK');
-await settle(rec1, 'turno 2');
-app1.unmount();
-rec1.close();
-Object.values(agents1).forEach((a) => a.dispose()); // mata os processos: nada fica na memória
+try {
+  await delay(500); // a tela precisa abrir antes de receber teclas
+  await type(app1.stdin, '@todos Guarde a palavra-código TAMARINDO. Responda só: OK');
+  await settle(rec1, 'turno 1');
+  await type(app1.stdin, '@claude Guarde também: o número da sorte é 42. Responda só: OK');
+  await settle(rec1, 'turno 2');
+} finally {
+  // mesmo se algo falhar no meio: mata os processos, e nada fica na memória para a 2ª sessão
+  app1.unmount();
+  rec1.close();
+  Object.values(agents1).forEach((a) => a.dispose());
+}
 
 // ---------- 2ª sessão: como o `duo -c`
 const data2 = store.load(store.lastIdFor(work)!)!;
@@ -71,13 +75,17 @@ if (!savedClaude || !savedCodex) throw new Error('a 1ª sessão não gravou os d
 const rec2 = new Recorder(data2, store);
 const agents2 = makeAgents(data2);
 const app2 = render(<App agents={agents2} recorder={rec2} resumed />);
-await delay(500);
-await type(app2.stdin, '@todos Sem procurar em arquivos: qual palavra-código eu pedi para guardar, e qual número da sorte eu disse ao Claude? Responda numa linha; se não souber algum, diga NAO SEI.');
-await settle(rec2, 'turno 3');
-const frames = app2.frames.join('\n');
-app2.unmount();
-rec2.close();
-Object.values(agents2).forEach((a) => a.dispose());
+let frames: string;
+try {
+  await delay(500);
+  await type(app2.stdin, '@todos Sem procurar em arquivos: qual palavra-código eu pedi para guardar, e qual número da sorte eu disse ao Claude? Responda numa linha; se não souber algum, diga NAO SEI.');
+  await settle(rec2, 'turno 3');
+  frames = app2.frames.join('\n');
+} finally {
+  app2.unmount();
+  rec2.close();
+  Object.values(agents2).forEach((a) => a.dispose());
+}
 
 const claudeSays = lastText(rec2.data, 'claude');
 const codexSays = lastText(rec2.data, 'codex');

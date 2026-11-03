@@ -19,7 +19,7 @@ Você conversa com os dois ao mesmo tempo: manda uma mensagem para um, para o ou
 - [Claude Code](https://code.claude.com/docs/en/overview) instalado e logado (`claude` no terminal)
 - [Codex CLI](https://github.com/openai/codex) instalado e logado (`codex` no terminal)
 
-Não precisa de chave de API: o duo usa os mesmos logins que você já usa no Claude Code e no Codex.
+Não precisa de chave de API: o duo usa os mesmos logins que você já usa no Claude Code e no Codex. Ele roda o Claude Code com o seu ambiente, como o terminal: se a variável `ANTHROPIC_API_KEY` estiver definida, o Claude Code pode usá-la e cobrar pela API em vez do seu login. O duo avisa quando vê isso.
 
 Testado no Windows 11 com Node 24, Claude Code 2.1.316 e Codex CLI 0.166.0.
 
@@ -82,7 +82,8 @@ duo [opções]
   --codex-sandbox <modo>           read-only | workspace-write | danger-full-access
   --claude-model <modelo>          modelo do Claude
   --codex-model <modelo>           modelo do Codex
-  --yolo                           força os dois sem restrição
+  --yolo                           Claude em bypassPermissions e Codex sem sandbox
+                                   (as regras deny e ask do settings do Claude continuam valendo)
   -h, --help                       ajuda
 ```
 
@@ -95,7 +96,7 @@ Por padrão:
 - o **Claude** segue o modo de permissão do seu `settings.json`. Quando o terminal dele perguntaria (uma regra `ask` como `Bash(git push:*)`, ou o modo `default`), a pergunta aparece no duo: a caixa de texto vira `permitir? s/n`, e o que você estava digitando fica guardado. Regras `deny` continuam negando sem perguntar;
 - o **Codex** roda **sem sandbox** e sem pedir aprovação.
 
-Ou seja, fora das regras `ask` do Claude, os dois podem editar arquivos e rodar comandos na pasta sem perguntar. Para restringir, use `--claude-permission default` (o duo pergunta antes de cada edição ou comando do Claude) e `--codex-sandbox read-only` (ou `workspace-write`).
+Ou seja, fora das regras `ask` do Claude, os dois podem editar arquivos e rodar comandos na pasta sem perguntar. Para restringir, use `--claude-permission default` (o duo pergunta antes de cada edição ou comando do Claude que as suas regras `allow` não liberem) e `--codex-sandbox read-only` (ou `workspace-write`).
 
 ## Como funciona
 

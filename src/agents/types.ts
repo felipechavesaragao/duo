@@ -67,15 +67,22 @@ export interface Agent {
   /**
    * Turno que o próprio CLI abre, sem mensagem do duo (o Claude é avisado de que um subagente ou comando em
    * segundo plano terminou e continua sozinho): `onOwnTurnEvent` recebe o que ele faz; `onOwnTurnReply`, a resposta.
+   * `tasksShared` = o turno foi aberto por tarefas em segundo plano e todas foram lançadas em mensagens no modo
+   * compartilhado (true) ou não (false); undefined = não veio de tarefa conhecida. Texto vazio = o turno terminou sem
+   * resposta em texto (só ferramenta): não há o que registrar, mas o turno acabou.
    */
   onOwnTurnEvent?: EmitFn;
-  onOwnTurnReply?: (text: string) => void;
+  onOwnTurnReply?: (text: string, tasksShared?: boolean) => void;
   /** mensagem que entrou na conversa por fora do duo: você digitou no app, pelo Remote Control */
   onRemoteMessage?: (text: string) => void;
   /** aviso sobre o agente fora de qualquer turno (o Remote Control ligou, ou não ligou) */
   onNotice?: EmitFn;
-  /** Manda uma mensagem. Resolve com a resposta final em texto. Mensagens são enfileiradas. */
-  send(prompt: string, emit: EmitFn): Promise<string>;
+  /**
+   * Manda uma mensagem. Resolve com a resposta final em texto. Mensagens são enfileiradas. `shared` = o modo do duo
+   * em que ela foi (padrão: compartilhado): o agente só guarda, e devolve em `onOwnTurnReply` se uma tarefa lançada
+   * nela abrir um turno sozinho.
+   */
+  send(prompt: string, emit: EmitFn, shared?: boolean): Promise<string>;
   /** Esquece a conversa: a próxima mensagem começa uma sessão nova. */
   reset(): void;
   /** Encerra processos filhos. */

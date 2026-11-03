@@ -9,6 +9,7 @@ import {
   type AgentCommand,
   type AgentId,
   type AgentStats,
+  type EmitFn,
 } from './agents/types.js';
 import {
   markInterrupted,
@@ -98,6 +99,17 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
   const queues = useRef({ claude: createQueue(), codex: createQueue() }).current;
   const nextId = useRef(0);
   const lastWho = useRef<Who | null>(null);
+  // Muda a cada /novo: o que ainda era da conversa anterior (na fila, rodando, o brain) não roda nem aparece na nova.
+  const session = useRef(0);
+  // Já houve algo privado com ele nesta conversa (pelo duo ou pelo app, antes ou depois de retomar): um turno que ele
+  // abre sozinho sem origem conhecida não é compartilhado (podia ser de uma tarefa lançada naquela mensagem).
+  const hadPrivate = (id: AgentId) => log.current.state.items.some((item) => item.onlyFor?.includes(id));
+  // O turno que ele abriu sozinho (ou que você abriu pelo app): o modo de quando começou, guardado para a resposta
+  // seguir ele mesmo que você troque antes de ela chegar, e se foi uma mensagem sua pelo app.
+  const own = useRef<Record<AgentId, { shared: boolean; remote: boolean } | undefined>>({
+    claude: undefined,
+    codex: undefined,
+  });
 
   // Na retomada, a tela volta como estava.
   const [entries, setEntries] = useState<Entry[]>(() => {
@@ -164,15 +176,28 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
       agent.onStats = (s) => setStats((prev) => ({ ...prev, [agent.id]: s }));
       agent.onCommands = (list) => setCommands((prev) => ({ ...prev, [agent.id]: list }));
       // turno que ele abriu sozinho (terminou um subagente em segundo plano): aparece e entra na janela como os outros
-      agent.onOwnTurnEvent = (ev) => add(agent.id, ev.kind, ev.text);
-      agent.onOwnTurnReply = (text) => {
-        log.current.agentReply(agent.id, text, rec.data.shared);
+      agent.onOwnTurnEvent = (ev) => {
+        own.current[agent.id] ??= { shared: rec.data.shared, remote: false };
+        add(agent.id, ev.kind, ev.text);
+      };
+      // Compartilhada só se o modo era compartilhado quando o turno começou E a origem dele também: as tarefas que o
+      // abriram (o agente diz se todas vieram de mensagens compartilhadas), a sua mensagem pelo app (o modo dela já
+      // está em `shared`) ou, sem origem conhecida, nada privado com ele nesta conversa. Texto vazio (turno só de
+      // ferramenta) não entra no log, mas encerra o turno: o próximo começa com o modo da hora dele.
+      agent.onOwnTurnReply = (text, tasksShared) => {
+        const turn = own.current[agent.id] ?? { shared: rec.data.shared, remote: false };
+        own.current[agent.id] = undefined;
+        const origin = tasksShared ?? (turn.remote || !hadPrivate(agent.id));
+        log.current.agentReply(agent.id, text, turn.shared && origin);
         rec.saveSoon();
       };
       // o que você digitou no app (Remote Control): aparece aqui e o outro recebe como contexto
       agent.onRemoteMessage = (text) => {
         add('voce', 'text', `[pelo app, para o ${agent.name}] ${text}`);
         log.current.userMessage([agent.id], text, rec.data.shared);
+        const turn = (own.current[agent.id] ??= { shared: true, remote: true });
+        turn.shared &&= rec.data.shared;
+        turn.remote = true;
         rec.saveSoon();
       };
       agent.onNotice = (ev) => add('sistema', ev.kind, ev.text);
@@ -232,20 +257,28 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
     ): Promise<string | null> => {
       const data = rec.data;
       const myLog = log.current;
+      const epoch = session.current;
+      const stale = () => session.current !== epoch; // houve /novo: o turno era da conversa anterior
       setBusy((b) => ({ ...b, [id]: b[id] + 1 }));
       return queues[id](async (): Promise<string | null> => {
         for (let attempt = 0; ; attempt++) {
+          if (stale()) return null;
           const prepared = myLog.prepare(id, text, sharedTurn, msgIndex, call?.from);
           setTurn(data, turnId, 'running');
           rec.saveNow();
           try {
-            const answer = await agents[id].send(prepared.prompt, (ev) => add(id, ev.kind, ev.text));
+            const emit: EmitFn = (ev) => {
+              if (!stale()) add(id, ev.kind, ev.text);
+            };
+            const answer = await agents[id].send(prepared.prompt, emit, sharedTurn);
+            if (stale()) return null;
             myLog.delivered(id, prepared);
             // quem chamou só recebeu a resposta se ainda esperava; senão ela vai no contexto dele
             myLog.agentReply(id, answer, sharedTurn, call && !call.signal.aborted ? call.from : undefined);
             setTurn(data, turnId, 'done');
             return answer;
           } catch (e) {
+            if (stale()) return null; // o /novo derrubou o processo: o erro não é desta conversa
             const err = e instanceof Error ? e : new Error(String(e));
             if (err instanceof ResumeFailedError && attempt === 0) {
               // Nada foi executado: abre conversa nova e manda de novo, com a janela inteira de contexto.
@@ -260,6 +293,9 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
             add(id, 'error', err.message);
             setTurn(data, turnId, 'failed');
             return null;
+          } finally {
+            // um turno que ele tinha aberto sozinho antes deste já terminou (ou entrou neste)
+            own.current[id] = undefined;
           }
         }
       }).finally(() => {
@@ -329,6 +365,7 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
       const state = { stop: false };
       brain.current = state;
       const data = rec.data;
+      const epoch = session.current;
       const name = (id: AgentId) => agents[id].name;
       add(
         'sistema',
@@ -349,6 +386,7 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
             n === 1
               ? await runTurn(who, turnId, brainOpening(who, question), true, msgIndex)
               : await runTurn(who, turnId, brainReview(who), true);
+          if (session.current !== epoch) return; // /novo: o brain era da conversa anterior
           if (answer === null) {
             add('sistema', 'error', `🧠 brain parou: a resposta do ${name(who)} falhou.`);
             return;
@@ -395,13 +433,29 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
           add('sistema', 'text', HELP_TEXT);
           return;
         case 'new': {
+          // o que estava na fila ou rodando (e o brain) era da anterior: sai, e fica gravado como cortado por você
+          session.current++;
+          brain.current = null;
+          own.current = { claude: undefined, codex: undefined };
           Object.values(agents).forEach((a) => a.reset());
+          const dropped = rec.data.turns.filter((t) => t.status === 'pending' || t.status === 'running');
+          for (const t of dropped) t.status = 'cancelled';
           const next = newSessionData(rec.data.cwd);
           next.shared = rec.data.shared;
           next.target = rec.data.target;
           rec.switchTo(next);
           log.current = new SharedLog(next.log);
-          add('sistema', 'text', 'Conversa nova: a próxima mensagem começa do zero nos dois. A anterior continua salva.');
+          const cut =
+            dropped.length === 0
+              ? ''
+              : dropped.length === 1
+                ? ' A mensagem que ainda estava rodando ou na fila foi descartada.'
+                : ` As ${dropped.length} mensagens que ainda estavam rodando ou na fila foram descartadas.`;
+          add(
+            'sistema',
+            'text',
+            `Conversa nova: a próxima mensagem começa do zero nos dois. A anterior continua salva.${cut}`,
+          );
           return;
         }
         case 'invalid':
@@ -474,6 +528,8 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
 
   const promptColor = target === 'todos' ? 'white' : COLORS[target];
   const asking = asks[0];
+  // o que você digitava valia para o pedido da vez: se ele sai (respondido ou cancelado), não passa para o próximo
+  useEffect(() => setAnswer(''), [asking]);
 
   // "@cla /co": a lista de comandos de quem você chamou, filtrada pelo que já digitou
   const query = asking ? null : agentCommandQuery(input);

@@ -6,12 +6,16 @@
 //                   sem ele, nega sozinho e só conta no permission_denials do result.
 // "CHAMA <texto>"  → usa a ferramenta do servidor MCP "duo" (sdk, via --mcp-config), como o 2.1.316:
 //                   initialize, notifications/initialized, tools/list e tools/call em mcp_message.
-// "AGENTE" / "FIM" → um subagente começa (task_started, mais uma mensagem dele com parent_tool_use_id)
+// "AGENTE" / "FIM" → um subagente começa (task_started, mais uma mensagem dele com texto e parent_tool_use_id)
 //                   e termina (task_notification), como no 2.1.316.
+// O system/init traz apiKeySource: "ANTHROPIC_API_KEY" com a variável no ambiente, "none" sem ela (2.1.316).
 // "ARGS"           → responde com os argumentos da linha de comando.
-// "SOZINHO <texto>" → responde, e logo depois abre um turno sozinho, como o 2.1.316 quando uma tarefa em
-//                   segundo plano termina: task_notification, init, a resposta dele e o result. Mensagem que
+// "SOZINHO <texto>" → lança uma tarefa em segundo plano (task_started "local_bash", no turno), responde, e logo
+//                   depois abre um turno sozinho, como o 2.1.316 quando ela termina: task_notification com o
+//                   mesmo task_id, init, a resposta dele e o result. Mensagem que
 //                   chega nesses 300ms entra no mesmo turno: eco dela, a resposta e um result só para os dois.
+//                   "SOZINHO FIM <texto>": além disso, o subagente do "AGENTE" termina neste turno, antes da resposta.
+// "CALADO"         → como "SOZINHO", mas o turno que ele abre sozinho só usa uma ferramenta: nenhum texto.
 // Com --replay-user-messages, ecoa cada mensagem lida (com o uuid dela), como o 2.1.316. O command_lifecycle
 // "started" vem antes do eco; numa mensagem que entra no turno que ele abriu sozinho, logo depois.
 // "/<comando>"     → comando local, como o /context no 2.1.316: "started", a saída (modelo <synthetic>), o eco
@@ -84,7 +88,10 @@ if (resume === 'sumiu') {
     own = [];
     out({ type: 'system', subtype: 'task_notification', task_id: 'tarefa-bg', status: 'completed', session_id: sid });
     out({ type: 'system', subtype: 'init', session_id: sid, model });
-    say(`sozinho: ${text}`);
+    if (text === null) {
+      const content = [{ type: 'tool_use', id: 'toolu_calado', name: 'Read', input: { file_path: 'saida.txt' } }];
+      out({ type: 'assistant', session_id: sid, message: { model, usage: usage(), content } });
+    } else say(`sozinho: ${text}`);
     await new Promise((r) => setTimeout(r, 300));
     for (const msg of own) {
       echo(msg);
@@ -114,7 +121,8 @@ if (resume === 'sumiu') {
     }
     if (own) return void own.push(msg);
     started(msg);
-    if (++n === 1) out({ type: 'system', subtype: 'init', session_id: sid, model });
+    const apiKeySource = process.env.ANTHROPIC_API_KEY ? 'ANTHROPIC_API_KEY' : 'none';
+    if (++n === 1) out({ type: 'system', subtype: 'init', session_id: sid, model, apiKeySource });
     const text = msg.message.content;
     if (text.startsWith('/')) {
       out({ type: 'assistant', session_id: sid, message: { model: '<synthetic>', content: [{ type: 'text', text: `saída do ${text}` }] } });
@@ -138,15 +146,20 @@ if (resume === 'sumiu') {
       }, 100);
       return;
     }
-    if (text.startsWith('SOZINHO ')) {
+    if (text.startsWith('SOZINHO ') || text === 'CALADO') {
+      out({ type: 'system', subtype: 'task_started', task_id: 'tarefa-bg', task_type: 'local_bash', session_id: sid });
+      if (text.startsWith('SOZINHO FIM ')) {
+        out({ type: 'system', subtype: 'task_notification', task_id: 'tarefa-1', status: 'completed', session_id: sid });
+      }
       reply('eco: lancei');
-      setTimeout(() => ownTurn(text.slice(8)), 100);
+      setTimeout(() => ownTurn(text === 'CALADO' ? null : text.slice(8)), 100);
       return;
     }
     if (text === 'AGENTE') {
       out({ type: 'system', subtype: 'task_started', task_id: 'tarefa-1', tool_use_id: 'toolu_a', task_type: 'local_agent', session_id: sid });
       const big = { input_tokens: 999999, output_tokens: 1 }; // do subagente: não é o contexto da conversa
-      out({ type: 'assistant', parent_tool_use_id: 'toolu_a', session_id: sid, message: { model, usage: big, content: [] } });
+      const content = [{ type: 'text', text: 'texto do subagente' }];
+      out({ type: 'assistant', parent_tool_use_id: 'toolu_a', session_id: sid, message: { model, usage: big, content } });
     }
     if (text === 'FIM') out({ type: 'system', subtype: 'task_notification', task_id: 'tarefa-1', status: 'completed', session_id: sid });
 
