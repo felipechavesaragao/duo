@@ -1,6 +1,6 @@
 # duo
 
-Claude Code e Codex na mesma janela do terminal.
+Claude Code e Codex na mesma janela: no terminal ou numa janela própria (`duo --gui`).
 
 Você conversa com os dois ao mesmo tempo: manda uma mensagem para um, para o outro ou para os dois, e cada um vê o que você e o outro disseram. Por baixo rodam o próprio Claude Code e o próprio Codex, com os seus logins. O duo é só a tela que junta os dois.
 
@@ -71,12 +71,26 @@ O Codex só recebe a ferramenta numa conversa nova: o app-server aceita ferramen
 
 O **rodapé** mostra, para cada um, o modelo, os tokens no contexto da conversa (com o tamanho da janela do modelo) e quantos subagentes estão rodando.
 
+## Janela (`duo --gui`)
+
+`duo --gui` abre a mesma conversa numa janela própria em vez do terminal: o Edge ou o Chrome em modo app (sem abas nem barra de endereço) ou, sem nenhum dos dois, o navegador padrão. O terminal fica só com o endereço; `/sair` na janela (ou **Encerrar o duo**) ou Ctrl+C no terminal encerra. `duo --gui -c` retoma a última conversa da pasta, inclusive uma do terminal.
+
+- **Barra lateral**: nova conversa, brain, limpar a tela, comandos, e como cada agente está (livre, trabalhando, pede permissão). Clicar num agente o torna o destino padrão.
+- **Conversa**: as suas mensagens à direita, as respostas com o nome de quem fala, as ações seguidas de um agente agrupadas (um clique abre a lista), e quem está trabalhando, com o tempo.
+- **Caixa de texto**: aceita tudo o que o terminal aceita (`/cla`, `@fog /`, `/brain`, `/privado`...). O **+** começa um comando do Claude, uma skill do Codex ou um brain; embaixo dela ficam o destino padrão e o modo. Enter manda, Shift+Enter quebra a linha.
+- **Print**: Ctrl+V cola um print (até 5 por mensagem), que aparece em miniatura antes de ir. Ele vai junto da mensagem, ou sozinho para o destino padrão. O Claude e o Codex recebem a imagem. No modo compartilhado, o outro fica sabendo que houve um print, mas não o vê. Os prints ficam em `~/.duo/imagens/`, e a conversa retomada mostra os prints de novo.
+- **Pedido de permissão**: vira um cartão com **Permitir** e **Negar**.
+- **Painel**: em **Rodando agora**, o turno de cada um com o tempo e o último sinal do processo dele, e o que ele pôs em segundo plano (subagentes como o devil-advocate, comandos), com o que cada um está fazendo. Turno sem sinal há mais de 2 minutos ganha um aviso: pode estar travado, ou numa ferramenta demorada. Mais abaixo, a pasta, o modo (compartilhado ou privado) e o contexto de cada um.
+
+A janela é uma página servida pelo próprio duo só para o seu computador (`127.0.0.1`). Quem fala com ela manda nos agentes, então ela só abre com a chave que vai no endereço que o duo mostra. A chave vira um cookie e sai do endereço, e a página não aceita pedido de outro site. Pode abrir o mesmo endereço em mais de uma janela: todas mostram a mesma conversa.
+
 ## Opções
 
 ```
 duo [opções]
 
   -c, --continuar                  continua a última conversa desta pasta
+  --gui                            abre numa janela própria em vez do terminal
   --para <claude|codex|todos>      destino padrão inicial (padrão: claude)
   --claude-permission <modo>       default | acceptEdits | plan | bypassPermissions
   --codex-sandbox <modo>           read-only | workspace-write | danger-full-access
@@ -93,7 +107,7 @@ As conversas ficam salvas em `~/.duo/`. O `duo -c` retoma a última conversa da 
 
 Por padrão:
 
-- o **Claude** segue o modo de permissão do seu `settings.json`. Quando o terminal dele perguntaria (uma regra `ask` como `Bash(git push:*)`, ou o modo `default`), a pergunta aparece no duo: a caixa de texto vira `permitir? s/n`, e o que você estava digitando fica guardado. Regras `deny` continuam negando sem perguntar;
+- o **Claude** segue o modo de permissão do seu `settings.json`. Quando o terminal dele perguntaria (uma regra `ask` como `Bash(git push:*)`, ou o modo `default`), a pergunta aparece no duo: no terminal a caixa de texto vira `permitir? s/n`, e o que você estava digitando fica guardado; na janela, vira um cartão com **Permitir** e **Negar**. Regras `deny` continuam negando sem perguntar;
 - o **Codex** roda **sem sandbox** e sem pedir aprovação.
 
 Ou seja, fora das regras `ask` do Claude, os dois podem editar arquivos e rodar comandos na pasta sem perguntar. Para restringir, use `--claude-permission default` (o duo pergunta antes de cada edição ou comando do Claude que as suas regras `allow` não liberem) e `--codex-sandbox read-only` (ou `workspace-write`).

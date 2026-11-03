@@ -1,14 +1,26 @@
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeAgent } from '../src/agents/claude.js';
 import { CodexAgent } from '../src/agents/codex.js';
-import { ResumeFailedError, type Agent, type AgentEvent } from '../src/agents/types.js';
+import { ResumeFailedError, type Agent, type AgentEvent, type AgentTask } from '../src/agents/types.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fakeClaude = [process.execPath, path.join(here, 'fixtures', 'fake-claude.mjs')];
 const fakeCodex = [process.execPath, path.join(here, 'fixtures', 'fake-codex.mjs')];
 const noop = () => undefined;
+/** um PNG de 1×1 */
+const PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+  'base64',
+);
+const pngFile = () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'duo-print-')), 'print.png');
+  fs.writeFileSync(file, PNG);
+  return file;
+};
 
 const live: Agent[] = [];
 const track = <T extends Agent>(a: T) => (live.push(a), a);
@@ -71,6 +83,55 @@ describe('ClaudeAgent', () => {
     expect(seen).toHaveBeenLastCalledWith(agent.stats);
     agent.reset();
     expect(agent.stats).toMatchObject({ contextTokens: undefined, subagents: 0 });
+  });
+
+  it('segundo plano: o subagente aparece com o que faz, o tipo e o progresso, e sai quando termina', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const seen: AgentTask[][] = [];
+    agent.onTasks = (list) => seen.push(list);
+    await agent.send('AGENTE', noop);
+    expect(seen.at(-1)).toEqual([
+      expect.objectContaining({
+        id: 'tarefa-1',
+        kind: 'subagente',
+        title: 'revisar o diff',
+        detail: 'devil-advocate',
+        activity: 'Lendo src/core.ts',
+      }),
+    ]);
+    const task = seen.at(-1)![0];
+    expect(task.lastAt).toBeGreaterThanOrEqual(task.startedAt);
+    await agent.send('FIM', noop);
+    expect(seen.at(-1)).toEqual([]);
+    // comando em segundo plano conta como comando
+    await agent.send('SOZINHO x', noop);
+    expect(seen.flat().some((t) => t.id === 'tarefa-bg' && t.kind === 'comando')).toBe(true);
+  });
+
+  it('sinal de vida: cada coisa que chega do processo avisa', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const signal = vi.fn();
+    agent.onSignal = signal;
+    await agent.send('oi', noop);
+    expect(signal.mock.calls.length).toBeGreaterThan(2);
+  });
+
+  it('print: vai como imagem em base64 na mesma mensagem, junto do texto (ou sozinho)', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const img = { path: pngFile(), mediaType: 'image/png' as const };
+    expect(await agent.send('olha', noop, true, [img])).toBe(`eco: olha | imagens: base64 image/png ${PNG.length}`);
+    expect(await agent.send('', noop, true, [img, img])).toBe(
+      `eco:  | imagens: base64 image/png ${PNG.length}, base64 image/png ${PNG.length}`,
+    );
+    // sem print, a mensagem segue em texto puro
+    expect(await agent.send('oi', noop)).toBe('eco: oi');
+  });
+
+  it('print que sumiu do disco: o turno falha dizendo por quê, e o próximo segue', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const gone = { path: path.join(os.tmpdir(), 'duo-nao-existe.png'), mediaType: 'image/png' as const };
+    await expect(agent.send('olha', noop, true, [gone])).rejects.toThrow(/não consegui ler a imagem/);
+    expect(await agent.send('oi', noop)).toBe('eco: oi');
   });
 
   it('falar com o Codex: a ferramenta do duo leva a mensagem e devolve a resposta dele', async () => {
@@ -137,6 +198,32 @@ describe('ClaudeAgent', () => {
     await vi.waitFor(() => expect(replies).toEqual(['sozinho: o devil aprovou']));
     expect(own).toEqual(['sozinho: o devil aprovou']);
     expect(await agent.send('e agora?', noop)).toBe('eco: e agora?');
+  });
+
+  it('o processo cai no meio do turno que ele abriu sozinho: o turno termina e a janela fica sabendo', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const own: string[] = [];
+    const replies: string[] = [];
+    agent.onOwnTurnEvent = (ev) => own.push(`${ev.kind}: ${ev.text}`);
+    agent.onOwnTurnReply = (text) => replies.push(text);
+    await agent.send('SOZINHO MORRE adeus', noop);
+    await vi.waitFor(() => expect(replies).toEqual(['sozinho: MORRE adeus']));
+    expect(own[0]).toBe('text: sozinho: MORRE adeus');
+    expect(own[1]).toMatch(/^error: o processo do claude encerrou \(código 3\)\ncaiu no meio do turno/);
+    expect(await agent.send('voltou?', noop)).toBe('eco: voltou?'); // a próxima sobe outro processo
+  });
+
+  it('cai com uma mensagem sua esperando: o erro aparece uma vez só, na sua mensagem', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const own: string[] = [];
+    const replies: string[] = [];
+    agent.onOwnTurnEvent = (ev) => own.push(`${ev.kind}: ${ev.text}`);
+    agent.onOwnTurnReply = (text) => replies.push(text);
+    await agent.send('SOZINHO MORRE adeus', noop);
+    await vi.waitFor(() => expect(own).toHaveLength(1));
+    await expect(agent.send('espera', noop)).rejects.toThrow(/o processo do claude encerrou \(código 3\)/);
+    expect(replies).toEqual(['sozinho: MORRE adeus']);
+    expect(own).toEqual(['text: sozinho: MORRE adeus']);
   });
 
   it('o turno que ele abre sozinho diz o modo da mensagem que lançou a tarefa, não o da última', async () => {
@@ -207,6 +294,38 @@ describe('ClaudeAgent', () => {
     await vi.waitFor(() => expect(replies).toEqual(['eco: oi do celular']));
     expect(typed).toEqual(['oi do celular']);
     expect(await agent.send('e aqui?', noop)).toBe('eco: e aqui?');
+  });
+
+  it('Remote Control: cada mensagem do app fica com o turno que a responde', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude, remoteControl: true }));
+    const typed: [string, boolean | undefined][] = [];
+    const replies: [string, boolean | undefined][] = [];
+    agent.onRemoteMessage = (text, inDuoTurn) => typed.push([text, inDuoTurn]);
+    agent.onOwnTurnReply = (text, _tasks, fromApp) => replies.push([text, fromApp]);
+    // lida no meio de um turno do duo: é dele, e não sobra nada para o turno seguinte
+    expect(await agent.send('APP DENTRO no meio', noop)).toBe('eco: no meio');
+    // lida antes da do duo, sem resposta no meio: entrou no turno do duo (o CLI respondeu as duas juntas)
+    expect(await agent.send('APP ANTES junto', noop)).toBe('eco: junto');
+    // com ele parado: abre um turno dele
+    await agent.send('APP do celular', noop);
+    await vi.waitFor(() => expect(replies).toEqual([['eco: do celular', true]]));
+    // um turno dele aberto por tarefa, depois: não herda nada do app
+    await agent.send('SOZINHO terminei', noop);
+    await vi.waitFor(() => expect(replies).toEqual([['eco: do celular', true], ['sozinho: terminei', false]]));
+    expect(typed).toEqual([
+      ['no meio', true],
+      ['junto', false],
+      ['do celular', false],
+    ]);
+  });
+
+  it('Remote Control: a lida antes da do duo, sem resposta no meio, não passa para o turno dele seguinte', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude, remoteControl: true }));
+    const replies: [string, boolean | undefined][] = [];
+    agent.onOwnTurnReply = (text, _tasks, fromApp) => replies.push([text, fromApp]);
+    expect(await agent.send('APP ANTES junto', noop)).toBe('eco: junto');
+    await agent.send('SOZINHO terminei', noop);
+    await vi.waitFor(() => expect(replies).toEqual([['sozinho: terminei', false]]));
   });
 
   it('comandos: carregam ao subir, sem mensagem nenhuma, e acompanham as mudanças', async () => {
@@ -302,6 +421,47 @@ describe('CodexAgent (app-server)', () => {
     expect(agent.stats.subagents).toBe(0);
     agent.reset();
     expect(agent.stats.contextTokens).toBeUndefined();
+  });
+
+  it('segundo plano: o subagente aparece com o nome e o modelo, e sai quando termina', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    const seen: AgentTask[][] = [];
+    agent.onTasks = (list) => seen.push(list);
+    await agent.send('AGENTE', noop);
+    expect(seen.at(-1)).toEqual([expect.objectContaining({ id: 'filho', kind: 'subagente', title: 'x', detail: 'gpt-filho' })]);
+    await agent.send('FIM', noop);
+    expect(seen.at(-1)).toEqual([]);
+    await agent.send('AGENTE', noop);
+    agent.reset(); // a conversa nova não herda o subagente da anterior
+    expect(seen.at(-1)).toEqual([]);
+  });
+
+  it('sinal de vida: cada coisa que chega do processo avisa', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    const signal = vi.fn();
+    agent.onSignal = signal;
+    await agent.send('oi', noop);
+    expect(signal.mock.calls.length).toBeGreaterThan(2);
+  });
+
+  it('sinal de vida: resposta também conta, não só notificação (a abertura só tem respostas)', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    const signal = vi.fn();
+    agent.onSignal = signal;
+    const loaded = new Promise<void>((r) => (agent.onCommands = () => r()));
+    agent.warmUp();
+    await loaded;
+    expect(signal.mock.calls.length).toBeGreaterThanOrEqual(2); // initialize e skills/list
+  });
+
+  it('print: vai como localImage, pelo caminho, junto do texto (ou sozinho)', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    const img = { path: 'C:/prints/a.png', mediaType: 'image/png' as const };
+    expect(await agent.send('olha', noop, true, [img])).toBe('eco: olha | imagens: C:/prints/a.png');
+    expect(await agent.send('', noop, true, [img])).toBe('eco:  | imagens: C:/prints/a.png');
+    expect(await agent.send('/revisar isto', noop, true, [img])).toBe(
+      'eco: [skill revisar C:/skills/revisar/SKILL.md] $revisar isto | imagens: C:/prints/a.png',
+    );
   });
 
   it('falar com o Claude: a ferramenta do duo leva a mensagem e devolve a resposta dele', async () => {

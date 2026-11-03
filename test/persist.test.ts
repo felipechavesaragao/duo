@@ -66,6 +66,9 @@ describe('SessionStore', () => {
     expect(broken((d) => delete d.turns[0].agent)).toBeUndefined();
     expect(broken((d) => (d.turns[0].status = 'talvez'))).toBeUndefined();
     expect(broken((d) => (d.screen = [{ ...entry, kind: undefined }]))).toBeUndefined();
+    expect(broken((d) => (d.screen = [{ ...entry, images: ['a.png'] }]))).toBeDefined();
+    expect(broken((d) => (d.screen = [{ ...entry, images: 'a.png' }]))).toBeUndefined();
+    expect(broken((d) => (d.screen = [{ ...entry, images: [1] }]))).toBeUndefined();
     expect(broken((d) => (d.claudeSessionId = 42))).toBeUndefined();
     expect(broken((d) => delete d.log.seen)).toBeUndefined();
     expect(broken((d) => (d.log.introduced = { claude: true }))).toBeUndefined();

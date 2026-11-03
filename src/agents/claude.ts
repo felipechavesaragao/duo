@@ -1,6 +1,7 @@
 import spawn from 'cross-spawn';
 import type { ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
 import { killTree, onJsonLines, stderrTail } from './process.js';
 import {
   createQueue,
@@ -11,7 +12,9 @@ import {
   type Agent,
   type AgentCommand,
   type AgentStats,
+  type AgentTask,
   type EmitFn,
+  type ImageInput,
   type PeerRequest,
   type PermissionRequest,
 } from './types.js';
@@ -62,6 +65,8 @@ interface Running {
   deniedByYou: Set<string>;
   /** task_id dos subagentes rodando */
   subagents: Set<string>;
+  /** subagentes e comandos em segundo plano rodando, por task_id (o quadro da janela) */
+  tasks: Map<string, AgentTask>;
   /** textos do turno que o CLI abriu sozinho, até o result dele */
   own: string[];
   /** o turno que o CLI abriu sozinho já mandou algo (texto, ferramenta ou o result): o fim dele tem de ser avisado */
@@ -70,6 +75,8 @@ interface Running {
   taskShared: Map<string, boolean>;
   /** as tarefas que terminaram e abrem (ou abriram) o turno dele: todas vieram de turnos compartilhados? */
   ownTasksShared?: boolean;
+  /** ele leu, fora de um turno do duo, uma mensagem sua pelo app: ela abre (ou entrou n)o turno dele */
+  ownFromApp: boolean;
   /** request_id do pedido que liga o Remote Control */
   remoteControlRequest?: string;
   /** request_id do initialize, que traz a lista de comandos */
@@ -140,11 +147,13 @@ export class ClaudeAgent implements Agent {
   askPermission?: (req: PermissionRequest) => Promise<boolean>;
   askPeer?: (req: PeerRequest) => Promise<string>;
   onOwnTurnEvent?: EmitFn;
-  onOwnTurnReply?: (text: string, tasksShared?: boolean) => void;
-  onRemoteMessage?: (text: string) => void;
+  onOwnTurnReply?: (text: string, tasksShared?: boolean, fromApp?: boolean) => void;
+  onRemoteMessage?: (text: string, inDuoTurn?: boolean) => void;
   onNotice?: EmitFn;
   onStats?: (stats: AgentStats) => void;
   onCommands?: (commands: AgentCommand[]) => void;
+  onTasks?: (tasks: AgentTask[]) => void;
+  onSignal?: () => void;
   commands: AgentCommand[] = [];
   readonly stats: AgentStats;
   private run?: Running;
@@ -163,14 +172,30 @@ export class ClaudeAgent implements Agent {
     return this.sessionId;
   }
 
-  send(prompt: string, emit: EmitFn, shared = true): Promise<string> {
+  send(prompt: string, emit: EmitFn, shared = true, images: ImageInput[] = []): Promise<string> {
     return this.enqueue(
       () =>
         new Promise<string>((resolve, reject) => {
+          // a imagem vai como bloco base64, como o app manda um print; lida só agora, na vez da mensagem
+          let content: string | object[] = prompt;
+          if (images.length > 0) {
+            try {
+              content = [
+                ...(prompt ? [{ type: 'text', text: prompt }] : []),
+                ...images.map((img) => ({
+                  type: 'image',
+                  source: { type: 'base64', media_type: img.mediaType, data: fs.readFileSync(img.path).toString('base64') },
+                })),
+              ];
+            } catch (err: any) {
+              reject(new Error(`não consegui ler a imagem para o Claude: ${err?.message ?? err}`));
+              return;
+            }
+          }
           const run = this.ensureProcess();
           const uuid = randomUUID();
           this.turn = { proc: run.proc, uuid, started: false, emit, shared, texts: [], resolve, reject };
-          const line = JSON.stringify({ type: 'user', uuid, message: { role: 'user', content: prompt } });
+          const line = JSON.stringify({ type: 'user', uuid, message: { role: 'user', content } });
           run.proc.stdin?.write(line + '\n');
         }),
     );
@@ -184,6 +209,7 @@ export class ClaudeAgent implements Agent {
     this.stop();
     this.sessionId = undefined;
     patchStats(this, { contextTokens: undefined, subagents: 0 });
+    this.onTasks?.([]);
   }
 
   dispose(): void {
@@ -223,12 +249,17 @@ export class ClaudeAgent implements Agent {
       asks: new Map(),
       deniedByYou: new Set(),
       subagents: new Set(),
+      tasks: new Map(),
       own: [],
       ownOpen: false,
+      ownFromApp: false,
       taskShared: new Map(),
       initRequest: `duo-init-${randomUUID()}`,
     };
-    onJsonLines(proc, (msg) => this.handle(run, msg));
+    onJsonLines(proc, (msg) => {
+      if (this.run === run) this.onSignal?.();
+      this.handle(run, msg);
+    });
     proc.on('error', (err) => this.fail(run, new Error(`não consegui iniciar o claude: ${err.message}`)));
     proc.on('exit', (code) => this.onExit(run, code));
     this.run = run;
@@ -244,7 +275,10 @@ export class ClaudeAgent implements Agent {
 
   private onExit(run: Running, code: number | null): void {
     for (const ask of run.asks.values()) ask.abort(); // a pergunta sai da tela: ninguém mais espera a resposta
-    if (this.run === run || !this.run) patchStats(this, { subagents: 0 }); // os subagentes morreram junto
+    if (this.run === run || !this.run) {
+      patchStats(this, { subagents: 0 }); // os subagentes morreram junto
+      if (run.tasks.size > 0) this.onTasks?.([]);
+    }
     const turn = this.turn;
     if (turn?.proc === run.proc && turn.resumeError !== undefined && /No conversation found/i.test(run.tail())) {
       if (this.sessionId === run.resumedWith) this.sessionId = undefined;
@@ -254,7 +288,14 @@ export class ClaudeAgent implements Agent {
     }
     const reason = turn?.resumeError || `o processo do claude encerrou (código ${code ?? '?'})`;
     const extra = run.tail();
-    this.fail(run, new Error(extra ? `${reason}\n${extra}` : reason));
+    const err = new Error(extra ? `${reason}\n${extra}` : reason);
+    if (this.run === run && run.ownOpen) {
+      // o turno que ele abriu sozinho morreu junto: termina aqui (senão fica "rodando"), e a janela fica sabendo, a
+      // não ser que uma mensagem do duo esperando por ele já vá mostrar o mesmo erro
+      if (turn?.proc !== run.proc) this.onOwnTurnEvent?.({ kind: 'error', text: err.message });
+      this.finishOwnTurn(run);
+    }
+    this.fail(run, err);
   }
 
   /** O processo morreu: esquece ele e derruba o turno que dependia dele. */
@@ -317,7 +358,10 @@ export class ClaudeAgent implements Agent {
     if (msg.type === 'assistant' && msg.parent_tool_use_id) return;
 
     const turn = this.turn?.proc === run.proc ? this.turn : undefined;
-    if (msg.type === 'system' && typeof msg.task_id === 'string') this.trackTask(run, turn, msg);
+    if (msg.type === 'system' && typeof msg.task_id === 'string') {
+      this.trackTask(run, turn, msg);
+      this.trackTaskList(run, msg);
+    }
     if (msg.type === 'command_lifecycle') {
       if (turn && msg.state === 'started' && msg.command_uuid === turn.uuid) this.startTurn(run, turn);
       return;
@@ -327,9 +371,13 @@ export class ClaudeAgent implements Agent {
       if (turn && msg.uuid === turn.uuid) {
         this.startTurn(run, turn);
       } else if (this.opts.remoteControl && !msg.isSynthetic) {
-        // outra mensagem lida pelo CLI: só pode ter vindo do app, pelo Remote Control
+        // outra mensagem lida pelo CLI: só pode ter vindo do app, pelo Remote Control. Lida no meio de um turno do duo,
+        // é dele; senão é do turno dele que está aberto ou do próximo (a não ser que o CLI leia a do duo antes de
+        // responder: aí entrou no turno do duo, e o startTurn esquece)
         const text = userText(msg.message?.content);
-        if (text) this.onRemoteMessage?.(text);
+        const inDuoTurn = turn?.started === true;
+        if (text && !inDuoTurn) run.ownFromApp = true;
+        if (text) this.onRemoteMessage?.(text, inDuoTurn);
       }
       return;
     }
@@ -395,16 +443,19 @@ export class ClaudeAgent implements Agent {
 
   /**
    * O turno que o CLI abriu sozinho terminou (ou a mensagem do duo entrou nele): a resposta vai para a janela. Turno
-   * sem texto (só ferramenta) também avisa, com texto vazio: o modo dele acaba aqui e não passa para o próximo.
+   * sem texto (só ferramenta) também avisa, com texto vazio: o modo dele acaba aqui e não passa para o próximo. Sem
+   * turno dele aberto (o CLI leu a do duo antes de responder), o que estava guardado para ele entrou no turno do duo.
    */
   private finishOwnTurn(run: Running): void {
     const tasksShared = run.ownTasksShared;
+    const fromApp = run.ownFromApp;
     run.ownTasksShared = undefined;
+    run.ownFromApp = false;
     if (!run.ownOpen) return;
     const text = run.own.join('\n\n');
     run.own = [];
     run.ownOpen = false;
-    this.onOwnTurnReply?.(text, tasksShared);
+    this.onOwnTurnReply?.(text, tasksShared, fromApp);
   }
 
   /**
@@ -420,6 +471,36 @@ export class ClaudeAgent implements Agent {
       if (!turn?.started) run.ownTasksShared = (run.ownTasksShared ?? true) && (run.taskShared.get(msg.task_id) ?? false);
       run.taskShared.delete(msg.task_id);
     }
+  }
+
+  /**
+   * O quadro de segundo plano: cada subagente e comando em segundo plano, do `task_started` (descrição, tipo do
+   * subagente) ao `task_notification`, com o último `task_progress` como sinal de vida. Medido em 03/11/2026 no
+   * 2.1.316: o progresso traz `description` (o que está fazendo agora) e `last_tool_name`; um `task_updated` com o
+   * status final vem logo antes do `task_notification`.
+   */
+  private trackTaskList(run: Running, msg: any): void {
+    const id: string = msg.task_id;
+    const now = Date.now();
+    const known = run.tasks.get(id);
+    if (msg.subtype === 'task_started') {
+      run.tasks.set(id, {
+        id,
+        kind: msg.task_type === 'local_bash' ? 'comando' : 'subagente',
+        title: String(msg.description || msg.task_type || 'tarefa'),
+        detail: typeof msg.subagent_type === 'string' ? msg.subagent_type : undefined,
+        startedAt: now,
+        lastAt: now,
+      });
+    } else if (msg.subtype === 'task_progress' && known) {
+      const activity = msg.description || msg.last_tool_name;
+      run.tasks.set(id, { ...known, activity: activity ? String(activity) : known.activity, lastAt: now });
+    } else if (msg.subtype === 'task_notification' && known) {
+      run.tasks.delete(id);
+    } else {
+      return;
+    }
+    if (this.run === run) this.onTasks?.([...run.tasks.values()]);
   }
 
   /** Modelo, contexto e subagentes, para o rodapé. Vale também fora de um turno (subagente em segundo plano). */

@@ -32,6 +32,28 @@ export interface AgentCommand {
   hint?: string;
 }
 
+/** Uma imagem que vai junto da mensagem (um print colado na janela), já gravada em disco. */
+export interface ImageInput {
+  /** caminho do arquivo: o Codex lê por ele, o Claude recebe o conteúdo */
+  path: string;
+  mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
+}
+
+/** Algo que o agente pôs para rodar além da resposta: um subagente ou um comando em segundo plano. */
+export interface AgentTask {
+  id: string;
+  kind: 'subagente' | 'comando';
+  /** o que ela faz, como o CLI descreveu */
+  title: string;
+  /** o tipo do subagente (general-purpose, devil-advocate...) ou o modelo dele, quando o CLI informa */
+  detail?: string;
+  /** o que ela está fazendo agora (o último progresso que o CLI mandou) */
+  activity?: string;
+  /** quando começou e o último sinal de vida (início ou progresso), em ms desde 1970 */
+  startedAt: number;
+  lastAt: number;
+}
+
 /** O que o rodapé mostra de cada um. */
 export interface AgentStats {
   /** modelo em uso, como o CLI informou; undefined = ainda não sabe (antes da primeira mensagem) */
@@ -54,6 +76,10 @@ export interface Agent {
   readonly commands: AgentCommand[];
   /** chamado quando a lista de comandos muda */
   onCommands?: (commands: AgentCommand[]) => void;
+  /** chamado quando um subagente ou comando em segundo plano começa, dá sinal de vida ou termina: a lista toda */
+  onTasks?: (tasks: AgentTask[]) => void;
+  /** chamado a cada coisa que chega do processo dele: é o sinal de vida que mostra se ele está travado */
+  onSignal?: () => void;
   /** sobe o processo já, sem mandar nada: a lista de comandos carrega antes da primeira mensagem */
   warmUp(): void;
   /** id da conversa no CLI de origem (session_id do Claude / thread_id do Codex); undefined = ainda não começou */
@@ -68,21 +94,26 @@ export interface Agent {
    * Turno que o próprio CLI abre, sem mensagem do duo (o Claude é avisado de que um subagente ou comando em
    * segundo plano terminou e continua sozinho): `onOwnTurnEvent` recebe o que ele faz; `onOwnTurnReply`, a resposta.
    * `tasksShared` = o turno foi aberto por tarefas em segundo plano e todas foram lançadas em mensagens no modo
-   * compartilhado (true) ou não (false); undefined = não veio de tarefa conhecida. Texto vazio = o turno terminou sem
+   * compartilhado (true) ou não (false); undefined = não veio de tarefa conhecida. `fromApp` = uma mensagem sua pelo
+   * app (`onRemoteMessage` fora de um turno do duo) abriu este turno ou entrou nele. Texto vazio = o turno terminou sem
    * resposta em texto (só ferramenta): não há o que registrar, mas o turno acabou.
    */
   onOwnTurnEvent?: EmitFn;
-  onOwnTurnReply?: (text: string, tasksShared?: boolean) => void;
-  /** mensagem que entrou na conversa por fora do duo: você digitou no app, pelo Remote Control */
-  onRemoteMessage?: (text: string) => void;
+  onOwnTurnReply?: (text: string, tasksShared?: boolean, fromApp?: boolean) => void;
+  /**
+   * Mensagem que entrou na conversa por fora do duo: você digitou no app, pelo Remote Control. `inDuoTurn` = ele a
+   * leu no meio de um turno do duo, que é quem a responde; senão (ou sem a informação) ela abre (ou entra em) um
+   * turno dele.
+   */
+  onRemoteMessage?: (text: string, inDuoTurn?: boolean) => void;
   /** aviso sobre o agente fora de qualquer turno (o Remote Control ligou, ou não ligou) */
   onNotice?: EmitFn;
   /**
    * Manda uma mensagem. Resolve com a resposta final em texto. Mensagens são enfileiradas. `shared` = o modo do duo
    * em que ela foi (padrão: compartilhado): o agente só guarda, e devolve em `onOwnTurnReply` se uma tarefa lançada
-   * nela abrir um turno sozinho.
+   * nela abrir um turno sozinho. `images` = prints que vão junto da mensagem.
    */
-  send(prompt: string, emit: EmitFn, shared?: boolean): Promise<string>;
+  send(prompt: string, emit: EmitFn, shared?: boolean, images?: ImageInput[]): Promise<string>;
   /** Esquece a conversa: a próxima mensagem começa uma sessão nova. */
   reset(): void;
   /** Encerra processos filhos. */

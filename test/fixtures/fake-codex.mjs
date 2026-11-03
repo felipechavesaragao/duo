@@ -9,7 +9,7 @@
 // CHAMA <texto> (usa a ferramenta do cliente, se o thread/start a trouxe em dynamicTools: pedido item/tool/call,
 // como o 0.166.0). Todo turno manda o uso de tokens da conversa.
 // skills/list → duas skills, uma desligada, como o 0.166.0. Turno com o item {type:"skill"} responde
-// "eco: [skill <nome>] <texto>".
+// "eco: [skill <nome>] <texto>". Turno com itens {type:"localImage"} acrescenta " | imagens: <caminhos>".
 // Cada turno tem id próprio (turno-1, turno-2...), como o real. Pedido antes do initialize → "Not initialized".
 // --init-delay <ms> → demora para responder o initialize (o real leva ~1s subindo).
 // INTRUSO → antes da resposta, chegam um item e um turn/completed de OUTRO turno (um que estourou o prazo).
@@ -37,6 +37,7 @@ const toolReplies = []; // o que o cliente devolveu às chamadas do ATRASA
 const waiting = new Map(); // respostas do cliente a pedidos do servidor
 const cancel = new Map(); // turnos que podem ser interrompidos, por id
 
+let images = [];
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   const msg = JSON.parse(line);
@@ -79,6 +80,7 @@ rl.on('line', (line) => {
       const turnId = `turno-${++turns}`;
       const text = params.input?.[0]?.text ?? '';
       const skill = params.input?.find((i) => i.type === 'skill');
+      images = (params.input ?? []).filter((i) => i.type === 'localImage').map((i) => i.path);
       if (text === 'DEMORA') return slowTurn(id, turnId);
       if (text.startsWith('ATRASA ')) return lateCall(id, turnId, text.slice(7));
       if (text === 'ANTES') {
@@ -131,6 +133,7 @@ async function runTurn(turnId, text, skill) {
   const message = (t) => item('item/completed', { id: 'm', type: 'agentMessage', text: t });
   note('turn/started', { turn: { id: turnId } });
   let answer = skill ? `eco: [skill ${skill.name} ${skill.path}] ${text}` : `eco: ${text}`;
+  if (images.length > 0) answer += ` | imagens: ${images.join(', ')}`;
   if (text === 'PID') answer = `pid ${process.pid}`;
   if (text === 'PARAMS') answer = JSON.stringify(threadParams);
   if (text === 'INIT') answer = JSON.stringify(initParams);
@@ -172,7 +175,7 @@ async function runTurn(turnId, text, skill) {
   // Subagente (0.166.0): item subAgentActivity na conversa principal; a dele tem uso de tokens próprio.
   if (text === 'AGENTE' || text === 'FIM') {
     const kind = text === 'AGENTE' ? 'started' : 'completed';
-    item('item/completed', { id: `s-${kind}`, type: 'subAgentActivity', kind, agentThreadId: 'filho', agentPath: '/root/x' });
+    item('item/completed', { id: `s-${kind}`, type: 'subAgentActivity', kind, agentThreadId: 'filho', agentPath: '/root/x', model: 'gpt-filho' });
     const big = { last: { totalTokens: 999999 }, modelContextWindow: 475000 };
     out({ method: 'thread/tokenUsage/updated', params: { threadId: 'filho', turnId: 't', tokenUsage: big } });
   }

@@ -10,7 +10,9 @@ import {
   type Agent,
   type AgentCommand,
   type AgentStats,
+  type AgentTask,
   type EmitFn,
+  type ImageInput,
   type PeerRequest,
 } from './types.js';
 
@@ -89,6 +91,8 @@ export class CodexAgent implements Agent {
   askPeer?: (req: PeerRequest) => Promise<string>;
   onStats?: (stats: AgentStats) => void;
   onCommands?: (commands: AgentCommand[]) => void;
+  onTasks?: (tasks: AgentTask[]) => void;
+  onSignal?: () => void;
   commands: AgentCommand[] = [];
   readonly stats: AgentStats;
   /** espera máxima por uma resposta de controle, lida a cada pedido. Os testes encurtam depois que a conexão sobe. */
@@ -105,6 +109,8 @@ export class CodexAgent implements Agent {
   private waiting?: Waiting;
   /** agentThreadId dos subagentes rodando */
   private subagents = new Set<string>();
+  /** os mesmos subagentes, para o quadro de segundo plano da janela */
+  private tasks = new Map<string, AgentTask>();
   private enqueue = createQueue();
 
   constructor(private readonly opts: CodexOptions) {
@@ -116,8 +122,8 @@ export class CodexAgent implements Agent {
     return this.threadId;
   }
 
-  send(prompt: string, emit: EmitFn): Promise<string> {
-    return this.enqueue(() => this.runTurn(prompt, emit));
+  send(prompt: string, emit: EmitFn, _shared?: boolean, images: ImageInput[] = []): Promise<string> {
+    return this.enqueue(() => this.runTurn(prompt, emit, images));
   }
 
   warmUp(): void {
@@ -173,8 +179,10 @@ export class CodexAgent implements Agent {
       if (!this.conn) {
         this.subagents.clear(); // os subagentes morreram junto
         patchStats(this, { subagents: 0 });
+        this.setTasks(() => this.tasks.clear());
       }
     });
+    conn.onMessage = () => this.onSignal?.();
     conn.on((method, p) => this.trackStats(method, p)); // a conexão toda: subagente pode terminar fora do turno
     conn.on((method) => method === 'skills/changed' && void this.loadSkills(conn));
     conn.handleRequest = (method, p) => (method === 'item/tool/call' ? this.answerTool(conn, p) : undefined);
@@ -216,13 +224,25 @@ export class CodexAgent implements Agent {
     }
   }
 
-  /** "/nome resto" com uma skill desse nome vira o que o terminal do Codex manda: "$nome resto" e a skill junto. */
-  private turnInput(prompt: string): object[] {
+  /**
+   * "/nome resto" com uma skill desse nome vira o que o terminal do Codex manda: "$nome resto" e a skill junto.
+   * Cada imagem vai como `localImage` (o caminho do arquivo), como o terminal dele manda um print colado.
+   */
+  private turnInput(prompt: string, images: ImageInput[] = []): object[] {
     const text = (t: string) => ({ type: 'text', text: t, text_elements: [] });
+    const pics = images.map((img) => ({ type: 'localImage', path: img.path }));
     const m = prompt.match(/^\/(\S+)([\s\S]*)$/);
     const path = m ? this.skills.get(m[1]) : undefined;
-    if (!m || !path) return [text(prompt)];
-    return [text(`$${m[1]}${m[2]}`), { type: 'skill', name: m[1], path }];
+    if (!m || !path) return [...(prompt || pics.length === 0 ? [text(prompt)] : []), ...pics];
+    return [text(`$${m[1]}${m[2]}`), { type: 'skill', name: m[1], path }, ...pics];
+  }
+
+  /** Muda a lista de subagentes e avisa a janela, se mudou algo. */
+  private setTasks(change: () => boolean | void): void {
+    const before = this.tasks.size;
+    if (change() === false && this.tasks.size === before) return;
+    if (before === 0 && this.tasks.size === 0) return;
+    this.onTasks?.([...this.tasks.values()]);
   }
 
   /** O Codex chamou a ferramenta do duo: leva a mensagem ao Claude e devolve a resposta dele. */
@@ -300,10 +320,25 @@ export class CodexAgent implements Agent {
       if (kind === 'started') this.subagents.add(agentThreadId);
       else if (kind === 'completed' || kind === 'interrupted') this.subagents.delete(agentThreadId);
       patchStats(this, { subagents: this.subagents.size });
+      this.setTasks(() => {
+        if (kind === 'completed' || kind === 'interrupted') return this.tasks.delete(agentThreadId);
+        if (kind !== 'started' || this.tasks.has(agentThreadId)) return false;
+        // agentPath é algo como "/root/explorer": o último pedaço é o nome que ele deu ao subagente
+        const name = String(p.item.agentPath ?? '').split('/').filter(Boolean).at(-1) || 'subagente';
+        const now = Date.now();
+        this.tasks.set(agentThreadId, {
+          id: agentThreadId,
+          kind: 'subagente',
+          title: name,
+          detail: typeof p.item.model === 'string' ? p.item.model : undefined,
+          startedAt: now,
+          lastAt: now,
+        });
+      });
     }
   }
 
-  private async runTurn(prompt: string, emit: EmitFn): Promise<string> {
+  private async runTurn(prompt: string, emit: EmitFn, images: ImageInput[] = []): Promise<string> {
     const conn = await this.connect();
     const threadId = await this.openThread(conn);
     conn.onServerRequest = (method) =>
@@ -373,7 +408,7 @@ export class CodexAgent implements Agent {
         const id = late?.turn?.id;
         if (typeof id === 'string') conn.request('turn/interrupt', { threadId, turnId: id }).catch(() => undefined);
       };
-      conn.request('turn/start', { threadId, input: this.turnInput(prompt) }, interruptLate).then(
+      conn.request('turn/start', { threadId, input: this.turnInput(prompt, images) }, interruptLate).then(
         (result: any) => {
           turnId = typeof result?.turn?.id === 'string' ? result.turn.id : undefined; // sem id: aceita todos
           waiting.turnId = turnId;
@@ -411,6 +446,8 @@ class Connection {
   handleRequest?: (method: string, params: any) => Promise<unknown> | undefined;
   /** chamado quando o servidor pede algo que o duo não atende (aprovação, pergunta): o duo recusa */
   onServerRequest?: (method: string) => void;
+  /** qualquer mensagem do processo (resposta, pedido ou notificação): é o sinal de vida dele */
+  onMessage?: () => void;
   closed = false;
 
   constructor(
@@ -478,6 +515,7 @@ class Connection {
 
   private dispatch(msg: any): void {
     if (this.closed) return;
+    this.onMessage?.();
     if (msg.id !== undefined && msg.method === undefined) {
       const lateHandler = this.late.get(msg.id);
       if (lateHandler) {

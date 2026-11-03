@@ -15,6 +15,8 @@ export interface ScreenEntry {
   text: string;
   /** mostra o nome de quem fala (só quando muda de quem falava antes) */
   label: boolean;
+  /** prints que você colou nesta mensagem: o nome do arquivo na pasta de imagens do duo */
+  images?: string[];
 }
 
 /**
@@ -101,7 +103,8 @@ const isScreenEntry = (e: any) =>
   ['claude', 'codex', 'voce', 'sistema'].includes(e.who) &&
   ['text', 'tool', 'error'].includes(e.kind) &&
   typeof e.text === 'string' &&
-  typeof e.label === 'boolean';
+  typeof e.label === 'boolean' &&
+  (e.images === undefined || (Array.isArray(e.images) && e.images.every((n: unknown) => typeof n === 'string')));
 
 /**
  * Confere a estrutura inteira, campo a campo do que a retomada usa: um JSON válido mas incompleto quebraria a
@@ -128,12 +131,17 @@ function isSessionData(d: any): d is SessionData {
  *   sessions/<id>.json   uma conversa
  *   sessions/<id>.lock   pid do duo que está com ela aberta
  *   last/<pasta>.txt     id da última conversa daquela pasta (o que o `duo -c` abre)
+ *   imagens/             os prints colados na janela (o agente lê daqui, e a conversa retomada mostra de novo)
  */
 export class SessionStore {
   readonly root: string;
 
   constructor(root = process.env.DUO_HOME || path.join(os.homedir(), '.duo')) {
     this.root = root;
+  }
+
+  get imagesDir(): string {
+    return path.join(this.root, 'imagens');
   }
 
   lastIdFor(cwd: string): string | undefined {

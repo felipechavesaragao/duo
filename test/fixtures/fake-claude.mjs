@@ -6,8 +6,9 @@
 //                   sem ele, nega sozinho e só conta no permission_denials do result.
 // "CHAMA <texto>"  → usa a ferramenta do servidor MCP "duo" (sdk, via --mcp-config), como o 2.1.316:
 //                   initialize, notifications/initialized, tools/list e tools/call em mcp_message.
-// "AGENTE" / "FIM" → um subagente começa (task_started, mais uma mensagem dele com texto e parent_tool_use_id)
-//                   e termina (task_notification), como no 2.1.316.
+// "AGENTE" / "FIM" → um subagente começa (task_started com description e subagent_type, um task_progress, mais
+//                   uma mensagem dele com texto e parent_tool_use_id) e termina (task_notification), como no 2.1.316.
+// content em lista (texto + imagens) → responde com o texto e o tipo e o tamanho de cada imagem.
 // O system/init traz apiKeySource: "ANTHROPIC_API_KEY" com a variável no ambiente, "none" sem ela (2.1.316).
 // "ARGS"           → responde com os argumentos da linha de comando.
 // "SOZINHO <texto>" → lança uma tarefa em segundo plano (task_started "local_bash", no turno), responde, e logo
@@ -15,6 +16,7 @@
 //                   mesmo task_id, init, a resposta dele e o result. Mensagem que
 //                   chega nesses 300ms entra no mesmo turno: eco dela, a resposta e um result só para os dois.
 //                   "SOZINHO FIM <texto>": além disso, o subagente do "AGENTE" termina neste turno, antes da resposta.
+//                   "SOZINHO MORRE <texto>": o processo cai (código 3) no meio do turno que ele abriu sozinho.
 // "CALADO"         → como "SOZINHO", mas o turno que ele abre sozinho só usa uma ferramenta: nenhum texto.
 // Com --replay-user-messages, ecoa cada mensagem lida (com o uuid dela), como o 2.1.316. O command_lifecycle
 // "started" vem antes do eco; numa mensagem que entra no turno que ele abriu sozinho, logo depois.
@@ -25,6 +27,8 @@
 // "MUDA"           → system/commands_changed com um comando a mais.
 // "APP <texto>"    → responde, e logo depois chega <texto> como se você tivesse digitado no app (Remote
 //                   Control): o eco dela com um uuid que não é do duo, e um turno inteiro respondendo.
+//                   "APP DENTRO <texto>": o eco dela chega no meio deste turno, e a resposta é deste turno.
+//                   "APP ANTES <texto>": ele lê a dela antes desta, sem responder no meio: uma resposta para as duas.
 // Toda resposta traz usage (contexto = 1000 × número da mensagem) e o result traz o contextWindow.
 import readline from 'node:readline';
 
@@ -92,6 +96,10 @@ if (resume === 'sumiu') {
       const content = [{ type: 'tool_use', id: 'toolu_calado', name: 'Read', input: { file_path: 'saida.txt' } }];
       out({ type: 'assistant', session_id: sid, message: { model, usage: usage(), content } });
     } else say(`sozinho: ${text}`);
+    if (text?.startsWith('MORRE ')) {
+      process.stderr.write('caiu no meio do turno\n');
+      return void setTimeout(() => process.exit(3), 200);
+    }
     await new Promise((r) => setTimeout(r, 300));
     for (const msg of own) {
       echo(msg);
@@ -120,9 +128,20 @@ if (resume === 'sumiu') {
       return out({ type: 'system', subtype: 'bridge_state', state: 'connected', session_id: sid });
     }
     if (own) return void own.push(msg);
+    const before = typeof msg.message.content === 'string' && msg.message.content.startsWith('APP ANTES ');
+    if (before) echo({ uuid: 'mensagem-do-app', message: { role: 'user', content: msg.message.content.slice(10) } });
     started(msg);
     const apiKeySource = process.env.ANTHROPIC_API_KEY ? 'ANTHROPIC_API_KEY' : 'none';
     if (++n === 1) out({ type: 'system', subtype: 'init', session_id: sid, model, apiKeySource });
+    if (Array.isArray(msg.message.content)) {
+      echo(msg);
+      const blocks = msg.message.content;
+      const said = blocks.filter((b) => b.type === 'text').map((b) => b.text).join(' ');
+      const pics = blocks
+        .filter((b) => b.type === 'image')
+        .map((b) => `${b.source.type} ${b.source.media_type} ${Buffer.from(b.source.data, 'base64').length}`);
+      return reply(`eco: ${said} | imagens: ${pics.join(', ')}`);
+    }
     const text = msg.message.content;
     if (text.startsWith('/')) {
       out({ type: 'assistant', session_id: sid, message: { model: '<synthetic>', content: [{ type: 'text', text: `saída do ${text}` }] } });
@@ -136,6 +155,11 @@ if (resume === 'sumiu') {
       out({ type: 'system', subtype: 'commands_changed', commands, session_id: sid });
       return reply('eco: MUDA');
     }
+    if (text.startsWith('APP DENTRO ')) {
+      echo({ uuid: 'mensagem-do-app', message: { role: 'user', content: text.slice(11) } });
+      return reply(`eco: ${text.slice(11)}`);
+    }
+    if (text.startsWith('APP ANTES ')) return reply(`eco: ${text.slice(10)}`);
     if (text.startsWith('APP ')) {
       reply('eco: ok');
       setTimeout(() => {
@@ -156,7 +180,9 @@ if (resume === 'sumiu') {
       return;
     }
     if (text === 'AGENTE') {
-      out({ type: 'system', subtype: 'task_started', task_id: 'tarefa-1', tool_use_id: 'toolu_a', task_type: 'local_agent', session_id: sid });
+      const desc = { description: 'revisar o diff', subagent_type: 'devil-advocate' };
+      out({ type: 'system', subtype: 'task_started', task_id: 'tarefa-1', tool_use_id: 'toolu_a', task_type: 'local_agent', ...desc, session_id: sid });
+      out({ type: 'system', subtype: 'task_progress', task_id: 'tarefa-1', description: 'Lendo src/core.ts', last_tool_name: 'Read', session_id: sid });
       const big = { input_tokens: 999999, output_tokens: 1 }; // do subagente: não é o contexto da conversa
       const content = [{ type: 'text', text: 'texto do subagente' }];
       out({ type: 'assistant', parent_tool_use_id: 'toolu_a', session_id: sid, message: { model, usage: big, content } });

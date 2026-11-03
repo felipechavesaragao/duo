@@ -6,6 +6,9 @@ import { App } from './app.js';
 import { ClaudeAgent } from './agents/claude.js';
 import { CodexAgent } from './agents/codex.js';
 import { remoteControlAtStartup } from './claudeSettings.js';
+import { Duo } from './core.js';
+import { openWindow } from './gui/open.js';
+import { startGui } from './gui/server.js';
 import { newSessionData, Recorder, SessionStore, type SessionData } from './persist.js';
 import type { Target } from './router.js';
 
@@ -14,6 +17,7 @@ const USAGE = `duo — Claude Code e Codex na mesma janela
 uso: duo [opções]
 
   -c, --continuar                  continua a última conversa desta pasta
+  --gui                            abre numa janela própria em vez do terminal
   --para <claude|codex|todos>      destino padrão inicial (padrão: claude)
   --claude-permission <modo>       default | acceptEdits | plan | bypassPermissions (padrão: o do seu settings.json)
   --codex-sandbox <modo>           read-only | workspace-write | danger-full-access (padrão: livre, sem sandbox)
@@ -28,6 +32,7 @@ Os dois trabalham na pasta onde você rodou o duo. As conversas ficam salvas em 
 const { values } = parseArgs({
   options: {
     continuar: { type: 'boolean', short: 'c', default: false },
+    gui: { type: 'boolean', default: false },
     para: { type: 'string' },
     'claude-permission': { type: 'string' },
     'codex-sandbox': { type: 'string' },
@@ -95,6 +100,30 @@ process.on('exit', () => {
   Object.values(agents).forEach((a) => a.dispose());
 });
 
-const app = render(<App agents={agents} recorder={recorder} resumed={resumed} />);
-await app.waitUntilExit();
+if (values.gui) {
+  // Na janela: o terminal só mostra o endereço. Ctrl+C aqui grava e solta a trava como o /sair; com a janela de pé,
+  // vai pelo próprio /sair, e ela fica sabendo que o duo acabou (senão fica tentando religar). O segundo sai na hora.
+  let ctrlC: () => void = () => process.exit(0);
+  process.on('SIGINT', () => ctrlC());
+  const duo = new Duo({ agents, recorder, resumed });
+  const gui = await startGui(duo, { imagesDir: store.imagesDir }).catch((err: Error) => {
+    console.error(err.message);
+    process.exit(1);
+  });
+  const quit = new Promise<void>((resolve) => duo.subscribe((ev) => ev.type === 'quit' && resolve()));
+  ctrlC = () => {
+    ctrlC = () => process.exit(0);
+    duo.submit('/sair');
+  };
+  duo.start();
+  openWindow(gui.url);
+  console.log(`duo aberto numa janela, na pasta ${cwd}.`);
+  console.log(`Se ela não abriu, abra no navegador: ${gui.url}`);
+  console.log('/sair na janela ou Ctrl+C aqui encerra o duo.');
+  await quit;
+  await gui.close();
+} else {
+  const app = render(<App agents={agents} recorder={recorder} resumed={resumed} />);
+  await app.waitUntilExit();
+}
 process.exit(0);
