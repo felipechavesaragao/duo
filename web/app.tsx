@@ -17,12 +17,13 @@ import {
   type AgentModel,
   type AgentStats,
   type AgentTask,
+  type AgentTool,
   type ModelChoice,
 } from '../src/agents/types.js';
 import type { Ask, Entry } from '../src/core.js';
 import { COLORS, currentModel, footerText, modelLabel, NAMES } from '../src/display.js';
 import type { Who } from '../src/persist.js';
-import type { ModelBody, PastedImage, ServerEvents, Snapshot } from '../src/gui/protocol.js';
+import type { ModelBody, PastedImage, ServerEvents, Snapshot, StopBody } from '../src/gui/protocol.js';
 import { agentCommandQuery, matchCommands, targetsOf, type Target } from '../src/router.js';
 
 /**
@@ -197,6 +198,7 @@ export function App() {
   const answer = (ask: Ask, ok: boolean) => void run('/api/answer', { id: ask.id, ok }).catch(() => undefined);
   const setModel = (agent: AgentId, choice: ModelChoice) =>
     void run('/api/modelo', { agent, ...choice } satisfies ModelBody).catch(() => undefined);
+  const stop = (agent: AgentId) => void run('/api/parar', { agent } satisfies StopBody).catch(() => undefined);
   /** começa a mensagem por você (o brain, a lista de comandos) e põe o cursor no fim */
   const prefill = (value: string) => {
     setText(value);
@@ -277,7 +279,9 @@ export function App() {
         </footer>
       </section>
 
-      {right && <Panel snap={snap} live={live} now={now} onHide={() => setRight(false)} onCommand={command} />}
+      {right && (
+        <Panel snap={snap} live={live} now={now} onHide={() => setRight(false)} onCommand={command} onStop={stop} />
+      )}
 
       {conn === 'caiu' && <div className="banner">A ligação com o duo caiu. Tentando de novo…</div>}
       {conn === 'encerrado' && (
@@ -359,8 +363,9 @@ function Panel(props: {
   now: number;
   onHide: () => void;
   onCommand: (cmd: string) => void;
+  onStop: (agent: AgentId) => void;
 }) {
-  const { snap, live, now, onHide, onCommand } = props;
+  const { snap, live, now, onHide, onCommand, onStop } = props;
   return (
     <aside className="panel">
       <div className="panel-top">
@@ -369,7 +374,7 @@ function Panel(props: {
       </div>
 
       <div className="panel-section">Rodando agora</div>
-      <Running snap={snap} now={now} />
+      <Running snap={snap} live={live} now={now} onStop={onStop} />
 
       <div className="panel-divider" />
       <div className="panel-section">Ambiente</div>
@@ -406,10 +411,11 @@ function Panel(props: {
 }
 
 /**
- * O quadro do que está rodando: o turno de cada um (desde quando, e há quanto tempo veio o último sinal do processo
- * dele) e o que ele pôs em segundo plano. Sinal parado há muito = travado, ou numa ferramenta demorada.
+ * O quadro do que está rodando: o turno de cada um (desde quando, e o que ele espera agora: você, o outro, uma
+ * ferramenta, ou nada que se saiba) e o que ele pôs em segundo plano. Cada um tem o botão de parar só ele.
  */
-function Running({ snap, now }: { snap: Snapshot; now: number }) {
+function Running(props: { snap: Snapshot; live: boolean; now: number; onStop: (agent: AgentId) => void }) {
+  const { snap, live, now, onStop } = props;
   const active = AGENTS.filter((id) => snap.busy[id] > 0 || snap.runningSince[id] !== null || snap.tasks[id].length > 0);
   return (
     <div className="running">
@@ -426,6 +432,12 @@ function Running({ snap, now }: { snap: Snapshot; now: number }) {
             signal={snap.lastSignal[id]}
             asking={snap.asks.some((a) => a.who === id)}
             tasks={snap.tasks[id]}
+            other={snap.names[id === 'claude' ? 'codex' : 'claude']}
+            tools={snap.tools[id]}
+            peerWait={snap.peerWait[id]}
+            stopping={snap.stopping[id]}
+            live={live}
+            onStop={() => onStop(id)}
             now={now}
           />
         ))
@@ -442,30 +454,63 @@ function RunningAgent(props: {
   signal: number | null;
   asking: boolean;
   tasks: AgentTask[];
+  /** o nome do outro agente */
+  other: string;
+  tools: AgentTool[];
+  peerWait: number | null;
+  stopping: boolean;
+  live: boolean;
+  onStop: () => void;
   now: number;
 }) {
-  const { name, color, since, busy, signal, asking, tasks, now } = props;
+  const { name, color, since, busy, signal, asking, tasks, other, tools, peerWait, stopping, live, onStop, now } = props;
   const silent = signal !== null ? now - signal : null;
+  // a ferramenta mais antiga é a que segura o turno
+  const tool = tools.reduce<AgentTool | undefined>((a, t) => (a && a.startedAt <= t.startedAt ? a : t), undefined);
   // Só conta com turno rodando: parado, com algo em segundo plano, o processo fica quieto mesmo (cada tarefa mostra o
-  // próprio progresso). E esperando a sua resposta não é estar travado.
-  const stale = since !== null && !asking && silent !== null && silent > STALE_MS;
+  // próprio progresso). Esperando você, o outro ou uma ferramenta não é estar travado.
+  const stale = since !== null && !asking && peerWait === null && !tool && silent !== null && silent > STALE_MS;
   const queued = since !== null ? busy - 1 : busy;
   return (
     <div className="running-agent" style={tint(color)}>
       <div className="running-head">
         <span className={`dot${since !== null ? ' pulse' : ''}`} />
         <span className="running-name">{name}</span>
-        <span className="spacer" />
-        <span className="muted">
-          {asking ? 'pede permissão' : since !== null ? `respondendo · ${elapsed(now - since)}` : 'sem turno'}
+        {!stopping && (since !== null || queued > 0) && (
+          <button
+            className="stop-agent"
+            disabled={!live}
+            aria-label={`Parar o ${name}`}
+            title={`Parar só o ${name}: o que ele está fazendo e a fila dele. O ${other} segue, e a conversa continua.`}
+            onClick={onStop}
+          >
+            {icons.stop}
+          </button>
+        )}
+        <span className="running-status muted">
+          {stopping
+            ? 'parando…'
+            : asking
+              ? 'pede permissão'
+              : since !== null
+                ? `respondendo · ${elapsed(now - since)}`
+                : 'sem turno'}
         </span>
       </div>
-      {queued > 0 && <div className="running-line muted">{queued === 1 ? '1 mensagem na fila' : `${queued} mensagens na fila`}</div>}
-      {since !== null && silent !== null && (
-        <div className={`running-line${stale ? ' warn' : ' muted'}`}>
-          {stale
-            ? `sem sinal há ${elapsed(silent)}: pode estar travado, ou numa ferramenta demorada`
-            : `último sinal há ${elapsed(silent)}`}
+      {queued > 0 && !stopping && (
+        <div className="running-line muted">{queued === 1 ? '1 mensagem na fila' : `${queued} mensagens na fila`}</div>
+      )}
+      {since !== null && !asking && (
+        <div className={`running-line${stale ? ' warn' : ' muted'}`} title={tools.map((t) => t.text).join('\n') || undefined}>
+          {peerWait !== null
+            ? `esperando o ${other} responder · há ${elapsed(now - peerWait)}`
+            : tool
+              ? `rodando: ${truncate(tool.text, 80)} · há ${elapsed(now - tool.startedAt)}${tools.length > 1 ? ` (+${tools.length - 1})` : ''}`
+              : silent === null
+                ? 'sem sinal ainda'
+                : stale
+                  ? `sem sinal há ${elapsed(silent)}, sem ferramenta rodando: pode estar travado`
+                  : `último sinal há ${elapsed(silent)}`}
         </div>
       )}
       {tasks.map((t) => (

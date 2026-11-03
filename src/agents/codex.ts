@@ -12,6 +12,7 @@ import {
   type AgentModel,
   type AgentStats,
   type AgentTask,
+  type AgentTool,
   type EmitFn,
   type ImageInput,
   type ModelChoice,
@@ -103,6 +104,7 @@ export class CodexAgent implements Agent {
   onCommands?: (commands: AgentCommand[]) => void;
   onModels?: (models: AgentModel[]) => void;
   onTasks?: (tasks: AgentTask[]) => void;
+  onTools?: (tools: AgentTool[]) => void;
   onSignal?: () => void;
   commands: AgentCommand[] = [];
   models: AgentModel[] = [];
@@ -123,6 +125,12 @@ export class CodexAgent implements Agent {
   private subagents = new Set<string>();
   /** os mesmos subagentes, para o quadro de segundo plano da janela */
   private tasks = new Map<string, AgentTask>();
+  /** as ferramentas rodando no turno, por id do item: o quadro da janela */
+  private tools = new Map<string, AgentTool>();
+  /** as chamadas dele ao Claude esperando resposta: parar o Codex solta cada uma */
+  private peerCalls = new Set<AbortController>();
+  /** pediram para parar enquanto o turno ainda abria a conversa: ele nem começa */
+  private stopAsked = false;
   private enqueue = createQueue();
   /** o serviceTier do modo rápido de cada modelo, por id */
   private fastTiers = new Map<string, string>();
@@ -141,12 +149,27 @@ export class CodexAgent implements Agent {
   }
 
   send(prompt: string, emit: EmitFn, _shared?: boolean, images: ImageInput[] = []): Promise<string> {
+    this.stopAsked = false; // um pedido de parar de antes desta mensagem não vale para ela
     return this.enqueue(() => this.runTurn(prompt, emit, images));
   }
 
   warmUp(): void {
     // falha aqui aparece na primeira mensagem, que tenta de novo
     this.connect().catch(() => undefined);
+  }
+
+  async interrupt(): Promise<void> {
+    for (const call of this.peerCalls) call.abort(); // o turno fecha sem esperar a resposta do Claude
+    const waiting = this.waiting;
+    const conn = this.conn;
+    if (!waiting || !conn) {
+      this.stopAsked = true; // ainda subindo ou abrindo a conversa: o turno nem começa
+      return;
+    }
+    waiting.stopped = true; // a chamada ao Claude que ainda espera o id do turno também não sai
+    await waiting.known;
+    if (this.waiting !== waiting || !waiting.turnId) return; // já acabou
+    await conn.request('turn/interrupt', { threadId: waiting.threadId, turnId: waiting.turnId });
   }
 
   async setModel(choice: ModelChoice): Promise<void> {
@@ -348,16 +371,27 @@ export class CodexAgent implements Agent {
     if (!ours || (waiting.turnId && p.turnId !== waiting.turnId)) {
       return reply('o duo não espera mais este turno do Codex (estourou o prazo); a mensagem não foi levada ao Claude', false);
     }
+    if (waiting.stopped) return reply('o usuário parou o Codex antes de a mensagem ir para o Claude', false);
     const ctrl = new AbortController();
     const abort = () => ctrl.abort(); // o processo caiu: ninguém mais espera a resposta
     conn.onClose(abort);
+    this.peerCalls.add(ctrl);
+    // parado por você: devolve já, sem esperar o Claude (a resposta dele vai para o contexto do Codex depois)
+    const stopped = new Promise<never>((_, reject) =>
+      ctrl.signal.addEventListener('abort', () => reject(new Error('o usuário parou o Codex antes de o Claude responder')), {
+        once: true,
+      }),
+    );
+    const asked = this.askPeer({ text, signal: ctrl.signal });
+    asked.catch(() => undefined);
     try {
-      const answer = await this.askPeer({ text, signal: ctrl.signal });
+      const answer = await Promise.race([asked, stopped]);
       return reply(`O Claude respondeu:\n\n${answer.trim() || '(sem texto)'}`, true);
     } catch (e) {
       return reply(e instanceof Error ? e.message : String(e), false);
     } finally {
       conn.offClose(abort);
+      this.peerCalls.delete(ctrl);
     }
   }
 
@@ -434,6 +468,7 @@ export class CodexAgent implements Agent {
   private async runTurn(prompt: string, emit: EmitFn, images: ImageInput[] = []): Promise<string> {
     const conn = await this.connect();
     const threadId = await this.openThread(conn);
+    if (this.stopAsked) throw new Error('o turno do Codex foi interrompido antes de começar');
     conn.onServerRequest = (method) =>
       emit({ kind: 'error', text: `o Codex pediu "${method}"; o duo não responde a pedidos, então foi recusado` });
 
@@ -448,6 +483,10 @@ export class CodexAgent implements Agent {
       const waiting: Waiting = { threadId, known: new Promise<void>((r) => (known = r)) };
       this.waiting = waiting;
       const finish = (settle: () => void) => {
+        if (this.tools.size > 0) {
+          this.tools.clear();
+          this.onTools?.([]);
+        }
         conn.off(listener);
         conn.offClose(onClose);
         conn.onServerRequest = undefined;
@@ -464,13 +503,20 @@ export class CodexAgent implements Agent {
         }
         if (tid !== undefined && turnId !== undefined && tid !== turnId) return;
         switch (method) {
-          case 'item/started':
+          case 'item/started': {
             if (p.item?.type === 'commandExecution') {
               emit({ kind: 'tool', text: `$ ${shortenCommand(p.item.command ?? '')}` });
             }
+            const text = toolText(p.item);
+            if (text && typeof p.item.id === 'string') {
+              this.tools.set(p.item.id, { id: p.item.id, text, startedAt: Date.now() });
+              this.onTools?.([...this.tools.values()]);
+            }
             break;
+          }
           case 'item/completed':
             handleItem(p.item, texts, emit);
+            if (this.tools.delete(p.item?.id)) this.onTools?.([...this.tools.values()]);
             break;
           case 'warning':
             // Aviso de recurso experimental ligado no config.toml: só ruído.
@@ -524,6 +570,8 @@ interface Waiting {
   threadId: string;
   turnId?: string;
   known: Promise<void>;
+  /** você mandou parar: chamada ao Claude que chegar agora não sai */
+  stopped?: boolean;
 }
 
 /** Um processo `codex app-server` e o JSON-RPC por linhas com ele. */
@@ -681,6 +729,26 @@ function handleItem(item: any, texts: string[], emit: EmitFn): void {
       }
       break;
   }
+}
+
+/** O que o quadro mostra de uma ferramenta que começou no turno; undefined = não é ferramenta (texto, raciocínio...). */
+function toolText(item: any): string | undefined {
+  switch (item?.type) {
+    case 'commandExecution':
+      return `$ ${shortenCommand(item.command ?? '')}`;
+    case 'mcpToolCall':
+      return truncate(`mcp ${item.server ?? ''} ${item.tool ?? ''}`);
+    case 'webSearch':
+      return truncate(item.query ? `busca na web: ${item.query}` : 'busca na web');
+    case 'fileChange':
+      return 'editando arquivos';
+    case 'collabAgentToolCall':
+      return 'chamando um subagente';
+    case 'dynamicToolCall':
+      // a do duo não entra: o quadro diz que ele espera o Claude
+      return item.tool === PEER_TOOL.name ? undefined : truncate(String(item.tool ?? 'ferramenta'));
+  }
+  return undefined;
 }
 
 /** Tira o invólucro "powershell.exe -Command '...'" que o Codex põe no Windows. */

@@ -19,6 +19,8 @@
 // ATRASA <texto> → a resposta do turn/start atrasa 600ms; aos 300ms o turno chama a ferramenta do cliente com <texto>.
 // RESPOSTAS → responde com o que o cliente devolveu às chamadas da ferramenta feitas pelo ATRASA.
 // --thread-delay <ms> → demora para responder o thread/start e o thread/resume.
+// LONGO <comando> → um commandExecution que demora 2s. turn/interrupt no meio dele (ou do CHAMA esperando a resposta
+// da ferramenta) fecha o turno como interrompido, na hora. RESPOSTAS também traz o que o cliente devolveu ao CHAMA.
 // model/list → três modelos em duas páginas (nextCursor), um deles escondido, como o 0.166.0: esforços, o padrão e
 // os serviceTiers (o "priority", de nome "Fast"). config/read → o que o config.toml diz (esforço high, tier
 // priority, sem modelo). O thread/start responde com model, reasoningEffort e serviceTier. TURNO → responde com o
@@ -115,6 +117,18 @@ rl.on('line', (line) => {
 
 const note = (method, params) => out({ method, params: { threadId: thread, ...params } });
 
+/** Espera `p`, ou o turn/interrupt deste turno: aí o turno fecha como interrompido e devolve null. */
+function stoppable(turnId, p) {
+  return new Promise((resolve) => {
+    cancel.set(turnId, () => {
+      cancel.delete(turnId);
+      note('turn/completed', { turn: { id: turnId, status: 'interrupted' } });
+      resolve(null);
+    });
+    p.then((v) => cancel.delete(turnId) && resolve(v));
+  });
+}
+
 /** A resposta do turn/start atrasa; o turno só responde se ninguém o interromper antes. */
 function slowTurn(reqId, turnId) {
   let stopped = false;
@@ -132,8 +146,15 @@ function slowTurn(reqId, turnId) {
   }, 400);
 }
 
-/** A resposta do turn/start atrasa; antes dela (e depois do prazo do cliente), o turno chama a ferramenta do cliente. */
+/**
+ * A resposta do turn/start atrasa; antes dela (e depois do prazo do cliente), o turno chama a ferramenta do cliente.
+ * turn/interrupt fecha o turno como interrompido.
+ */
 function lateCall(reqId, turnId, mensagem) {
+  cancel.set(turnId, () => {
+    cancel.delete(turnId);
+    note('turn/completed', { turn: { id: turnId, status: 'interrupted' } });
+  });
   setTimeout(async () => {
     const callId = next++;
     const res = await new Promise((resolve) => {
@@ -169,14 +190,26 @@ async function runTurn(turnId, text, skill) {
     } else {
       const reqId = next++;
       const args = { mensagem: text.slice(6) };
-      const res = await new Promise((resolve) => {
-        waiting.set(reqId, resolve);
+      const replied = new Promise((resolve) => {
+        waiting.set(reqId, (res) => {
+          toolReplies.push(res.result ?? res.error);
+          resolve(res);
+        });
         const params = { threadId: thread, turnId, callId: 'call-1', namespace: null, tool: tool.name, arguments: args };
         out({ id: reqId, method: 'item/tool/call', params });
       });
+      const res = await stoppable(turnId, replied);
+      if (res === null) return;
       const r = res.result;
       answer = `eco: [${tool.name}${r.success ? '' : ' erro'}] ${r.contentItems[0].text}`;
     }
+  }
+  if (text.startsWith('LONGO ')) {
+    const command = text.slice(6);
+    item('item/started', { id: 'longo', type: 'commandExecution', command });
+    if ((await stoppable(turnId, new Promise((r) => setTimeout(() => r(true), 2000)))) === null) return;
+    item('item/completed', { id: 'longo', type: 'commandExecution', command, exitCode: 0 });
+    answer = `eco: rodei ${command}`;
   }
   if (text === 'CMD') {
     const command = `"C:\\WINDOWS\\powershell.exe" -Command 'echo oi'`;

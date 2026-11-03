@@ -154,6 +154,9 @@ const statusOf = (s: DuoState): Status => ({
   tasks: s.tasks,
   runningSince: s.runningSince,
   lastSignal: s.lastSignal,
+  tools: s.tools,
+  peerWait: s.peerWait,
+  stopping: s.stopping,
 });
 
 /** O pedido do seletor: de quem, e ao menos uma coisa a trocar. Se o agente oferece aquilo, o duo confere. */
@@ -336,6 +339,9 @@ export async function startGui(duo: Duo, opts: GuiOptions = {}): Promise<Gui> {
         if (!ok) drop();
       } else if (url.pathname === '/api/answer' && Number.isInteger(body?.id) && typeof body?.ok === 'boolean') {
         ok = duo.answer(body.id, body.ok);
+      } else if (url.pathname === '/api/parar' && (body?.agent === 'claude' || body?.agent === 'codex')) {
+        void duo.interrupt(body.agent);
+        ok = true;
       } else if (url.pathname === '/api/modelo' && isModelBody(body)) {
         const { agent, model, effort, fast } = body;
         void duo.setModel(agent, { model, effort, fast });

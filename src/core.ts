@@ -9,6 +9,7 @@ import {
   type AgentModel,
   type AgentStats,
   type AgentTask,
+  type AgentTool,
   type EmitFn,
   type ImageInput,
   type ModelChoice,
@@ -63,6 +64,12 @@ export interface DuoState {
   runningSince: Record<AgentId, number | null>;
   /** quando chegou a última coisa do processo de cada um, em ms (null = nada ainda): sem sinal há muito = travado? */
   lastSignal: Record<AgentId, number | null>;
+  /** as ferramentas que cada um está usando agora no turno (um comando, uma edição, uma busca) */
+  tools: Record<AgentId, AgentTool[]>;
+  /** desde quando cada um espera a resposta do outro pela ferramenta do duo, em ms (null = não espera) */
+  peerWait: Record<AgentId, number | null>;
+  /** você mandou parar e o turno dele ainda não fechou */
+  stopping: Record<AgentId, boolean>;
 }
 
 /**
@@ -126,6 +133,12 @@ export class Duo {
   private readonly modelQueues = { claude: createQueue(), codex: createQueue() };
   /** Chamadas em andamento de cada um ao outro, pela ferramenta do duo. */
   private readonly calling: Record<AgentId, number> = { claude: 0, codex: 0 };
+  /** Muda a cada vez que você para um deles: o turno dele que estava rodando ou na fila não segue. */
+  private readonly cut: Record<AgentId, number> = { claude: 0, codex: 0 };
+  /** Quem espera uma resposta dele pela ferramenta do duo: parar ele avisa cada um na hora. */
+  private readonly onCut: Record<AgentId, Set<() => void>> = { claude: new Set(), codex: new Set() };
+  /** O que rodava quando você mandou parar: o "parando" dura até isso acabar, mesmo que outra coisa já tenha começado. */
+  private readonly stopParts: Record<AgentId, Set<'duo' | 'own'>> = { claude: new Set(), codex: new Set() };
   /** O brain em andamento (só um por vez). `stop` = /parar: encerra depois da resposta em andamento. */
   private brain: { stop: boolean } | null = null;
   /** quem responde cada pedido de permissão da fila */
@@ -155,6 +168,9 @@ export class Duo {
       tasks: { claude: [], codex: [] },
       runningSince: { claude: null, codex: null },
       lastSignal: { claude: null, codex: null },
+      tools: { claude: [], codex: [] },
+      peerWait: { claude: null, codex: null },
+      stopping: { claude: false, codex: false },
     };
   }
 
@@ -196,10 +212,28 @@ export class Duo {
     this.update({ busy: { ...this.state.busy, [id]: this.state.busy[id] + delta } });
   }
 
-  /** O turno dele (o da fila, ou um que ele abriu sozinho) começou ou acabou. Começar conta como sinal. */
+  /**
+   * Espera `work`, ou você parar o `id`: aí devolve null no clique, sem esperar o turno dele fechar (o CLI pode
+   * levar segundos). É como quem espera a resposta dele (quem o chamou, o brain) fica sabendo já.
+   */
+  private untilCut<T>(id: AgentId, work: Promise<T>): Promise<T | null> {
+    let stopNow!: () => void;
+    const stopped = new Promise<null>((resolve) => (stopNow = () => resolve(null)));
+    this.onCut[id].add(stopNow);
+    return Promise.race([work, stopped]).finally(() => this.onCut[id].delete(stopNow));
+  }
+
+  /**
+   * O turno dele (o da fila, ou um que ele abriu sozinho) começou ou acabou. Começar conta como sinal. O "parando"
+   * acaba quando acaba o que rodava no clique, ou quando ele para de rodar de vez.
+   */
   private setRunning(id: AgentId, part: 'duo' | 'own', value: boolean): void {
     this.running[id][part] = value;
     const on = this.running[id].duo || this.running[id].own;
+    const stops = this.stopParts[id];
+    if (!on) stops.clear();
+    else if (!value) stops.delete(part);
+    if (stops.size === 0 && this.state.stopping[id]) this.update({ stopping: { ...this.state.stopping, [id]: false } });
     if (on === (this.state.runningSince[id] !== null)) return;
     const now = Date.now();
     this.update({
@@ -245,6 +279,7 @@ export class Duo {
       agent.onCommands = (list) => this.update({ commands: { ...this.state.commands, [agent.id]: list } });
       agent.onModels = (list) => this.update({ models: { ...this.state.models, [agent.id]: list } });
       agent.onTasks = (list) => this.update({ tasks: { ...this.state.tasks, [agent.id]: list } });
+      agent.onTools = (list) => this.update({ tools: { ...this.state.tools, [agent.id]: list } });
       agent.onSignal = () => this.signal(agent.id);
       // turno que ele abriu sozinho (terminou um subagente em segundo plano): aparece e entra na janela como os outros
       agent.onOwnTurnEvent = (ev) => {
@@ -317,6 +352,12 @@ export class Duo {
     for (const agent of Object.values(agents)) {
       const to = otherOf(agent.id);
       agent.askPeer = async ({ text, signal }) => {
+        // Chamada fora de um turno do duo vem de um turno que ele abriu sozinho (o Claude, quando uma tarefa em segundo
+        // plano termina) e que pode começar por ela: conta como rodando, para o quadro mostrar a espera e o Parar alcançá-lo.
+        if (!this.running[agent.id].duo && !this.running[agent.id].own) {
+          this.own[agent.id] ??= { shared: rec.data.shared };
+          this.setRunning(agent.id, 'own', true);
+        }
         // Se o outro está esperando este, a chamada ficaria na fila atrás do turno que espera: os dois travariam.
         if (this.calling[to] > 0) {
           throw new Error(
@@ -325,6 +366,15 @@ export class Duo {
           );
         }
         this.calling[agent.id]++;
+        if (this.calling[agent.id] === 1) this.update({ peerWait: { ...this.state.peerWait, [agent.id]: Date.now() } });
+        // parado por você (ou o processo dele caiu): deixa de esperar já, sem esperar o outro terminar a resposta
+        let released = false;
+        const release = () => {
+          if (released) return;
+          released = true;
+          if (--this.calling[agent.id] === 0) this.update({ peerWait: { ...this.state.peerWait, [agent.id]: null } });
+        };
+        signal.addEventListener('abort', release, { once: true });
         try {
           const sharedNow = rec.data.shared;
           this.add(agent.id, 'text', `[para o ${agents[to].name}] ${text}`);
@@ -336,13 +386,22 @@ export class Duo {
             `e o usuário acompanha na janela. Termine dizendo claramente se concorda sem ressalvas ou o que ainda ` +
             `falta: é assim que ele sabe se chama você de novo. Não o chame de volta agora (ele está esperando você); ` +
             `se precisar perguntar algo, pergunte na resposta.\n\n${text}`;
-          const answer = await this.runTurn(to, turnId, prompt, sharedNow, { msgIndex, call: { from: agent.id, signal } });
+          const cutAt = this.cut[to];
+          const answer = await this.untilCut(
+            to,
+            this.runTurn(to, turnId, prompt, sharedNow, { msgIndex, call: { from: agent.id, signal } }),
+          );
           if (answer === null) {
-            throw new Error(`o ${agents[to].name} não conseguiu responder; o erro aparece na janela do duo`);
+            throw new Error(
+              this.cut[to] !== cutAt
+                ? `o usuário parou o ${agents[to].name} antes de ele responder`
+                : `o ${agents[to].name} não conseguiu responder; o erro aparece na janela do duo`,
+            );
           }
           return answer;
         } finally {
-          this.calling[agent.id]--;
+          signal.removeEventListener('abort', release);
+          release();
         }
       };
     }
@@ -373,10 +432,12 @@ export class Duo {
     const myLog = this.log;
     const epoch = this.session;
     const stale = () => this.session !== epoch; // houve /novo: o turno era da conversa anterior
+    const cutAt = this.cut[id];
+    const cut = () => this.cut[id] !== cutAt; // você parou ele: o turno (rodando ou na fila) não segue
     this.setBusy(id, +1);
     return this.queues[id](async (): Promise<string | null> => {
       for (let attempt = 0; ; attempt++) {
-        if (stale()) return null;
+        if (stale() || cut()) return null;
         const prepared = myLog.prepare(id, text, sharedTurn, msgIndex, call?.from);
         setTurn(data, turnId, 'running');
         rec.saveNow();
@@ -388,12 +449,19 @@ export class Duo {
           const answer = await agents[id].send(prepared.prompt, emit, sharedTurn, images);
           if (stale()) return null;
           myLog.delivered(id, prepared);
-          // quem chamou só recebeu a resposta se ainda esperava; senão ela vai no contexto dele
-          myLog.agentReply(id, answer, sharedTurn, call && !call.signal.aborted ? call.from : undefined);
+          // Quem chamou só recebeu a resposta se ainda esperava; senão ela vai no contexto dele. Se você parou ele e a
+          // resposta chegou antes de o CLI parar, ela fica na conversa, mas quem esperava (quem chamou, o brain) já
+          // soube que você parou: para eles, o turno não respondeu.
+          const waited = call !== undefined && !call.signal.aborted && !cut();
+          myLog.agentReply(id, answer, sharedTurn, waited ? call.from : undefined, call?.from);
           setTurn(data, turnId, 'done');
-          return answer;
+          return cut() ? null : answer;
         } catch (e) {
           if (stale()) return null; // o /novo derrubou o processo: o erro não é desta conversa
+          if (cut()) {
+            setTurn(data, turnId, 'cancelled'); // a conversa já diz que você parou
+            return null;
+          }
           const err = e instanceof Error ? e : new Error(String(e));
           if (err instanceof ResumeFailedError && attempt === 0) {
             // Nada foi executado: abre conversa nova e manda de novo, com a janela inteira de contexto.
@@ -444,13 +512,17 @@ export class Duo {
       for (let n = 1; n <= BRAIN_MAX; n++) {
         const turnId = newTurn(data, who, n === 1 ? question : `[brain] avaliar a resposta do ${name(otherOf(who))}`);
         this.rec.saveNow();
-        const answer =
+        const cutAt = this.cut[who];
+        const answer = await this.untilCut(
+          who,
           n === 1
-            ? await this.runTurn(who, turnId, brainOpening(who, question), true, { msgIndex })
-            : await this.runTurn(who, turnId, brainReview(who), true);
+            ? this.runTurn(who, turnId, brainOpening(who, question), true, { msgIndex })
+            : this.runTurn(who, turnId, brainReview(who), true),
+        );
         if (this.session !== epoch) return; // /novo: o brain era da conversa anterior
         if (answer === null) {
-          this.add('sistema', 'error', `🧠 brain parou: a resposta do ${name(who)} falhou.`);
+          if (this.cut[who] !== cutAt) this.add('sistema', 'text', `🧠 brain parou: você parou o ${name(who)}.`);
+          else this.add('sistema', 'error', `🧠 brain parou: a resposta do ${name(who)} falhou.`);
           return;
         }
         if (n > 1 && brainVerdict(answer) === 'concordo') {
@@ -513,7 +585,13 @@ export class Duo {
         this.brain = null;
         // um turno que ele tinha aberto sozinho não termina mais (o processo cai no reset): não fica "rodando"
         for (const r of Object.values(this.running)) r.duo = r.own = false;
-        this.update({ brain: false, runningSince: { claude: null, codex: null } });
+        for (const s of Object.values(this.stopParts)) s.clear();
+        this.update({
+          brain: false,
+          runningSince: { claude: null, codex: null },
+          tools: { claude: [], codex: [] },
+          stopping: { claude: false, codex: false },
+        });
         this.own = { claude: undefined, codex: undefined };
         this.fromApp = { claude: undefined, codex: undefined };
         Object.values(agents).forEach((a) => a.reset());
@@ -623,6 +701,43 @@ export class Duo {
       return fail(e instanceof Error ? e.message : String(e));
     }
     this.add('sistema', 'text', `modelo do ${agent.name} agora: ${modelLabel(agent.models, agent.stats)}`);
+  }
+
+  /**
+   * O botão Parar da janela: para só ele. O turno em andamento (do duo, ou um que ele abriu sozinho) termina sem
+   * resposta, e as mensagens na fila dele saem. O outro segue, e a conversa fica: a próxima mensagem continua nela.
+   */
+  async interrupt(id: AgentId): Promise<void> {
+    const agent = this.agents[id];
+    if (this.state.stopping[id]) return; // já pediu: espera o turno fechar
+    const running = this.state.runningSince[id] !== null;
+    const queued = this.state.busy[id] - (this.running[id].duo ? 1 : 0);
+    if (!running && queued === 0) {
+      this.add('sistema', 'error', `o ${agent.name} não está rodando nada.`);
+      return;
+    }
+    const epoch = this.session;
+    const mine = ++this.cut[id];
+    for (const t of this.rec.data.turns) if (t.agent === id && t.status === 'pending') t.status = 'cancelled';
+    this.rec.saveNow();
+    const what = [
+      running ? 'o que ele estava fazendo' : '',
+      queued === 1 ? 'a mensagem na fila dele' : queued > 1 ? `as ${queued} mensagens na fila dele` : '',
+    ];
+    this.add('sistema', 'text', `você parou o ${agent.name}: ${what.filter(Boolean).join(' e ')}. A conversa continua.`);
+    for (const stop of [...this.onCut[id]]) stop(); // quem esperava a resposta dele fica sabendo já
+    if (!running) return;
+    for (const part of ['duo', 'own'] as const) if (this.running[id][part]) this.stopParts[id].add(part);
+    this.update({ stopping: { ...this.state.stopping, [id]: true } });
+    try {
+      await agent.interrupt();
+    } catch (e) {
+      // o /novo derrubou o processo, ou você já parou ele de novo: o erro não é deste parar
+      if (this.session !== epoch || this.cut[id] !== mine) return;
+      this.stopParts[id].clear();
+      this.update({ stopping: { ...this.state.stopping, [id]: false } });
+      this.add('sistema', 'error', `não consegui parar o ${agent.name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   /** Responde a um pedido da fila. false = ele já não espera (respondido em outra tela, ou cancelado). */

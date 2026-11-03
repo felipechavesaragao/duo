@@ -478,6 +478,104 @@ describe('ClaudeAgent', () => {
     await vi.waitFor(() => expect(signal!.aborted).toBe(true));
     expect(await turn).toBeInstanceOf(Error);
   });
+
+  it('quadro: o comando rodando aparece com o que é, e sai quando termina', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const seen: string[][] = [];
+    agent.onTools = (list) => seen.push(list.map((t) => t.text));
+    expect(await agent.send('CURTO npm test', noop)).toBe('eco: rodei npm test');
+    expect(seen).toEqual([['Bash npm test'], []]);
+  });
+
+  it('parar no meio de um comando: o turno fecha sem erro na tela, o quadro esvazia, e a conversa segue', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const seen: string[][] = [];
+    agent.onTools = (list) => seen.push(list.map((t) => t.text));
+    const errors: string[] = [];
+    const turn = agent.send('LONGO npm test', (ev) => ev.kind === 'error' && errors.push(ev.text)).catch((e: Error) => e);
+    await vi.waitFor(() => expect(seen.at(-1)).toEqual(['Bash npm test']));
+    await agent.interrupt();
+    expect(((await turn) as Error).message).toBe('você parou o Claude');
+    expect(seen.at(-1)).toEqual([]);
+    expect(errors).toEqual([]);
+    expect(await agent.send('oi', noop)).toBe('eco: oi');
+  });
+
+  it('parar esperando o Codex: solta quem esperava a resposta dele e fecha o turno na hora', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    let signal: AbortSignal | undefined;
+    agent.askPeer = (req) => ((signal = req.signal), new Promise<string>(() => undefined));
+    const turn = agent.send('CHAMA oi', noop).catch((e: Error) => e);
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    await agent.interrupt();
+    expect(signal!.aborted).toBe(true);
+    expect(((await turn) as Error).message).toBe('você parou o Claude');
+    expect(await agent.send('oi', noop)).toBe('eco: oi');
+  });
+
+  it('parar com a pergunta de permissão aberta: a pergunta sai, e o turno fecha', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    let signal: AbortSignal | undefined;
+    agent.askPermission = (req) => ((signal = req.signal), new Promise<boolean>(() => undefined));
+    const turn = agent.send('PEDE git push', noop).catch((e: Error) => e);
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    await agent.interrupt();
+    expect(signal!.aborted).toBe(true);
+    expect(((await turn) as Error).message).toBe('você parou o Claude');
+  });
+
+  it('parar o turno que ele abriu sozinho: termina sem erro na tela', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const own: string[] = [];
+    agent.onOwnTurnEvent = (ev) => own.push(`${ev.kind}: ${ev.text}`);
+    const ended = new Promise<string>((resolve) => (agent.onOwnTurnReply = (text) => resolve(text)));
+    expect(await agent.send('SOZINHO oi', noop)).toBe('eco: lancei');
+    await vi.waitFor(() => expect(own).toEqual(['text: sozinho: oi']));
+    await agent.interrupt();
+    await ended;
+    expect(own).toEqual(['text: sozinho: oi']);
+    expect(await agent.send('oi', noop)).toBe('eco: oi');
+  });
+
+  it('parar com uma chamada ao Codex e um pedido de permissão a caminho: os dois voltam recusados', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const went: string[] = [];
+    agent.askPeer = async ({ text }) => (went.push(`codex: ${text}`), 'NAO-DEVIA');
+    agent.askPermission = async ({ text }) => (went.push(`permissão: ${text}`), true);
+    const said: string[] = [];
+    const turn = agent.send('TARDE', (ev) => said.push(ev.text)).catch((e: Error) => e);
+    await vi.waitFor(() => expect(said).toContain('esperando'));
+    await agent.interrupt();
+    expect(((await turn) as Error).message).toBe('você parou o Claude');
+    expect(went).toEqual([]);
+    const late = JSON.parse((await agent.send('TARDIAS', noop)).slice('eco: '.length));
+    expect(late.called).toEqual({
+      content: [{ type: 'text', text: 'o usuário parou o Claude antes de a mensagem ir para o Codex' }],
+      isError: true,
+    });
+    expect(late.asked).toEqual({ behavior: 'deny', message: 'O usuário parou o Claude pela janela do duo.' });
+  });
+
+  it('mensagem nova enquanto o turno que ele abriu sozinho ainda para: ele fecha sem erro, e a nova responde', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const own: string[] = [];
+    agent.onOwnTurnEvent = (ev) => own.push(`${ev.kind}: ${ev.text}`);
+    const ended = new Promise<string>((resolve) => (agent.onOwnTurnReply = (text) => resolve(text)));
+    expect(await agent.send('SOZINHO DEVAGAR oi', noop)).toBe('eco: lancei');
+    await vi.waitFor(() => expect(own).toEqual(['text: sozinho: DEVAGAR oi']));
+    await agent.interrupt();
+    const next = agent.send('de novo', noop); // chega antes de o turno parado fechar
+    await ended;
+    expect(await next).toBe('eco: de novo');
+    expect(own).toEqual(['text: sozinho: DEVAGAR oi']);
+  });
+
+  it('parar sem nada rodando: o pedido vai e nada muda', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    expect(await agent.send('oi', noop)).toBe('eco: oi');
+    await agent.interrupt();
+    expect(await agent.send('de novo', noop)).toBe('eco: de novo');
+  });
 });
 
 describe('CodexAgent (app-server)', () => {
@@ -742,5 +840,62 @@ describe('CodexAgent (app-server)', () => {
     expect(agent.resumeId).toBeUndefined();
     await agent.send('oi', noop);
     expect(agent.resumeId).toBe('thread-nova');
+  });
+
+  it('quadro: o comando rodando aparece com o que é, e sai quando termina', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    const seen: string[][] = [];
+    agent.onTools = (list) => seen.push(list.map((t) => t.text));
+    expect(await agent.send('CMD', noop)).toBe('eco: CMD');
+    expect(seen).toEqual([['$ echo oi'], []]);
+  });
+
+  it('parar no meio de um comando: o turno é interrompido, o quadro esvazia, e a conversa segue', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    const seen: string[][] = [];
+    agent.onTools = (list) => seen.push(list.map((t) => t.text));
+    const turn = agent.send('LONGO npm test', noop).catch((e: Error) => e);
+    await vi.waitFor(() => expect(seen.at(-1)).toEqual(['$ npm test']));
+    await agent.interrupt();
+    expect(((await turn) as Error).message).toBe('o turno do Codex foi interrompido');
+    expect(seen.at(-1)).toEqual([]);
+    expect(await agent.send('oi', noop)).toBe('eco: oi');
+  });
+
+  it('parar esperando o Claude: a ferramenta volta na hora dizendo que você parou, e o turno fecha', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    let signal: AbortSignal | undefined;
+    agent.askPeer = (req) => ((signal = req.signal), new Promise<string>(() => undefined));
+    const turn = agent.send('CHAMA oi', noop).catch((e: Error) => e);
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    await agent.interrupt();
+    expect(signal!.aborted).toBe(true);
+    expect(((await turn) as Error).message).toBe('o turno do Codex foi interrompido');
+    const [res] = JSON.parse(await agent.send('RESPOSTAS', noop));
+    expect(res.success).toBe(false);
+    expect(res.contentItems[0].text).toBe('o usuário parou o Codex antes de o Claude responder');
+  });
+
+  it('parar antes de a chamada ao Claude chegar: ela volta dizendo que você parou, sem ir ao Claude', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    const asked: string[] = [];
+    agent.askPeer = async ({ text }) => (asked.push(text), 'NAO-DEVIA');
+    const turn = agent.send('ATRASA oi claude', noop).catch((e: Error) => e);
+    // o turn/start saiu; a chamada chega aos 300ms dele, e a resposta (com o id do turno) aos 600ms
+    await vi.waitFor(() => expect((agent as any).waiting).toBeDefined());
+    await agent.interrupt();
+    expect(((await turn) as Error).message).toBe('o turno do Codex foi interrompido');
+    expect(asked).toEqual([]);
+    const [res] = JSON.parse(await agent.send('RESPOSTAS', noop));
+    expect(res.success).toBe(false);
+    expect(res.contentItems[0].text).toBe('o usuário parou o Codex antes de a mensagem ir para o Claude');
+  });
+
+  it('parar enquanto a conversa ainda abre: o turno nem começa, e a mensagem seguinte vai', async () => {
+    const agent = track(new CodexAgent({ bin: [...fakeCodex, '--thread-delay', '300'] }));
+    const turn = agent.send('oi', noop).catch((e: Error) => e);
+    await agent.interrupt();
+    expect(((await turn) as Error).message).toBe('o turno do Codex foi interrompido antes de começar');
+    expect(await agent.send('de novo', noop)).toBe('eco: de novo');
   });
 });

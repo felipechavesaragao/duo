@@ -969,18 +969,41 @@ textarea::placeholder {
 
 .running-head {
   display: flex;
+  flex-wrap: wrap; /* o tempo longo não cabe ao lado do nome e do botão de parar: desce inteiro, à direita */
   align-items: center;
-  gap: 8px;
+  gap: 2px 8px;
   font-size: 14px;
 }
 
-.running-head .muted {
+.running-status {
+  margin-left: auto;
   font-size: 13px;
+  white-space: nowrap;
 }
 
 .running-name {
   font-weight: 600;
   color: var(--c);
+}
+
+.stop-agent {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.stop-agent svg {
+  width: 14px;
+  height: 14px;
+}
+
+.stop-agent:not(:disabled):hover {
+  background: var(--hover);
 }
 
 .running-line {

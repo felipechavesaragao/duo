@@ -12,7 +12,18 @@ export interface Snapshot extends DuoState {
 /** O estado que muda sem linha nova na tela. As listas de comandos e de modelos vão à parte (são grandes e quase não mudam). */
 export type Status = Pick<
   DuoState,
-  'target' | 'shared' | 'busy' | 'asks' | 'stats' | 'brain' | 'tasks' | 'runningSince' | 'lastSignal'
+  | 'target'
+  | 'shared'
+  | 'busy'
+  | 'asks'
+  | 'stats'
+  | 'brain'
+  | 'tasks'
+  | 'runningSince'
+  | 'lastSignal'
+  | 'tools'
+  | 'peerWait'
+  | 'stopping'
 >;
 
 /** Eventos do servidor (SSE em /events): o nome do evento e o que vai no `data`, em JSON. */
@@ -41,6 +52,11 @@ export interface SubmitBody {
 
 /** POST /api/modelo: o seletor da janela. O resultado aparece na conversa. */
 export interface ModelBody extends ModelChoice {
+  agent: AgentId;
+}
+
+/** POST /api/parar: o botão Parar de um agente no painel. O resultado aparece na conversa. */
+export interface StopBody {
   agent: AgentId;
 }
 

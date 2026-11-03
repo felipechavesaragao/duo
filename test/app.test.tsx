@@ -72,6 +72,7 @@ class FakeAgent implements Agent {
   warmUp() {
     this.warmed++;
   }
+  async interrupt() {}
   dispose() {}
 }
 

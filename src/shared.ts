@@ -136,13 +136,15 @@ export class SharedLog {
 
   /**
    * `shared` = o modo em que a mensagem que gerou esta resposta foi enviada. `replyTo` = o agente que chamou
-   * e já recebeu a resposta direto (ferramenta do duo): ela não volta no contexto dele.
+   * e já recebeu a resposta direto (ferramenta do duo): ela não volta no contexto dele. `caller` = o agente que
+   * chamou e deixou de esperar (você o parou, ou ele caiu): a resposta vai no contexto dele, mesmo no modo privado.
    */
-  agentReply(id: AgentId, text: string, shared: boolean, replyTo?: AgentId): void {
+  agentReply(id: AgentId, text: string, shared: boolean, replyTo?: AgentId, caller?: AgentId): void {
     if (!text.trim()) return;
     // Não precisa avançar seen[id]: prepare() já ignora o que veio do próprio agente.
     const to = replyTo ? [replyTo] : undefined;
-    this.state.items.push({ from: id, to, text, onlyFor: shared ? undefined : [id, ...(to ?? [])] });
+    const between = [id, ...(to ?? []), ...(caller && caller !== replyTo ? [caller] : [])];
+    this.state.items.push({ from: id, to, text, onlyFor: shared ? undefined : between });
   }
 
   /** O agente perdeu a memória (conversa nova): a próxima mensagem leva a janela inteira. */

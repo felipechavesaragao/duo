@@ -14,6 +14,7 @@ import {
   type AgentModel,
   type AgentStats,
   type AgentTask,
+  type AgentTool,
   type EmitFn,
   type ImageInput,
   type ModelChoice,
@@ -34,6 +35,9 @@ const PEER_TOOL = {
     required: ['mensagem'],
   },
 };
+
+/** O motivo de abortar o que ele espera quando você o para (e não porque o CLI desistiu, ou caiu). */
+const STOPPED = 'parado pelo duo';
 
 const PEER_HINT =
   '[duo] Você está no duo, numa janela compartilhada com o usuário e com o Codex (o Fog). Para falar com o Codex ' +
@@ -85,6 +89,12 @@ interface Running {
   initRequest: string;
   /** pedidos de controle do duo esperando a resposta do CLI (o seletor de modelo), por request_id */
   controls: Map<string, { resolve: (response: any) => void; reject: (err: Error) => void }>;
+  /** as ferramentas rodando no turno (o da conversa principal), por tool_use_id: o quadro da janela */
+  tools: Map<string, AgentTool>;
+  /** o que ele espera de você ou do Codex (permissão, a ferramenta do duo): parar o solta */
+  waits: Set<AbortController>;
+  /** o duo pediu para parar: o result de erro que vem é o da interrupção, não uma falha */
+  interrupting: boolean;
 }
 
 interface Turn {
@@ -140,6 +150,12 @@ interface Turn {
  * saída vem como resposta. Os `terminal_slash_commands` do `system/init` (doctor, color, focus...) também
  * rodam no `-p` (o /doctor vira um prompt) ou respondem que não estão disponíveis: ficam na lista.
  *
+ * Parar (medido em 03/11/2026, 2.1.316): o `control_request` interrupt responde na hora ({still_queued: []}, mesmo
+ * sem turno). Com um comando rodando, ~9s depois chegam o tool_result de erro, o texto "[Request interrupted by user
+ * for tool use]" e um `result` error_during_execution; a conversa segue, e o turno seguinte sabe que foi parado.
+ * Com a ferramenta do duo esperando o Codex, o turno fecha na hora, sem esperar a resposta dela e sem avisar o
+ * duo (nenhum control_cancel_request): quem a respondia tem de ser solto pelo próprio duo.
+ *
  * Modelo e esforço (medido em 03/11/2026, 2.1.316): o initialize traz `models` [{value, resolvedModel,
  * displayName, description, supportedEffortLevels, supportsFastMode}]; o `control_request` set_model {model} troca
  * o modelo e responde com o id resolvido, o apply_flag_settings {settings: {effortLevel}} troca o esforço (valor
@@ -165,6 +181,7 @@ export class ClaudeAgent implements Agent {
   onCommands?: (commands: AgentCommand[]) => void;
   onModels?: (models: AgentModel[]) => void;
   onTasks?: (tasks: AgentTask[]) => void;
+  onTools?: (tools: AgentTool[]) => void;
   onSignal?: () => void;
   commands: AgentCommand[] = [];
   models: AgentModel[] = [];
@@ -219,6 +236,15 @@ export class ClaudeAgent implements Agent {
 
   warmUp(): void {
     this.ensureProcess();
+  }
+
+  async interrupt(): Promise<void> {
+    const run = this.run;
+    if (!run) return;
+    run.interrupting = true;
+    // o CLI fecha o turno sem esperar a ferramenta do duo nem avisar: quem a respondia deixa de ser esperado
+    for (const wait of run.waits) wait.abort(STOPPED);
+    await this.control(run, { subtype: 'interrupt' });
   }
 
   async setModel(choice: ModelChoice): Promise<void> {
@@ -308,6 +334,9 @@ export class ClaudeAgent implements Agent {
       taskShared: new Map(),
       initRequest: `duo-init-${randomUUID()}`,
       controls: new Map(),
+      tools: new Map(),
+      waits: new Set(),
+      interrupting: false,
     };
     onJsonLines(proc, (msg) => {
       if (this.run === run) this.onSignal?.();
@@ -332,6 +361,7 @@ export class ClaudeAgent implements Agent {
     if (this.run === run || !this.run) {
       patchStats(this, { subagents: 0 }); // os subagentes morreram junto
       if (run.tasks.size > 0) this.onTasks?.([]);
+      if (run.tools.size > 0) this.onTools?.([]);
     }
     const turn = this.turn;
     if (turn?.proc === run.proc && turn.resumeError !== undefined && /No conversation found/i.test(run.tail())) {
@@ -439,7 +469,10 @@ export class ClaudeAgent implements Agent {
       return;
     }
     if (msg.type === 'user') {
-      if (!msg.isReplay) return;
+      if (!msg.isReplay) {
+        this.toolsDone(run, msg.message?.content);
+        return;
+      }
       if (turn && msg.uuid === turn.uuid) {
         this.startTurn(run, turn);
       } else if (this.opts.remoteControl && !msg.isSynthetic) {
@@ -468,19 +501,31 @@ export class ClaudeAgent implements Agent {
     if (!mine && (msg.type === 'assistant' || msg.type === 'result')) run.ownOpen = true;
 
     if (msg.type === 'assistant') {
+      const before = run.tools.size;
       for (const block of msg.message?.content ?? []) {
         if (block.type === 'text' && block.text?.trim()) {
           texts.push(block.text);
           emit({ kind: 'text', text: block.text });
         } else if (block.type === 'tool_use' && !String(block.name).startsWith('mcp__duo__')) {
           // a ferramenta do duo não entra aqui: a tela mostra a mensagem inteira quando ela chega ao Codex
-          emit({ kind: 'tool', text: describeTool(block.name, block.input) });
+          const text = describeTool(block.name, block.input);
+          emit({ kind: 'tool', text });
+          if (typeof block.id === 'string') run.tools.set(block.id, { id: block.id, text, startedAt: Date.now() });
         }
       }
+      if (run.tools.size !== before) this.showTools(run);
       return;
     }
 
     if (msg.type === 'result') {
+      const stopped = run.interrupting && msg.subtype === 'error_during_execution';
+      run.interrupting = false;
+      // o turno parado fechou sem esperar o que ainda estava aberto nele: solta quem respondia
+      if (stopped) for (const wait of run.waits) wait.abort(STOPPED);
+      if (run.tools.size > 0) {
+        run.tools.clear();
+        this.showTools(run);
+      }
       for (const denial of msg.permission_denials ?? []) {
         if (run.deniedByYou.has(denial.tool_use_id)) continue;
         emit({
@@ -489,12 +534,25 @@ export class ClaudeAgent implements Agent {
         });
       }
       if (!mine) {
-        if (msg.is_error) emit({ kind: 'error', text: resultError(msg) });
+        if (msg.is_error && !stopped) emit({ kind: 'error', text: resultError(msg) });
         this.finishOwnTurn(run);
         return;
       }
-      this.settle(mine, msg.is_error ? new Error(resultError(msg)) : mine.texts.join('\n\n'));
+      if (stopped) this.settle(mine, new Error('você parou o Claude'));
+      else this.settle(mine, msg.is_error ? new Error(resultError(msg)) : mine.texts.join('\n\n'));
     }
+  }
+
+  /** As ferramentas que terminaram (os tool_result da conversa principal) saem do quadro. */
+  private toolsDone(run: Running, content: unknown): void {
+    if (!Array.isArray(content) || run.tools.size === 0) return;
+    const before = run.tools.size;
+    for (const block of content) if (block?.type === 'tool_result') run.tools.delete(block.tool_use_id);
+    if (run.tools.size !== before) this.showTools(run);
+  }
+
+  private showTools(run: Running): void {
+    if (this.run === run) this.onTools?.([...run.tools.values()]);
   }
 
   /** A lista de comandos que o CLI informou. */
@@ -633,10 +691,16 @@ export class ClaudeAgent implements Agent {
       );
     if (req.subtype === 'mcp_message') {
       const ctrl = new AbortController();
+      const call = req.message?.method === 'tools/call';
+      // chegou com o parar já pedido (estava a caminho): o turno está fechando, então volta na hora sem ir ao Codex
+      const late = call && run.interrupting;
+      if (late) ctrl.abort(STOPPED);
+      else if (call) run.waits.add(ctrl);
       run.asks.set(msg.request_id, ctrl);
       const mcpResponse = await this.answerMcp(req.message ?? {}, ctrl.signal);
       run.asks.delete(msg.request_id);
-      if (!ctrl.signal.aborted) reply({ subtype: 'success', response: { mcp_response: mcpResponse } });
+      run.waits.delete(ctrl);
+      if (late || !ctrl.signal.aborted) reply({ subtype: 'success', response: { mcp_response: mcpResponse } });
       return;
     }
     if (req.subtype !== 'can_use_tool') {
@@ -645,17 +709,27 @@ export class ClaudeAgent implements Agent {
     }
     const ask = this.askPermission;
     const ctrl = new AbortController();
+    // chegou com o parar já pedido: nem pergunta, nega
+    if (run.interrupting) ctrl.abort(STOPPED);
     run.asks.set(msg.request_id, ctrl);
+    run.waits.add(ctrl);
     const text = toolCall(req.tool_name, req.input);
-    const allowed = ask ? await ask({ text, signal: ctrl.signal }).catch(() => false) : false;
+    const allowed = ask && !ctrl.signal.aborted ? await ask({ text, signal: ctrl.signal }).catch(() => false) : false;
     run.asks.delete(msg.request_id);
-    if (ctrl.signal.aborted) return;
+    run.waits.delete(ctrl);
+    // parado pelo duo: nega, para o CLI não ficar esperando (se ele já desistiu, a resposta não muda nada)
+    const stopped = ctrl.signal.reason === STOPPED;
+    if (ctrl.signal.aborted && !stopped) return;
     if (allowed) {
       reply({ subtype: 'success', response: { behavior: 'allow', updatedInput: req.input } });
       return;
     }
     if (ask) run.deniedByYou.add(req.tool_use_id);
-    const message = ask ? 'O usuário negou pela janela do duo.' : 'O duo não tinha como perguntar ao usuário.';
+    const message = stopped
+      ? 'O usuário parou o Claude pela janela do duo.'
+      : ask
+        ? 'O usuário negou pela janela do duo.'
+        : 'O duo não tinha como perguntar ao usuário.';
     reply({ subtype: 'success', response: { behavior: 'deny', message } });
   }
 
@@ -681,6 +755,7 @@ export class ClaudeAgent implements Agent {
         if (message.params?.name !== PEER_TOOL.name || !text || !this.askPeer) {
           return toolResult('chamada inválida: a ferramenta do duo precisa de uma mensagem para o Codex', true);
         }
+        if (signal.aborted) return toolResult('o usuário parou o Claude antes de a mensagem ir para o Codex', true);
         try {
           const answer = await this.askPeer({ text, signal });
           return toolResult(`O Codex respondeu:\n\n${answer.trim() || '(sem texto)'}`);

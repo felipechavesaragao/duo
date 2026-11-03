@@ -197,6 +197,17 @@ describe('SharedLog', () => {
     expect(turn(log, ['claude'], 'e?').claude).toContain('### Codex\nPARECER');
   });
 
+  it('o Claude parou de esperar uma chamada privada: a resposta é só dos dois, e vai com a próxima compartilhada', () => {
+    const log = new SharedLog();
+    turn(log, ['claude'], 'começa');
+    const idx = log.agentMessage('claude', 'codex', 'REVISA', false);
+    log.delivered('codex', log.prepare('codex', 'REVISA', false, idx, 'claude'));
+    log.agentReply('codex', 'PARECER-PRIVADO', false, undefined, 'claude');
+    expect(log.state.items.at(-1)?.onlyFor).toEqual(['codex', 'claude']);
+    expect(turn(log, ['claude'], 'e?', false).claude).toBe('e?'); // mensagem privada vai sem contexto, como sempre
+    expect(turn(log, ['claude'], 'e agora?').claude).toContain('### Codex\nPARECER-PRIVADO');
+  });
+
   it('quem perdeu a memória vê a chamada que fez, com seta', () => {
     const log = new SharedLog();
     turn(log, ['claude'], 'começa');

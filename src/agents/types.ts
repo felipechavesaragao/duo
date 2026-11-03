@@ -54,6 +54,15 @@ export interface AgentTask {
   lastAt: number;
 }
 
+/** Uma ferramenta que ele está usando agora, no turno (um comando, uma edição, uma busca): o quadro mostra qual. */
+export interface AgentTool {
+  id: string;
+  /** o que ela faz, como a conversa mostra ("Bash npm test", "$ npm test") */
+  text: string;
+  /** quando começou, em ms desde 1970 */
+  startedAt: number;
+}
+
 /** Um modelo que o agente oferece, como o próprio CLI informa: o menu do seletor da janela. */
 export interface AgentModel {
   /** o que vai para o CLI ao escolher (o Claude aceita apelidos: "opus", "default") */
@@ -117,6 +126,8 @@ export interface Agent {
   setModel(choice: ModelChoice): Promise<void>;
   /** chamado quando um subagente ou comando em segundo plano começa, dá sinal de vida ou termina: a lista toda */
   onTasks?: (tasks: AgentTask[]) => void;
+  /** chamado quando uma ferramenta começa ou termina no turno dele (a do duo não entra): a lista toda */
+  onTools?: (tools: AgentTool[]) => void;
   /** chamado a cada coisa que chega do processo dele: é o sinal de vida que mostra se ele está travado */
   onSignal?: () => void;
   /** sobe o processo já, sem mandar nada: a lista de comandos carrega antes da primeira mensagem */
@@ -153,6 +164,13 @@ export interface Agent {
    * nela abrir um turno sozinho. `images` = prints que vão junto da mensagem.
    */
   send(prompt: string, emit: EmitFn, shared?: boolean, images?: ImageInput[]): Promise<string>;
+  /**
+   * Para o que ele está fazendo agora: o turno do duo (que termina com erro) ou um que ele abriu sozinho. A conversa
+   * fica, e a próxima mensagem segue nela. Quem ele esperava pela ferramenta do duo deixa de ser esperado (a resposta
+   * vai para o contexto dele depois), e o pedido de permissão aberto sai. Resolve quando o pedido chegou ao CLI, não
+   * quando o turno acabou.
+   */
+  interrupt(): Promise<void>;
   /** Esquece a conversa: a próxima mensagem começa uma sessão nova. */
   reset(): void;
   /** Encerra processos filhos. */

@@ -35,6 +35,17 @@
 //                   Control): o eco dela com um uuid que não é do duo, e um turno inteiro respondendo.
 //                   "APP DENTRO <texto>": o eco dela chega no meio deste turno, e a resposta é deste turno.
 //                   "APP ANTES <texto>": ele lê a dela antes desta, sem responder no meio: uma resposta para as duas.
+// "LONGO <comando>" → roda um Bash que demora 2s ("CURTO <comando>": 50ms): o tool_use, e no fim o tool_result.
+// control_request "interrupt" → como o 2.1.316 (medido em 03/11/2026): responde na hora {still_queued: []}, mesmo
+//                   sem turno. No meio do LONGO, do CHAMA (esperando a ferramenta do duo), do PEDE (esperando a
+//                   permissão) ou do turno que ele abriu sozinho, fecha o turno: o tool_result de erro (só no LONGO),
+//                   o texto "[Request interrupted by user for tool use]" e um result error_during_execution.
+//                   "SOZINHO DEVAGAR <texto>": parar o turno que ele abriu sozinho leva 200ms, e a mensagem que chega
+//                   nesse meio vai depois, num turno dela, como o 2.1.316 (medido em 03/11/2026: ela fica na fila e o
+//                   command_lifecycle "started" e o eco dela só vêm depois do result do turno parado).
+// "TARDE"          → espera o interrupt; quando ele chega, ainda manda uma chamada da ferramenta do duo e um
+//                   can_use_tool (estavam a caminho), espera as respostas e fecha como parado. "TARDIAS" → responde
+//                   com o que o duo devolveu a elas.
 // Toda resposta traz usage (contexto = 1000 × número da mensagem) e o result traz o contextWindow.
 import readline from 'node:readline';
 
@@ -107,6 +118,33 @@ if (resume === 'sumiu') {
     replay && out({ type: 'user', session_id: sid, uuid: msg.uuid, isReplay: true, parent_tool_use_id: null, message: msg.message });
   const started = (msg) => out({ type: 'command_lifecycle', command_uuid: msg.uuid, state: 'started', session_id: sid });
 
+  /** o que o interrupt corta agora: o turno esperando alguma coisa (null = nada que dê para parar) */
+  let stop = null;
+  /** o que o duo devolveu às chamadas que o TARDE mandou depois do interrupt */
+  let late = null;
+  /** fecha o turno como o 2.1.316 depois de um interrupt */
+  const interrupted = () => {
+    const content = [{ type: 'text', text: '[Request interrupted by user for tool use]' }];
+    out({ type: 'user', session_id: sid, parent_tool_use_id: null, message: { role: 'user', content } });
+    out({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: sid, errors: ['[ede_diagnostic] parado'] });
+  };
+  /** espera `p`, ou o interrupt: aí fecha o turno (depois de `before`, `delay` ms depois) e devolve null */
+  const stoppable = (p, before = () => undefined, delay = 0) =>
+    new Promise((resolve) => {
+      const close = () => {
+        before();
+        interrupted();
+        resolve(null);
+      };
+      const mine = () => (delay ? void setTimeout(close, delay) : close());
+      stop = mine;
+      p.then((v) => {
+        if (stop !== mine) return;
+        stop = null;
+        resolve(v);
+      });
+    });
+
   /** mensagens que chegaram no meio do turno que ele abriu sozinho; null = nenhum aberto */
   let own = null;
   const ownTurn = async (text) => {
@@ -121,7 +159,13 @@ if (resume === 'sumiu') {
       process.stderr.write('caiu no meio do turno\n');
       return void setTimeout(() => process.exit(3), 200);
     }
-    await new Promise((r) => setTimeout(r, 300));
+    const slow = text?.startsWith('DEVAGAR ') ? 200 : 0;
+    if ((await stoppable(new Promise((r) => setTimeout(() => r(true), 300)), undefined, slow)) === null) {
+      const queued = own;
+      own = null;
+      for (const msg of queued) void onMessage(msg);
+      return;
+    }
     for (const msg of own) {
       echo(msg);
       started(msg);
@@ -131,8 +175,7 @@ if (resume === 'sumiu') {
     done();
   };
 
-  readline.createInterface({ input: process.stdin }).on('line', async (line) => {
-    const msg = JSON.parse(line);
+  const onMessage = async (msg) => {
     if (msg.type === 'control_response') {
       const resolve = pending.get(msg.response.request_id);
       pending.delete(msg.response.request_id);
@@ -156,6 +199,12 @@ if (resume === 'sumiu') {
         return out({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id } });
       }
       return ok({ effective: { effortLevel: effort }, applied: { model, effort: appliedEffort() } });
+    }
+    if (msg.type === 'control_request' && msg.request.subtype === 'interrupt') {
+      out({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id, response: { still_queued: [] } } });
+      const cut = stop;
+      stop = null;
+      return cut?.();
     }
     if (msg.type === 'control_request' && msg.request.subtype === 'remote_control') {
       const response = { session_url: 'https://claude.ai/code/session_falsa', bridge_session_id: 'cse_falsa' };
@@ -187,6 +236,22 @@ if (resume === 'sumiu') {
     }
     echo(msg);
     if (text === 'ARGS') return reply(`eco: ${JSON.stringify(args)}`);
+    if (text === 'TARDIAS') return reply(`eco: ${JSON.stringify(late)}`);
+    if (text === 'TARDE') {
+      await mcp({ method: 'initialize', params: { protocolVersion: '2025-11-25' }, id: 0 });
+      await mcp({ method: 'notifications/initialized' });
+      const tool = (await mcp({ method: 'tools/list', id: 1 })).result.tools[0].name;
+      await new Promise((r) => {
+        stop = r;
+        say('esperando');
+      });
+      const [called, asked] = await Promise.all([
+        mcp({ method: 'tools/call', params: { name: tool, arguments: { mensagem: 'tarde' } }, id: 2 }),
+        control({ subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'ls' }, tool_use_id: 'toolu_tarde' }),
+      ]);
+      late = { called: called.result, asked: asked.response };
+      return interrupted();
+    }
     if (text === 'MODELO') return reply(`eco: ${model} ${appliedEffort()}`);
     if (text.startsWith('TROCA ')) {
       model = resolve(text.slice(6)) ?? model;
@@ -238,15 +303,35 @@ if (resume === 'sumiu') {
       const tool = (await mcp({ method: 'tools/list', id: 1 })).result.tools[0].name;
       const input = { mensagem: text.slice(6) };
       out({ type: 'assistant', session_id: sid, message: { content: [{ type: 'tool_use', id: 'toolu_c', name: `mcp__duo__${tool}`, input }] } });
-      const r = (await mcp({ method: 'tools/call', params: { name: tool, arguments: input }, id: 2 })).result;
+      const called = await stoppable(mcp({ method: 'tools/call', params: { name: tool, arguments: input }, id: 2 }));
+      if (called === null) return; // parado: o 2.1.316 fecha o turno sem esperar a resposta da ferramenta
+      const r = called.result;
       return reply(`eco: [${tool}${r.isError ? ' erro' : ''}] ${r.content[0].text}`);
+    }
+
+    if (text.startsWith('LONGO ') || text.startsWith('CURTO ')) {
+      const id = `toolu_longo_${n}`;
+      const command = text.slice(6);
+      out({ type: 'assistant', session_id: sid, message: { model, usage: usage(), content: [{ type: 'tool_use', id, name: 'Bash', input: { command } }] } });
+      const result = (content, is_error) =>
+        out({ type: 'user', session_id: sid, parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content, is_error }] } });
+      const ms = text.startsWith('LONGO ') ? 2000 : 50;
+      const ran = await stoppable(new Promise((r) => setTimeout(() => r(true), ms)), () =>
+        result("The user doesn't want to proceed with this tool use. The tool use was rejected.", true),
+      );
+      if (ran === null) return;
+      result('pronto', false);
+      return reply(`eco: rodei ${command}`);
     }
 
     if (!text.startsWith('PEDE ')) return reply(`eco: ${text}`);
     const call = { tool_name: 'Bash', tool_use_id: `toolu_${n}`, tool_input: { command: text.slice(5) } };
     if (!canAsk) return reply('eco: negado sem perguntar', [call]);
-    const r = (await control({ subtype: 'can_use_tool', tool_name: call.tool_name, input: call.tool_input, tool_use_id: call.tool_use_id })).response;
+    const asked = await stoppable(control({ subtype: 'can_use_tool', tool_name: call.tool_name, input: call.tool_input, tool_use_id: call.tool_use_id }));
+    if (asked === null) return;
+    const r = asked.response;
     if (r.behavior === 'allow') reply(`eco: rodei ${r.updatedInput.command}`);
     else reply(`eco: negado (${r.message})`, [call]);
-  });
+  };
+  readline.createInterface({ input: process.stdin }).on('line', (line) => onMessage(JSON.parse(line)));
 }

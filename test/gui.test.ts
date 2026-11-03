@@ -31,6 +31,15 @@ class FakeAgent implements Agent {
   onOwnTurnEvent?: Agent['onOwnTurnEvent'];
   onOwnTurnReply?: Agent['onOwnTurnReply'];
   onRemoteMessage?: Agent['onRemoteMessage'];
+  onTools?: Agent['onTools'];
+  askPeer?: Agent['askPeer'];
+  /** quantas vezes pediram para parar; `slowStop` = o turno só fecha no `finishStop` (o CLI ainda não parou) */
+  interrupts = 0;
+  slowStop = false;
+  /** enquanto existir, o pedido de parar espera por ele; `interruptFails` faz o pedido falhar com essa mensagem */
+  interruptGate?: Promise<void>;
+  interruptFails?: string;
+  private stopTurn?: (err: Error) => void;
   constructor(
     readonly id: AgentId,
     readonly name: string,
@@ -38,7 +47,9 @@ class FakeAgent implements Agent {
   async send(prompt: string, emit: EmitFn, _shared?: boolean, images: ImageInput[] = []) {
     this.prompts.push(prompt);
     this.images.push(images);
-    await this.gate;
+    // parar derruba o turno que o gate segura, como o adaptador de verdade
+    await Promise.race([this.gate, new Promise<never>((_, reject) => (this.stopTurn = reject))]);
+    this.stopTurn = undefined;
     const answer = `${this.name} responde ${this.prompts.length}`;
     emit({ kind: 'text', text: answer });
     return answer;
@@ -57,6 +68,15 @@ class FakeAgent implements Agent {
     this.onStats?.({ ...this.stats });
   }
   warmUp() {}
+  async interrupt() {
+    this.interrupts++;
+    await this.interruptGate;
+    if (this.interruptFails) throw new Error(this.interruptFails);
+    if (!this.slowStop) this.finishStop();
+  }
+  finishStop() {
+    this.stopTurn?.(new Error('parado'));
+  }
   reset() {}
   dispose() {
     this.disposed++;
@@ -727,5 +747,215 @@ describe('janela: seletor de modelo', () => {
       expect((await post('/api/modelo', body)).status).toBe(400);
     }
     expect(agents.codex.choices).toEqual([]);
+  });
+});
+
+describe('janela: parar só um agente', () => {
+  /** espera o estado ATUAL do duo passar no filtro: o `next` acha qualquer status desde o começo, e o inicial
+   * (livre, sem parar nada) já passaria nas esperas de "voltou ao normal" */
+  const now = (events: ReturnType<typeof listen>, duo: Duo, pick: (s: ReturnType<Duo['getState']>) => boolean) =>
+    events.until(() => pick(duo.getState()), 'o estado esperado');
+
+  it('para o turno e a fila só dele; o outro segue, e a próxima mensagem dele vai', async () => {
+    const { agents, duo, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    let openCodex!: () => void;
+    agents.claude.gate = new Promise(() => undefined);
+    agents.codex.gate = new Promise((r) => (openCodex = r));
+    await post('/api/submit', { text: '@todos um' });
+    await post('/api/submit', { text: '@cla dois' });
+    await events.next('status', (s) => s.busy.claude === 2 && s.runningSince.claude !== null);
+
+    expect(JSON.parse((await post('/api/parar', { agent: 'claude' })).body)).toEqual({ ok: true });
+    await events.next(
+      'entry',
+      (e) => e.text === 'você parou o Claude: o que ele estava fazendo e a mensagem na fila dele. A conversa continua.',
+    );
+    await now(events, duo, (s) => s.busy.claude === 0 && s.runningSince.claude === null && !s.stopping.claude);
+    expect(agents.claude.interrupts).toBe(1);
+    expect(agents.claude.prompts).toHaveLength(1); // a da fila nem foi
+    expect(events.events.some((e) => e.name === 'entry' && e.data.who === 'claude' && e.data.kind === 'error')).toBe(false);
+    const turns = (duo as any).rec.data.turns.filter((t: any) => t.agent === 'claude');
+    expect(turns.map((t: any) => t.status)).toEqual(['cancelled', 'cancelled']);
+
+    openCodex(); // o outro não foi parado
+    await events.next('entry', (e) => e.who === 'codex' && e.text === 'Codex responde 1');
+    agents.claude.gate = undefined;
+    await post('/api/submit', { text: '@cla de novo' });
+    await events.next('entry', (e) => e.who === 'claude' && e.text === 'Claude responde 2');
+    events.close();
+  });
+
+  it('enquanto o turno não fecha, o quadro diz que está parando', async () => {
+    const { agents, duo, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    agents.claude.gate = new Promise(() => undefined);
+    agents.claude.slowStop = true;
+    await post('/api/submit', { text: '@cla um' });
+    await events.next('status', (s) => s.runningSince.claude !== null);
+    await post('/api/parar', { agent: 'claude' });
+    await events.next('status', (s) => s.stopping.claude === true && s.runningSince.claude !== null);
+    agents.claude.finishStop();
+    await now(events, duo, (s) => s.stopping.claude === false && s.runningSince.claude === null);
+    events.close();
+  });
+
+  it('pedido inválido não chega ao duo; parar quem está livre só avisa', async () => {
+    const { agents, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    expect((await post('/api/parar', { agent: 'gemini' })).status).toBe(400);
+    expect((await post('/api/parar', {})).status).toBe(400);
+    expect(JSON.parse((await post('/api/parar', { agent: 'codex' })).body)).toEqual({ ok: true });
+    await events.next('entry', (e) => e.kind === 'error' && e.text === 'o Codex não está rodando nada.');
+    expect(agents.codex.interrupts).toBe(0);
+    events.close();
+  });
+
+  it('o motivo da espera: a ferramenta rodando, e quem espera o outro (até ser parado)', async () => {
+    const { agents, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    agents.claude.onTools?.([{ id: 't1', text: 'Bash npm test', startedAt: 1 }]);
+    await events.next('status', (s) => s.tools.claude[0]?.text === 'Bash npm test');
+
+    let openCodex!: () => void;
+    agents.codex.gate = new Promise((r) => (openCodex = r));
+    const ctrl = new AbortController();
+    const asked = agents.claude.askPeer!({ text: 'revisa', signal: ctrl.signal }).catch((e: Error) => e);
+    await events.next('status', (s) => typeof s.peerWait.claude === 'number' && s.runningSince.codex !== null);
+    ctrl.abort(); // você parou o Claude: deixa de esperar já, com o Codex ainda respondendo
+    await events.next('status', (s) => s.peerWait.claude === null && s.runningSince.codex !== null);
+    openCodex();
+    expect(await asked).toBe('Codex responde 1');
+    events.close();
+  });
+
+  it('parar quem foi chamado: quem chamou recebe na hora que você o parou, sem esperar o CLI parar', async () => {
+    const { agents, duo, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    agents.codex.gate = new Promise(() => undefined);
+    agents.codex.slowStop = true;
+    const asked = agents.claude.askPeer!({ text: 'revisa', signal: new AbortController().signal }).catch((e: Error) => e);
+    await events.next('status', (s) => s.runningSince.codex !== null);
+    await post('/api/parar', { agent: 'codex' });
+    expect(((await asked) as Error).message).toBe('o usuário parou o Codex antes de ele responder');
+    expect((duo as any).state.stopping.codex).toBe(true); // o turno dele ainda não fechou
+    await now(events, duo, (s) => s.peerWait.claude === null);
+    agents.codex.finishStop();
+    events.close();
+  });
+
+  it('parar no brain: o brain para dizendo que foi você', async () => {
+    const { agents, duo, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    agents.claude.gate = new Promise(() => undefined);
+    await post('/api/submit', { text: '/brain /cla qual banco?' });
+    await events.next('status', (s) => s.runningSince.claude !== null);
+    await post('/api/parar', { agent: 'claude' });
+    await events.next('entry', (e) => e.text === '🧠 brain parou: você parou o Claude.');
+    await now(events, duo, (s) => s.brain === false);
+    expect(agents.codex.prompts).toHaveLength(0);
+    events.close();
+  });
+
+  it('o brain para no clique, sem esperar o turno fechar; a resposta que chega depois não segue', async () => {
+    const { agents, duo, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    let open!: () => void;
+    agents.claude.gate = new Promise((r) => (open = r));
+    agents.claude.slowStop = true;
+    await post('/api/submit', { text: '/brain /cla qual banco?' });
+    await events.next('status', (s) => s.runningSince.claude !== null);
+    await post('/api/parar', { agent: 'claude' });
+    await events.next('entry', (e) => e.text === '🧠 brain parou: você parou o Claude.');
+    await now(events, duo, (s) => s.brain === false && s.stopping.claude); // o turno dele ainda não fechou
+    open(); // o CLI respondeu antes de parar
+    await events.next('entry', (e) => e.who === 'claude' && e.text === 'Claude responde 1');
+    await now(events, duo, (s) => s.runningSince.claude === null);
+    expect(agents.codex.prompts).toHaveLength(0);
+    events.close();
+  });
+
+  it('turno que ele abriu sozinho começando pela ferramenta do duo: aparece rodando, e o Parar o alcança', async () => {
+    const { agents, duo, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    agents.codex.gate = new Promise(() => undefined);
+    void agents.claude.askPeer!({ text: 'revisa', signal: new AbortController().signal }).catch(() => undefined);
+    await events.next('status', (s) => s.runningSince.claude !== null && typeof s.peerWait.claude === 'number');
+    await post('/api/parar', { agent: 'claude' });
+    await events.next('status', (s) => s.stopping.claude === true);
+    expect(agents.claude.interrupts).toBe(1);
+    agents.claude.onOwnTurnReply!(''); // o turno parado fecha
+    await now(events, duo, (s) => s.runningSince.claude === null && !s.stopping.claude);
+    events.close();
+  });
+
+  it('mensagem nova enquanto o turno parado fecha: o "parando" é só do turno parado', async () => {
+    const { agents, duo, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    agents.claude.onOwnTurnEvent!({ kind: 'text', text: 'sozinho' });
+    await events.next('status', (s) => s.runningSince.claude !== null);
+    await post('/api/parar', { agent: 'claude' });
+    await events.next('status', (s) => s.stopping.claude === true);
+    agents.claude.gate = new Promise(() => undefined);
+    await post('/api/submit', { text: '@cla nova' });
+    await vi.waitFor(() => expect(agents.claude.prompts).toHaveLength(1));
+    agents.claude.onOwnTurnReply!(''); // o turno parado fecha; o da mensagem nova segue
+    await now(events, duo, (s) => s.stopping.claude === false && s.runningSince.claude !== null);
+    events.close();
+  });
+
+  it('a falha atrasada de um parar antigo não desfaz o parar seguinte', async () => {
+    const { agents, duo, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    let open!: () => void;
+    let release!: () => void;
+    agents.claude.gate = new Promise((r) => (open = r));
+    agents.claude.interruptGate = new Promise((r) => (release = r));
+    agents.claude.interruptFails = 'caiu';
+    await post('/api/submit', { text: '@cla um' });
+    await events.next('status', (s) => s.runningSince.claude !== null);
+    await post('/api/parar', { agent: 'claude' });
+    open(); // o turno fecha antes de o pedido de parar responder
+    await now(events, duo, (s) => s.runningSince.claude === null && !s.stopping.claude);
+    agents.claude.gate = new Promise(() => undefined);
+    agents.claude.interruptGate = new Promise(() => undefined); // o segundo pedido ainda não respondeu
+    await post('/api/submit', { text: '@cla dois' });
+    await now(events, duo, (s) => s.runningSince.claude !== null);
+    await post('/api/parar', { agent: 'claude' });
+    await now(events, duo, (s) => s.stopping.claude);
+    release(); // o primeiro pedido falha agora
+    await new Promise((r) => setTimeout(r, 50));
+    expect(duo.getState().stopping.claude).toBe(true);
+    expect(events.events.some((e) => e.name === 'entry' && /não consegui parar/.test(e.data.text))).toBe(false);
+    events.close();
+  });
+
+  it('o erro de um parar que demorou não aparece na conversa nova', async () => {
+    const { agents, duo, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    let release!: () => void;
+    agents.claude.gate = new Promise(() => undefined);
+    agents.claude.interruptGate = new Promise((r) => (release = r));
+    agents.claude.interruptFails = 'caiu';
+    await post('/api/submit', { text: '@cla um' });
+    await events.next('status', (s) => s.runningSince.claude !== null);
+    await post('/api/parar', { agent: 'claude' });
+    await post('/api/submit', { text: '/novo' });
+    await now(events, duo, (s) => s.runningSince.claude === null && !s.stopping.claude);
+    release();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(events.events.some((e) => e.name === 'entry' && /não consegui parar/.test(e.data.text))).toBe(false);
+    events.close();
   });
 });
