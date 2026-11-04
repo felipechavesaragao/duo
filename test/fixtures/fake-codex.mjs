@@ -25,6 +25,14 @@
 // os serviceTiers (o "priority", de nome "Fast"). config/read → o que o config.toml diz (esforço high, tier
 // priority, sem modelo). O thread/start responde com model, reasoningEffort e serviceTier. TURNO → responde com o
 // model, o effort e o serviceTier que vieram no turn/start deste turno.
+// PASSOS → os passos como o 0.166.0 (03/11/2026): um comando que dá certo e um que falha (status "failed", exitCode 1,
+// como o PowerShell devolve), os dois no invólucro do Windows com as aspas de dentro como \"; um comando recusado que
+// só aparece no item/completed; um fileChange que cria, altera, apaga e move arquivos da pasta; um mcpToolCall que
+// falha (com a mensagem comprida) e uma busca na web. Medidos rodando: os dois comandos e o fileChange que cria e
+// altera; o resto segue a forma do esquema do próprio CLI (`codex app-server generate-ts`). Responde "fim".
+// CAI → um comando começa, e o processo cai antes do fim dele.
+// SOLTO → um comando começa e o turno acaba (completed) sem o item/completed dele.
+import path from 'node:path';
 import readline from 'node:readline';
 
 const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
@@ -215,6 +223,38 @@ async function runTurn(turnId, text, skill) {
     const command = `"C:\\WINDOWS\\powershell.exe" -Command 'echo oi'`;
     item('item/started', { id: 'c', type: 'commandExecution', command });
     item('item/completed', { id: 'c', type: 'commandExecution', command, exitCode: 1 });
+  }
+  if (text === 'PASSOS') {
+    const wrap = (c) => `"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "${c.replace(/"/g, '\\"')}"`;
+    const run = (id, inner, status, exitCode) => {
+      const command = wrap(inner);
+      item('item/started', { id, type: 'commandExecution', command, status: 'inProgress', exitCode: null });
+      item('item/completed', { id, type: 'commandExecution', command, status, exitCode });
+    };
+    run('p1', `node -e "console.log('oi')"`, 'completed', 0);
+    run('p2', 'node -e "process.exit(3)"', 'failed', 1);
+    item('item/completed', { id: 'p3', type: 'commandExecution', command: wrap('rm -rf x'), status: 'declined', exitCode: null });
+    const at = (...p) => path.join(process.cwd(), ...p);
+    const changes = [
+      { path: at('novo.txt'), kind: { type: 'add' }, diff: 'linha a\n' },
+      { path: at('src', 'velho.ts'), kind: { type: 'update', move_path: null }, diff: '@@ -1 +1 @@\n-a\n+b\n' },
+      { path: at('lixo.txt'), kind: { type: 'delete' }, diff: '' },
+      { path: at('a.ts'), kind: { type: 'update', move_path: at('b.ts') }, diff: '' },
+    ];
+    item('item/started', { id: 'p4', type: 'fileChange', changes, status: 'inProgress' });
+    item('item/completed', { id: 'p4', type: 'fileChange', changes, status: 'completed' });
+    const why = `servidor fora: ${'tentou de novo e não respondeu; '.repeat(4)}desisti depois de 3 tentativas`;
+    item('item/completed', { id: 'p5', type: 'mcpToolCall', server: 'docs', tool: 'buscar', status: 'failed', error: { message: why } });
+    item('item/completed', { id: 'p6', type: 'webSearch', query: 'vitest' });
+    answer = 'fim';
+  }
+  if (text === 'CAI') {
+    item('item/started', { id: 'cai', type: 'commandExecution', command: 'npm test', status: 'inProgress' });
+    return void setTimeout(() => process.exit(2), 100);
+  }
+  if (text === 'SOLTO') {
+    item('item/started', { id: 'solto', type: 'commandExecution', command: 'npm test', status: 'inProgress' });
+    answer = 'fim';
   }
   if (text === 'PEDE') {
     const reqId = next++;

@@ -3,8 +3,58 @@ export type AgentId = 'claude' | 'codex';
 /** O que um agente avisa enquanto trabalha. */
 export type AgentEvent =
   | { kind: 'text'; text: string } // um trecho de resposta pronto
-  | { kind: 'tool'; text: string } // atividade: comando, edição de arquivo, busca...
+  // atividade: comando, edição de arquivo, busca... `step` = é um passo, com o texto inteiro; `result` = é o fim de um
+  // passo (vem numa linha própria, depois dele). Os dois juntos = o passo só apareceu quando já tinha acabado.
+  | { kind: 'tool'; text: string; step?: StepInfo; result?: StepResult }
   | { kind: 'error'; text: string }; // aviso de erro que não encerra o turno
+
+/** Um passo do turno (um comando, uma edição, uma busca) por inteiro: a janela abre o que a linha mostra cortado. */
+export interface StepInfo {
+  /** o id que o CLI deu ao passo: o resultado acha o passo por ele */
+  id: string;
+  /** o que a linha mostra, sem cortar: o comando todo, o arquivo, a busca */
+  full: string;
+}
+
+/** Um arquivo que um passo mexeu. */
+export interface FileChange {
+  /** relativo à pasta do projeto quando está dentro dela */
+  path: string;
+  change: 'criado' | 'alterado' | 'apagado' | 'movido';
+}
+
+/** Como um passo terminou. */
+export interface StepResult {
+  /** o id do passo (`StepInfo.id`) */
+  of: string;
+  ok: boolean;
+  /** o código de saída de um comando, quando o CLI informa */
+  exitCode?: number;
+  /** o que houve, quando não é só ok nem só o código: "você negou", STEP_STOPPED, STEP_UNFINISHED, "erro: …" */
+  note?: string;
+  /** os arquivos que ele criou, alterou, apagou ou moveu */
+  files?: FileChange[];
+}
+
+/** O passo foi cortado no meio, e não falhou: você parou o agente, ou o turno (o processo) acabou antes dele. */
+export const STEP_STOPPED = 'parado por você';
+export const STEP_UNFINISHED = 'não terminou';
+
+/** O fim de um passo, numa linha própria: o terminal só mostra a que não deu certo; a janela pendura no passo. */
+export function stepEnd(result: StepResult): AgentEvent {
+  const why = result.ok
+    ? 'ok'
+    : result.exitCode !== undefined
+      ? `saiu com código ${result.exitCode}`
+      : (result.note ?? 'falhou');
+  // a linha corta como as outras; o motivo inteiro fica no `result.note`
+  return { kind: 'tool', text: `  ↳ ${truncate(why)}`, result };
+}
+
+/** A linha do fim de um passo que deu certo: não aparece no terminal (a janela mostra o ✓ no passo). */
+export function quietStep(entry: { kind: string; step?: StepInfo; result?: StepResult }): boolean {
+  return entry.kind === 'tool' && entry.step === undefined && entry.result?.ok === true;
+}
 
 export type EmitFn = (event: AgentEvent) => void;
 

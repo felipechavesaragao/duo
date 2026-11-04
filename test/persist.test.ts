@@ -4,7 +4,31 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { markInterrupted, newSessionData, Recorder, SessionStore } from '../src/persist.js';
+import {
+  closeOpenSteps,
+  markInterrupted,
+  newSessionData,
+  Recorder,
+  SessionStore,
+  trimScreen,
+  type ScreenEntry,
+} from '../src/persist.js';
+
+/** Uma linha de passo e a do fim dele, como os adaptadores mandam. */
+const stepLine = (id: string, who: 'claude' | 'codex' = 'claude'): ScreenEntry => ({
+  who,
+  kind: 'tool',
+  text: `$ ${id}`,
+  label: false,
+  step: { id, full: `$ ${id}` },
+});
+const endLine = (of: string, who: 'claude' | 'codex' = 'claude'): ScreenEntry => ({
+  who,
+  kind: 'tool',
+  text: '  ↳ ok',
+  label: false,
+  result: { of, ok: true },
+});
 
 const tmpStore = () => new SessionStore(fs.mkdtempSync(path.join(os.tmpdir(), 'duo-test-')));
 const filesIn = (dir: string) => (fs.existsSync(dir) ? fs.readdirSync(dir) : []);
@@ -69,6 +93,18 @@ describe('SessionStore', () => {
     expect(broken((d) => (d.screen = [{ ...entry, images: ['a.png'] }]))).toBeDefined();
     expect(broken((d) => (d.screen = [{ ...entry, images: 'a.png' }]))).toBeUndefined();
     expect(broken((d) => (d.screen = [{ ...entry, images: [1] }]))).toBeUndefined();
+    // o passo e o fim dele voltam na retomada; o que não tem a forma deles não passa
+    const tool = { who: 'claude', kind: 'tool', text: '$ npm test', label: true };
+    const end = { of: 's1', ok: false, exitCode: 3, note: 'x', files: [{ path: 'a.ts', change: 'criado' }] };
+    const steps = [{ ...tool, step: { id: 's1', full: '$ npm test --run' } }, { ...tool, label: false, result: end }];
+    expect(broken((d) => (d.screen = steps))).toBeDefined();
+    expect(store.load(data.id)!.screen).toEqual(steps);
+    expect(broken((d) => (d.screen = [{ ...tool, step: { id: 1, full: 'x' } }]))).toBeUndefined();
+    expect(broken((d) => (d.screen = [{ ...tool, step: { id: 's1' } }]))).toBeUndefined();
+    expect(broken((d) => (d.screen = [{ ...tool, result: { ...end, ok: 'sim' } }]))).toBeUndefined();
+    expect(broken((d) => (d.screen = [{ ...tool, result: { ...end, exitCode: '3' } }]))).toBeUndefined();
+    expect(broken((d) => (d.screen = [{ ...tool, result: { ...end, files: [{ path: 'a.ts', change: 'mexido' }] } }]))).toBeUndefined();
+    expect(broken((d) => (d.screen = [{ ...entry, step: { id: 's1', full: 'x' } }]))).toBeUndefined(); // só linha de ação
     expect(broken((d) => (d.claudeSessionId = 42))).toBeUndefined();
     expect(broken((d) => delete d.log.seen)).toBeUndefined();
     expect(broken((d) => (d.log.introduced = { claude: true }))).toBeUndefined();
@@ -219,6 +255,83 @@ describe('Recorder', () => {
     expect(saved.turns.slice(0, 2).map((t) => t.text)).toEqual(['ainda rodando', 'na fila']);
     expect(saved.turns.map((t) => t.text)).not.toContain('velho e terminado');
     expect(markInterrupted(saved).map((t) => t.id)).toEqual([1, 2]);
+  });
+
+  it('o limite da tela gravada não deixa o fim de um passo sem o passo dele', () => {
+    const store = tmpStore();
+    const rec = new Recorder(newSessionData('/p'), store);
+    rec.data.turns.push({ id: 1, agent: 'claude', text: 'oi', status: 'done' });
+    for (let i = 0; i < 150; i++) rec.data.screen.push(stepLine(`s${i}`), endLine(`s${i}`));
+    rec.data.screen.push({ who: 'claude', kind: 'text', text: 'fim', label: false }); // 301: o corte leva o passo s0
+    rec.saveNow();
+    const screen = store.load(rec.data.id)!.screen;
+    expect(screen[0].step?.id).toBe('s1'); // o fim do s0 saiu junto
+    expect(screen).toHaveLength(299);
+    const steps = new Set(screen.flatMap((e) => (e.step ? [e.step.id] : [])));
+    expect(screen.every((e) => !e.result || steps.has(e.result.of))).toBe(true);
+  });
+
+  it('o passo que saiu num corte de antes: o fim que chega depois também não fica', () => {
+    const store = tmpStore();
+    const rec = new Recorder(newSessionData('/p'), store);
+    const text: ScreenEntry = { who: 'claude', kind: 'text', text: 'linha', label: false };
+    rec.data.turns.push({ id: 1, agent: 'claude', text: 'oi', status: 'done' });
+    rec.data.screen.push(stepLine('a'), stepLine('b'), ...Array.from({ length: 299 }, () => ({ ...text })));
+    rec.saveNow(); // 300: sai o passo a
+    rec.data.screen.push(endLine('a'));
+    rec.saveNow(); // 301: sai o passo b, e o fim do a
+    rec.data.screen.push(endLine('b'));
+    rec.saveNow(); // 300, sem corte: o fim do b, que saiu antes, também sai
+    expect(store.load(rec.data.id)!.screen.filter((e) => e.step || e.result)).toEqual([]);
+  });
+
+  it('a linha que sai no corte levava o nome de quem fala: o nome passa para a próxima', () => {
+    const fail: ScreenEntry = { ...endLine('c'), label: true, result: { of: 'c', ok: false, exitCode: 1 } };
+    const screen: ScreenEntry[] = [
+      stepLine('c'), // sai no corte
+      { who: 'codex', kind: 'text', text: 'enquanto isso', label: true },
+      fail, // o Claude volta a falar: o fim do c levava o nome
+      { who: 'claude', kind: 'text', text: 'falhou', label: false },
+    ];
+    expect(trimScreen(screen, 3).map((e) => [e.text, e.label])).toEqual([
+      ['enquanto isso', true],
+      ['falhou', true],
+    ]);
+  });
+
+  it('o nome é refeito mesmo quando nada sai: a linha que o decidia pode ter saído numa gravação de antes', () => {
+    // o fim que levava o nome do Claude saiu antes; o texto dele chegou depois, sem nome, atrás do Codex
+    const screen: ScreenEntry[] = [
+      { who: 'codex', kind: 'text', text: 'enquanto isso', label: true },
+      { who: 'claude', kind: 'text', text: 'falhou', label: false },
+    ];
+    expect(trimScreen(screen).map((e) => e.label)).toEqual([true, true]);
+    const right = trimScreen(screen);
+    expect(trimScreen(right)).toBe(right); // nada mudou: a mesma lista
+  });
+});
+
+describe('closeOpenSteps', () => {
+  it('na retomada, o passo que o duo deixou aberto ganha "não terminou" logo depois dele', () => {
+    const screen: ScreenEntry[] = [
+      stepLine('a'),
+      endLine('a'),
+      stepLine('b'), // aberto
+      { who: 'codex', kind: 'text', text: 'outro falando', label: true },
+      stepLine('d', 'codex'), // aberto: outro passo com o mesmo id veio depois
+      stepLine('d', 'codex'),
+      endLine('d', 'codex'),
+      stepLine('c', 'codex'), // aberto, no fim
+    ];
+    expect(closeOpenSteps(screen)).toBe(3);
+    const unfinished = { kind: 'tool', text: '  ↳ não terminou', label: false };
+    expect(screen.map((e) => e.step?.id ?? (e.result ? `fim ${e.result.of}` : e.text))).toEqual([
+      'a', 'fim a', 'b', 'fim b', 'outro falando', 'd', 'fim d', 'd', 'fim d', 'c', 'fim c',
+    ]);
+    expect(screen[3]).toEqual({ who: 'claude', ...unfinished, result: { of: 'b', ok: false, note: 'não terminou' } });
+    expect(screen[6]).toEqual({ who: 'codex', ...unfinished, result: { of: 'd', ok: false, note: 'não terminou' } });
+    expect(screen[10]).toEqual({ who: 'codex', ...unfinished, result: { of: 'c', ok: false, note: 'não terminou' } });
+    expect(closeOpenSteps(screen)).toBe(0); // nada mais aberto
   });
 });
 

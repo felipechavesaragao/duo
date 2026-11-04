@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeAgent } from '../src/agents/claude.js';
 import { CodexAgent } from '../src/agents/codex.js';
-import { ResumeFailedError, type Agent, type AgentEvent, type AgentTask } from '../src/agents/types.js';
+import { ResumeFailedError, type Agent, type AgentEvent, type AgentTask, type StepResult } from '../src/agents/types.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fakeClaude = [process.execPath, path.join(here, 'fixtures', 'fake-claude.mjs')];
@@ -21,6 +21,16 @@ const pngFile = () => {
   fs.writeFileSync(file, PNG);
   return file;
 };
+
+/** Os passos de um turno: [id, texto inteiro, linha] de cada um, e o fim de cada um, na ordem em que chegaram. */
+function stepsOf(events: AgentEvent[]) {
+  const tools = events.flatMap((e) => (e.kind === 'tool' ? [e] : []));
+  return {
+    steps: tools.flatMap((e) => (e.step ? [[e.step.id, e.step.full, e.text]] : [])),
+    ends: tools.flatMap((e) => (e.result ? [e.result] : [])),
+    texts: tools.map((e) => e.text),
+  };
+}
 
 const live: Agent[] = [];
 const track = <T extends Agent>(a: T) => (live.push(a), a);
@@ -260,9 +270,11 @@ describe('ClaudeAgent', () => {
     const agent = track(new ClaudeAgent({ bin: fakeClaude }));
     agent.askPermission = async () => false;
     const errors: string[] = [];
-    const answer = await agent.send('PEDE git push', (ev) => ev.kind === 'error' && errors.push(ev.text));
+    const events: AgentEvent[] = [];
+    const answer = await agent.send('PEDE git push', (ev) => (events.push(ev), ev.kind === 'error' && errors.push(ev.text)));
     expect(answer).toBe('eco: negado (O usuário negou pela janela do duo.)');
     expect(errors).toEqual([]);
+    expect(stepsOf(events).ends).toEqual([{ of: 'toolu_1', ok: false, note: 'você negou' }]);
   });
 
   it('sem ninguém para perguntar, nega e avisa como antes', async () => {
@@ -331,6 +343,54 @@ describe('ClaudeAgent', () => {
     await vi.waitFor(() => expect(replies).toEqual([['sozinho: FIM da pública', true]]));
   });
 
+  it('passos: o comando inteiro, o código de saída de cada um e o arquivo que ele criou ou alterou', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const events: AgentEvent[] = [];
+    expect(await agent.send('PASSOS', (ev) => events.push(ev))).toBe('fim');
+    const { steps, ends, texts } = stepsOf(events);
+    const ok = `node -e "console.log('oi')" && echo ${'x'.repeat(130)}`;
+    const file = path.join('sub', 'novo.txt'); // relativo à pasta do projeto
+    const outside = path.resolve(process.cwd(), '..', 'outro', 'fora.txt'); // fora dela: o caminho inteiro
+    expect(steps).toEqual([
+      ['toolu_p1', `Bash ${ok}`, `Bash ${ok}`.slice(0, 119) + '…'], // a linha corta, o passo guarda inteiro
+      ['toolu_p2', 'Bash node -e "process.exit(3)"', 'Bash node -e "process.exit(3)"'],
+      ['toolu_p3', `Write ${file}`, `Write ${file}`],
+      ['toolu_p4', `Edit ${file}`, `Edit ${file}`],
+      ['toolu_p5', `Read ${outside}`, `Read ${outside}`],
+      ['toolu_p6', 'Read nao-existe.txt', 'Read nao-existe.txt'],
+      ['toolu_p7', `Write ${file}`, `Write ${file}`],
+      ['toolu_p8', `Write ${file}`, `Write ${file}`],
+      ['toolu_p9', `MultiEdit ${file}`, `MultiEdit ${file}`],
+      ['toolu_p10', 'NotebookEdit nb.ipynb', 'NotebookEdit nb.ipynb'],
+    ]);
+    // o motivo inteiro (só a primeira linha), mesmo comprido; a linha do terminal corta
+    const why = `erro: File does not exist. Note: your current working directory is ${'/uma/pasta/comprida'.repeat(6)}. Did you mean nao-existe.md?`;
+    expect(ends).toEqual<StepResult[]>([
+      { of: 'toolu_p1', ok: true },
+      { of: 'toolu_p2', ok: false, exitCode: 3 },
+      { of: 'toolu_p3', ok: true, files: [{ path: file, change: 'criado' }] },
+      { of: 'toolu_p4', ok: true, files: [{ path: file, change: 'alterado' }] },
+      { of: 'toolu_p5', ok: true },
+      { of: 'toolu_p6', ok: false, note: why },
+      { of: 'toolu_p7', ok: true, files: [{ path: file, change: 'alterado' }] }, // type "update"
+      { of: 'toolu_p8', ok: true }, // sem tool_use_result: não dá para saber se criou; a linha já diz o arquivo
+      { of: 'toolu_p9', ok: true, files: [{ path: file, change: 'alterado' }] },
+      { of: 'toolu_p10', ok: true, files: [{ path: 'nb.ipynb', change: 'alterado' }] },
+    ]);
+    expect(texts).toContain('  ↳ saiu com código 3');
+    expect(texts).toContain(`  ↳ ${why.slice(0, 119)}…`);
+  });
+
+  it('passo sem fim: o turno que acaba, ou o processo que cai, diz que ele não terminou', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const events: AgentEvent[] = [];
+    expect(await agent.send('SEMFIM', (ev) => events.push(ev))).toBe('fim');
+    expect(stepsOf(events).ends).toEqual([{ of: 'toolu_semfim', ok: false, note: 'não terminou' }]);
+    const fell: AgentEvent[] = [];
+    await expect(agent.send('CAI', (ev) => fell.push(ev))).rejects.toThrow(/encerrou/);
+    expect(stepsOf(fell).ends).toEqual([{ of: 'toolu_cai', ok: false, note: 'não terminou' }]);
+  });
+
   it('turno dele sem texto (só ferramenta) também avisa o fim, com texto vazio', async () => {
     const agent = track(new ClaudeAgent({ bin: fakeClaude }));
     const seen: string[] = [];
@@ -339,8 +399,7 @@ describe('ClaudeAgent', () => {
     agent.onOwnTurnReply = (text, tasksShared) => replies.push([text, tasksShared]);
     await agent.send('CALADO', noop, true);
     await vi.waitFor(() => expect(replies).toEqual([['', true]]));
-    expect(seen).toHaveLength(1);
-    expect(seen[0]).toMatch(/^tool: /);
+    expect(seen).toEqual(['tool: Read saida.txt', 'tool:   ↳ ok']); // o passo e o fim dele, nenhum texto
     await agent.send('depois', noop); // a mensagem seguinte não reabre o aviso
     expect(replies).toHaveLength(1);
   });
@@ -491,13 +550,15 @@ describe('ClaudeAgent', () => {
     const agent = track(new ClaudeAgent({ bin: fakeClaude }));
     const seen: string[][] = [];
     agent.onTools = (list) => seen.push(list.map((t) => t.text));
-    const errors: string[] = [];
-    const turn = agent.send('LONGO npm test', (ev) => ev.kind === 'error' && errors.push(ev.text)).catch((e: Error) => e);
+    const events: AgentEvent[] = [];
+    const turn = agent.send('LONGO npm test', (ev) => events.push(ev)).catch((e: Error) => e);
     await vi.waitFor(() => expect(seen.at(-1)).toEqual(['Bash npm test']));
     await agent.interrupt();
     expect(((await turn) as Error).message).toBe('você parou o Claude');
     expect(seen.at(-1)).toEqual([]);
-    expect(errors).toEqual([]);
+    expect(events.filter((e) => e.kind === 'error')).toEqual([]);
+    // o comando parado não aparece como falha: o fim dele diz que você parou
+    expect(stepsOf(events).ends).toEqual([{ of: 'toolu_longo_1', ok: false, note: 'parado por você' }]);
     expect(await agent.send('oi', noop)).toBe('eco: oi');
   });
 
@@ -516,12 +577,18 @@ describe('ClaudeAgent', () => {
   it('parar com a pergunta de permissão aberta: a pergunta sai, e o turno fecha', async () => {
     const agent = track(new ClaudeAgent({ bin: fakeClaude }));
     let signal: AbortSignal | undefined;
-    agent.askPermission = (req) => ((signal = req.signal), new Promise<boolean>(() => undefined));
-    const turn = agent.send('PEDE git push', noop).catch((e: Error) => e);
+    // como o duo: a pergunta que sai vale como não
+    agent.askPermission = (req) => (
+      (signal = req.signal), new Promise<boolean>((resolve) => req.signal.addEventListener('abort', () => resolve(false)))
+    );
+    const events: AgentEvent[] = [];
+    const turn = agent.send('PEDE git push', (ev) => events.push(ev)).catch((e: Error) => e);
     await vi.waitFor(() => expect(signal).toBeDefined());
     await agent.interrupt();
     expect(signal!.aborted).toBe(true);
     expect(((await turn) as Error).message).toBe('você parou o Claude');
+    // o duo negou porque você parou: o passo diz que foi parado, não que você negou
+    expect(stepsOf(events).ends).toEqual([{ of: 'toolu_1', ok: false, note: 'parado por você' }]);
   });
 
   it('parar o turno que ele abriu sozinho: termina sem erro na tela', async () => {
@@ -770,6 +837,51 @@ describe('CodexAgent (app-server)', () => {
     expect(emitted).toContain('  ↳ saiu com código 1');
   });
 
+  it('passos: o comando inteiro sem o invólucro, o fim de cada um e os arquivos que ele mexeu', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    const events: AgentEvent[] = [];
+    expect(await agent.send('PASSOS', (ev) => events.push(ev))).toBe('fim');
+    const { steps, ends, texts } = stepsOf(events);
+    const files = `criado novo.txt, alterado ${path.join('src', 'velho.ts')}, apagado lixo.txt, movido a.ts → b.ts`;
+    expect(steps).toEqual([
+      ['p1', `$ node -e "console.log('oi')"`, `$ node -e "console.log('oi')"`],
+      ['p2', '$ node -e "process.exit(3)"', '$ node -e "process.exit(3)"'],
+      ['p3', '$ rm -rf x', '$ rm -rf x'], // só veio o item/completed: a linha vem com o fim
+      ['p4', `arquivos: ${files}`, `arquivos: ${files}`],
+      ['p5', 'mcp docs buscar', 'mcp docs buscar'],
+      ['p6', 'busca na web: vitest', 'busca na web: vitest'],
+    ]);
+    expect(ends).toEqual<StepResult[]>([
+      { of: 'p1', ok: true },
+      { of: 'p2', ok: false, exitCode: 1 },
+      { of: 'p3', ok: false, note: 'recusado' },
+      {
+        of: 'p4',
+        ok: true,
+        files: [
+          { path: 'novo.txt', change: 'criado' },
+          { path: path.join('src', 'velho.ts'), change: 'alterado' },
+          { path: 'lixo.txt', change: 'apagado' },
+          { path: 'a.ts → b.ts', change: 'movido' },
+        ],
+      },
+      // a mensagem inteira, mesmo comprida; a linha do terminal corta
+      { of: 'p5', ok: false, note: `erro: servidor fora: ${'tentou de novo e não respondeu; '.repeat(4)}desisti depois de 3 tentativas` },
+      { of: 'p6', ok: true },
+    ]);
+    expect(texts.indexOf('$ rm -rf x')).toBeLessThan(texts.indexOf('  ↳ recusado'));
+  });
+
+  it('comando sem fim, quando o processo cai ou o turno acaba: diz que ele não terminou', async () => {
+    const agent = track(new CodexAgent({ bin: fakeCodex }));
+    const ended: AgentEvent[] = [];
+    expect(await agent.send('SOLTO', (ev) => ended.push(ev))).toBe('fim');
+    expect(stepsOf(ended).ends).toEqual([{ of: 'solto', ok: false, note: 'não terminou' }]);
+    const events: AgentEvent[] = [];
+    await expect(agent.send('CAI', (ev) => events.push(ev))).rejects.toThrow();
+    expect(stepsOf(events).ends).toEqual([{ of: 'cai', ok: false, note: 'não terminou' }]);
+  });
+
   it('pedido de aprovação do servidor: recusa, avisa na tela e o turno termina', async () => {
     const agent = track(new CodexAgent({ bin: fakeCodex }));
     const emitted: { kind: string; text: string }[] = [];
@@ -854,11 +966,13 @@ describe('CodexAgent (app-server)', () => {
     const agent = track(new CodexAgent({ bin: fakeCodex }));
     const seen: string[][] = [];
     agent.onTools = (list) => seen.push(list.map((t) => t.text));
-    const turn = agent.send('LONGO npm test', noop).catch((e: Error) => e);
+    const events: AgentEvent[] = [];
+    const turn = agent.send('LONGO npm test', (ev) => events.push(ev)).catch((e: Error) => e);
     await vi.waitFor(() => expect(seen.at(-1)).toEqual(['$ npm test']));
     await agent.interrupt();
     expect(((await turn) as Error).message).toBe('o turno do Codex foi interrompido');
     expect(seen.at(-1)).toEqual([]);
+    expect(stepsOf(events).ends).toEqual([{ of: 'longo', ok: false, note: 'parado por você' }]);
     expect(await agent.send('oi', noop)).toBe('eco: oi');
   });
 

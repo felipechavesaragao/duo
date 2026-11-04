@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { Box, Static, Text, useApp, useInput, useStdout } from 'ink';
 import TextInput from 'ink-text-input';
-import { truncate, type Agent, type AgentCommand, type AgentId } from './agents/types.js';
+import { quietStep, truncate, type Agent, type AgentCommand, type AgentId } from './agents/types.js';
 import { Duo, type Entry } from './core.js';
 import { COLORS, footerText, NAMES } from './display.js';
 import type { Recorder } from './persist.js';
@@ -85,7 +85,8 @@ export function App({ agents, recorder, resumed = false }: AppProps) {
 
   return (
     <Box flexDirection="column">
-      <Static key={staticKey} items={entries}>
+      {/* o fim de um passo que deu certo só serve à janela (o ✓ no passo): aqui a linha do passo basta */}
+      <Static key={staticKey} items={entries.filter((e) => !quietStep(e))}>
         {(e) => <EntryView key={e.id} entry={e} />}
       </Static>
 

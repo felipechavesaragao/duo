@@ -1,13 +1,17 @@
 import spawn from 'cross-spawn';
 import type { ChildProcess } from 'node:child_process';
-import { killTree, onJsonLines, stderrTail } from './process.js';
+import { killTree, onJsonLines, relPath, stderrTail } from './process.js';
 import {
   createQueue,
   patchStats,
   peerLoopHint,
   ResumeFailedError,
+  stepEnd,
+  STEP_STOPPED,
+  STEP_UNFINISHED,
   truncate,
   type Agent,
+  type AgentEvent,
   type AgentCommand,
   type AgentModel,
   type AgentStats,
@@ -15,8 +19,10 @@ import {
   type AgentTool,
   type EmitFn,
   type ImageInput,
+  type FileChange,
   type ModelChoice,
   type PeerRequest,
+  type StepResult,
 } from './types.js';
 
 /** A ferramenta que o duo dá ao Codex para falar com o Claude (dynamicTools do app-server). */
@@ -94,6 +100,13 @@ const RPC_TIMEOUT_MS = 120_000;
  * turn/completed traz `turn.id`. É por ele que cada turno só aceita os próprios eventos. `turn/interrupt`
  * {threadId, turnId} responde {} e o turno termina com status "interrupted" (medido: ~0,6s, com um comando
  * rodando). Nada pode ir antes do initialize (o app-server responde "Not initialized").
+ *
+ * Passos (medido em 03/11/2026, 0.166.0): o `commandExecution` traz em `command` o invólucro do Windows
+ * ("powershell.exe" -Command "…", com as aspas de dentro como \"), e no item/completed o `status` ("completed",
+ * "failed", "declined") e o `exitCode`. No Windows o código é o do PowerShell: um `process.exit(3)` volta como 1,
+ * com status "failed". O `fileChange` traz `changes` [{path absoluto, kind {type "add" | "update" | "delete",
+ * move_path}, diff}] e o `status`. O comando que estava rodando quando o turno é interrompido não manda item/completed:
+ * só vem o turn/completed "interrupted".
  */
 export class CodexAgent implements Agent {
   readonly id = 'codex' as const;
@@ -482,7 +495,12 @@ export class CodexAgent implements Agent {
       let known!: () => void;
       const waiting: Waiting = { threadId, known: new Promise<void>((r) => (known = r)) };
       this.waiting = waiting;
-      const finish = (settle: () => void) => {
+      /** os comandos que a tela mostrou começando e ainda não terminaram */
+      const steps: Steps = { cwd: this.opts.cwd ?? process.cwd(), open: new Set(), stopped: () => waiting.stopped === true };
+      /** `note` = o que dizer dos comandos que ficaram sem fim */
+      const finish = (settle: () => void, note = STEP_UNFINISHED) => {
+        for (const of of steps.open) emit(stepEnd({ of, ok: false, note }));
+        steps.open.clear();
         if (this.tools.size > 0) {
           this.tools.clear();
           this.onTools?.([]);
@@ -504,9 +522,7 @@ export class CodexAgent implements Agent {
         if (tid !== undefined && turnId !== undefined && tid !== turnId) return;
         switch (method) {
           case 'item/started': {
-            if (p.item?.type === 'commandExecution') {
-              emit({ kind: 'tool', text: `$ ${shortenCommand(p.item.command ?? '')}` });
-            }
+            if (p.item?.type === 'commandExecution') commandStarted(p.item, steps, emit);
             const text = toolText(p.item);
             if (text && typeof p.item.id === 'string') {
               this.tools.set(p.item.id, { id: p.item.id, text, startedAt: Date.now() });
@@ -515,7 +531,7 @@ export class CodexAgent implements Agent {
             break;
           }
           case 'item/completed':
-            handleItem(p.item, texts, emit);
+            handleItem(p.item, texts, emit, steps);
             if (this.tools.delete(p.item?.id)) this.onTools?.([...this.tools.values()]);
             break;
           case 'warning':
@@ -533,7 +549,9 @@ export class CodexAgent implements Agent {
           case 'turn/completed': {
             const status = p.turn?.status;
             if (status === 'completed') finish(() => resolve(texts.join('\n\n')));
-            else if (status === 'interrupted') finish(() => reject(new Error('o turno do Codex foi interrompido')));
+            else if (status === 'interrupted') {
+              finish(() => reject(new Error('o turno do Codex foi interrompido')), STEP_STOPPED);
+            }
             else finish(() => reject(new Error(p.turn?.error?.message ?? lastError ?? 'o turno do Codex falhou')));
             break;
           }
@@ -703,8 +721,30 @@ class Connection {
   }
 }
 
-function handleItem(item: any, texts: string[], emit: EmitFn): void {
+/** O que o turno precisa para mostrar o fim de cada passo. */
+interface Steps {
+  /** a pasta do projeto: os arquivos aparecem relativos a ela */
+  cwd: string;
+  /** os comandos que a tela mostrou começando e ainda não terminaram */
+  open: Set<string>;
+  /** você mandou parar este turno */
+  stopped: () => boolean;
+}
+
+/** A linha de um passo: o texto cortado, e o inteiro para a janela abrir. Sem id, não há como ligar o fim a ele. */
+function stepLine(id: unknown, full: string): AgentEvent {
+  const text = truncate(full);
+  return typeof id === 'string' ? { kind: 'tool', text, step: { id, full } } : { kind: 'tool', text };
+}
+
+function commandStarted(item: any, steps: Steps, emit: EmitFn): void {
+  emit(stepLine(item.id, `$ ${unwrapCommand(item.command ?? '')}`));
+  if (typeof item.id === 'string') steps.open.add(item.id);
+}
+
+function handleItem(item: any, texts: string[], emit: EmitFn, steps: Steps): void {
   if (!item) return;
+  const id = typeof item.id === 'string' ? item.id : undefined;
   switch (item.type) {
     case 'agentMessage':
       if (item.text?.trim()) {
@@ -713,22 +753,58 @@ function handleItem(item: any, texts: string[], emit: EmitFn): void {
       }
       break;
     case 'fileChange': {
-      const files = (item.changes ?? []).map((c: any) => `${c.kind?.type ?? ''} ${c.path ?? ''}`.trim());
-      emit({ kind: 'tool', text: truncate(`arquivos: ${files.join(', ') || '(alteração)'}`) });
+      const files = fileChanges(item.changes, steps.cwd);
+      emit(stepLine(id, `arquivos: ${files.map((f) => `${f.change} ${f.path}`).join(', ') || '(alteração)'}`));
+      if (id) emit(stepEnd(endOf(id, item, steps, files)));
       break;
     }
     case 'mcpToolCall':
-      emit({ kind: 'tool', text: truncate(`mcp ${item.server ?? ''} ${item.tool ?? ''}`) });
+      emit(stepLine(id, `mcp ${item.server ?? ''} ${item.tool ?? ''}`.trim()));
+      if (id) emit(stepEnd(endOf(id, item, steps)));
       break;
     case 'webSearch':
-      emit({ kind: 'tool', text: truncate(`busca na web: ${item.query ?? ''}`) });
+      emit(stepLine(id, `busca na web: ${item.query ?? ''}`));
+      if (id) emit(stepEnd({ of: id, ok: true }));
       break;
     case 'commandExecution':
-      if (typeof item.exitCode === 'number' && item.exitCode !== 0) {
-        emit({ kind: 'tool', text: `  ↳ saiu com código ${item.exitCode}` });
+      if (!id) {
+        if (typeof item.exitCode === 'number' && item.exitCode !== 0) {
+          emit({ kind: 'tool', text: `  ↳ saiu com código ${item.exitCode}` });
+        }
+        break;
       }
+      // sem o item/started, a linha do comando ainda não apareceu: vem agora, antes do fim
+      if (!steps.open.delete(id)) emit(stepLine(id, `$ ${unwrapCommand(item.command ?? '')}`));
+      emit(stepEnd(endOf(id, item, steps)));
       break;
   }
+}
+
+/** Como o passo terminou: pelo status e, num comando, pelo código de saída. */
+function endOf(of: string, item: any, steps: Steps, files?: FileChange[]): StepResult {
+  if (item.status === 'declined') return { of, ok: false, note: 'recusado' };
+  const code = typeof item.exitCode === 'number' ? item.exitCode : undefined;
+  const failed = item.status === 'failed' || (code !== undefined && code !== 0) || item.error != null;
+  if (!failed) return files?.length ? { of, ok: true, files } : { of, ok: true };
+  if (steps.stopped()) return { of, ok: false, note: STEP_STOPPED };
+  if (code !== undefined) return { of, ok: false, exitCode: code };
+  // o motivo vai inteiro para a janela e para o disco; só a linha do terminal corta
+  const why = typeof item.error?.message === 'string' ? item.error.message.trim() : '';
+  return { of, ok: false, note: why ? `erro: ${why}` : 'falhou' };
+}
+
+/** Os arquivos de um fileChange, relativos à pasta do projeto. */
+function fileChanges(changes: unknown, cwd: string): FileChange[] {
+  if (!Array.isArray(changes)) return [];
+  return changes
+    .filter((c) => typeof c?.path === 'string')
+    .map((c): FileChange => {
+      const from = relPath(cwd, c.path);
+      const to = c.kind?.move_path;
+      if (typeof to === 'string' && to) return { path: `${from} → ${relPath(cwd, to)}`, change: 'movido' };
+      const type = c.kind?.type;
+      return { path: from, change: type === 'add' ? 'criado' : type === 'delete' ? 'apagado' : 'alterado' };
+    });
 }
 
 /** O que o quadro mostra de uma ferramenta que começou no turno; undefined = não é ferramenta (texto, raciocínio...). */
@@ -751,8 +827,16 @@ function toolText(item: any): string | undefined {
   return undefined;
 }
 
-/** Tira o invólucro "powershell.exe -Command '...'" que o Codex põe no Windows. */
-export function shortenCommand(command: string): string {
+/**
+ * Tira o invólucro "powershell.exe -Command '...'" que o Codex põe no Windows, e desfaz o escape das aspas de dentro
+ * (\" entre aspas duplas, '' entre simples): sobra o comando como ele pediu.
+ */
+export function unwrapCommand(command: string): string {
   const m = command.match(/(?:-Command|\/c)\s+(['"])([\s\S]*)\1\s*$/);
-  return truncate(m ? m[2] : command);
+  if (!m) return command;
+  return m[1] === '"' ? m[2].replace(/\\"/g, '"') : m[2].replace(/''/g, "'");
+}
+
+export function shortenCommand(command: string): string {
+  return truncate(unwrapCommand(command));
 }

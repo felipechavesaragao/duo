@@ -25,6 +25,7 @@ import { COLORS, currentModel, footerText, modelLabel, NAMES } from '../src/disp
 import type { Who } from '../src/persist.js';
 import type { ModelBody, PastedImage, ServerEvents, Snapshot, StopBody } from '../src/gui/protocol.js';
 import { agentCommandQuery, matchCommands, targetsOf, type Target } from '../src/router.js';
+import { blocksOf, stepStatus, type Block, type StepRow } from './blocks.js';
 
 /**
  * A janela: barra lateral com as ações do duo, a conversa no meio e o painel com o que está rodando, a pasta, o modo e
@@ -568,26 +569,6 @@ function ContextRow({ name, color, stats }: { name: string; color: string; stats
 
 /* a conversa */
 
-type Block = { key: number; entry: Entry } | { key: number; who: Who; label: boolean; tools: Entry[] };
-
-/** Ações seguidas do mesmo agente viram um grupo só, que abre com um clique. */
-function blocksOf(entries: Entry[]): Block[] {
-  const out: Block[] = [];
-  for (const entry of entries) {
-    const prev = out.at(-1);
-    if (entry.kind === 'tool') {
-      if (prev && 'tools' in prev && prev.who === entry.who && !entry.label) {
-        prev.tools.push(entry);
-        continue;
-      }
-      out.push({ key: entry.id, who: entry.who, label: entry.label, tools: [entry] });
-    } else {
-      out.push({ key: entry.id, entry });
-    }
-  }
-  return out;
-}
-
 function Timeline({ entries, anyBusy, children }: { entries: Entry[]; anyBusy: boolean; children: ReactNode }) {
   const ref = useRef<HTMLElement>(null);
   // segue a conversa enquanto você está no fim dela; se subiu para ler, fica onde está
@@ -654,34 +635,78 @@ function EntryView({ entry }: { entry: Entry }) {
   );
 }
 
-function ToolGroup({ block }: { block: Extract<Block, { tools: Entry[] }> }) {
+function ToolGroup({ block }: { block: Extract<Block, { tools: StepRow[] }> }) {
   const [open, setOpen] = useState(false);
   const { tools } = block;
   const last = tools[tools.length - 1];
+  const failed = tools.filter((t) => stepStatus(t)?.tone === 'fail').length;
   return (
     <div className={`entry agent${block.label ? ' labeled' : ''}`} style={tint(COLORS[block.who])}>
       {block.label && <Label who={block.who} />}
       {tools.length === 1 ? (
-        <div className="tool-line">{last.text}</div>
+        <div className="steps">
+          <StepLine row={last} />
+        </div>
       ) : (
         <>
           <button className="tool-summary" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
             <span>
               {tools.length} ações
-              {!open && <span className="tool-last"> · {truncate(last.text, 90)}</span>}
+              {failed > 0 && <span className="step-why fail"> · {failed} {failed === 1 ? 'falhou' : 'falharam'}</span>}
+              {!open && <span className="tool-last"> · {truncate(last.entry.text, 90)}</span>}
             </span>
             <span className={`chev${open ? ' open' : ''}`}>{icons.chevronRight}</span>
           </button>
           {open && (
             <div className="tool-list">
               {tools.map((t) => (
-                <div key={t.id} className="tool-line">
-                  {t.text}
-                </div>
+                <StepLine key={t.entry.id} row={t} />
               ))}
             </div>
           )}
         </>
+      )}
+    </div>
+  );
+}
+
+/** Uma ação: o ✓ ou o ✗ de como acabou e, num clique, o comando inteiro e os arquivos que ela mexeu. */
+function StepLine({ row }: { row: StepRow }) {
+  const [open, setOpen] = useState(false);
+  const { entry, result } = row;
+  const status = stepStatus(row);
+  const full = entry.step?.full;
+  const long = full !== undefined && full !== entry.text;
+  const files = result?.ok ? (result.files ?? []) : [];
+  const more = long || files.length > 1;
+  return (
+    <div className="step">
+      <div className="tool-line step-line">
+        {status && <span className={`step-mark ${status.tone}`}>{status.mark}</span>}
+        <span className="step-body">
+          {more ? (
+            <button className="step-open" aria-expanded={open} title="Ver por inteiro" onClick={() => setOpen((o) => !o)}>
+              {entry.text}
+            </button>
+          ) : (
+            entry.text
+          )}
+          {status?.why && <span className={`step-why ${status.tone}`}> · {status.why}</span>}
+        </span>
+      </div>
+      {open && more && (
+        <div className="step-detail">
+          {long && <pre>{full}</pre>}
+          {files.length > 1 && (
+            <ul>
+              {files.map((f) => (
+                <li key={f.path}>
+                  <span className="step-change">{f.change}</span> {f.path}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       )}
     </div>
   );

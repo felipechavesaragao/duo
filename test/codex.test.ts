@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CodexAgent, shortenCommand } from '../src/agents/codex.js';
+import { CodexAgent, shortenCommand, unwrapCommand } from '../src/agents/codex.js';
 
 describe('CodexAgent.threadParams', () => {
   it('por padrão roda livre: sem aprovações e sem sandbox', () => {
@@ -22,5 +22,11 @@ describe('shortenCommand', () => {
     expect(shortenCommand(`"C:\\WINDOWS\\powershell.exe" -Command "Get-Content 'a.txt'"`)).toBe(`Get-Content 'a.txt'`);
     expect(shortenCommand(`"C:\\WINDOWS\\system32\\cmd.exe" /c 'dir /a'`)).toBe('dir /a');
     expect(shortenCommand('git status')).toBe('git status');
+  });
+
+  it('desfaz o escape das aspas de dentro do invólucro (o 0.166.0 manda \\" entre aspas duplas)', () => {
+    const real = String.raw`"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command "node -e \"console.log('oi')\""`;
+    expect(unwrapCommand(real)).toBe(`node -e "console.log('oi')"`);
+    expect(unwrapCommand(`"C:\\WINDOWS\\powershell.exe" -Command 'echo ''oi'''`)).toBe(`echo 'oi'`);
   });
 });

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { AgentId } from './agents/types.js';
+import { quietStep, STEP_UNFINISHED, stepEnd, type AgentId, type StepInfo, type StepResult } from './agents/types.js';
 import type { Target } from './router.js';
 import { emptyLogState, type SharedLogState } from './shared.js';
 
@@ -17,6 +17,10 @@ export interface ScreenEntry {
   label: boolean;
   /** prints que você colou nesta mensagem: o nome do arquivo na pasta de imagens do duo */
   images?: string[];
+  /** a linha é um passo do turno (um comando, uma edição): o texto inteiro, para a janela abrir */
+  step?: StepInfo;
+  /** a linha é o fim de um passo: a janela mostra no passo, o terminal só quando não deu certo */
+  result?: StepResult;
 }
 
 /**
@@ -53,6 +57,58 @@ export interface SessionData {
 
 const MAX_SCREEN = 300;
 const MAX_TURNS = 300;
+
+/**
+ * A tela gravada cortada no limite (ficam as linhas mais novas). O fim de um passo que não está mais na tela sai
+ * também: sozinho, ele não diz de que passo era. Vale em toda gravação, não só na que corta: o passo pode ter saído
+ * num corte de antes, com o fim chegando depois. O nome de quem fala é sempre refeito pela regra do `Duo.add` (muda
+ * quem falava → mostra o nome; o fim que deu certo não conta): uma linha que saiu, agora ou numa gravação de antes,
+ * podia ser a que decidia o nome das que vieram depois. Nada mudou → a mesma lista.
+ */
+export function trimScreen(screen: ScreenEntry[], max = MAX_SCREEN): ScreenEntry[] {
+  const steps = new Set<string>();
+  const kept = (screen.length > max ? screen.slice(screen.length - max) : screen).filter((e) => {
+    if (e.step) steps.add(e.step.id);
+    return !e.result || e.step !== undefined || steps.has(e.result.of);
+  });
+  let last: Who | null = null;
+  let changed = kept.length !== screen.length;
+  const out = kept.map((e) => {
+    const quiet = quietStep(e);
+    const label = !quiet && last !== e.who;
+    if (!quiet) last = e.who;
+    if (label === e.label) return e;
+    changed = true;
+    return { ...e, label };
+  });
+  return changed ? out : screen;
+}
+
+/**
+ * Na retomada: o passo que estava aberto quando o duo fechou não acaba mais (o processo dele foi junto). Ganha o fim
+ * "não terminou" logo depois dele, como quando o processo cai com o duo de pé. Devolve quantos fechou.
+ */
+export function closeOpenSteps(screen: ScreenEntry[]): number {
+  /** o passo aberto de cada id (o fim acha o último com o id, como na janela) e os que outro do mesmo id tirou dali */
+  const open = new Map<string, number>();
+  const pushed: number[] = [];
+  screen.forEach((e, i) => {
+    if (e.result) open.delete(e.result.of);
+    else if (e.step) {
+      const before = open.get(e.step.id);
+      if (before !== undefined) pushed.push(before);
+      open.set(e.step.id, i);
+    }
+  });
+  // de trás para a frente: cada fim entra sem mudar a posição dos passos que ainda faltam
+  const at = [...pushed, ...open.values()].sort((a, b) => b - a);
+  for (const i of at) {
+    const { who, step } = screen[i];
+    const result: StepResult = { of: step!.id, ok: false, note: STEP_UNFINISHED };
+    screen.splice(i + 1, 0, { who, kind: 'tool', text: stepEnd(result).text, label: false, result });
+  }
+  return at.length;
+}
 
 export function newSessionData(cwd: string): SessionData {
   const now = new Date().toISOString();
@@ -104,7 +160,19 @@ const isScreenEntry = (e: any) =>
   ['text', 'tool', 'error'].includes(e.kind) &&
   typeof e.text === 'string' &&
   typeof e.label === 'boolean' &&
-  (e.images === undefined || (Array.isArray(e.images) && e.images.every((n: unknown) => typeof n === 'string')));
+  (e.images === undefined || (Array.isArray(e.images) && e.images.every((n: unknown) => typeof n === 'string'))) &&
+  (e.step === undefined || (e.kind === 'tool' && isStep(e.step))) &&
+  (e.result === undefined || (e.kind === 'tool' && isStepResult(e.result)));
+const isStep = (s: any) => isObject(s) && typeof s.id === 'string' && typeof s.full === 'string';
+const CHANGES = ['criado', 'alterado', 'apagado', 'movido'];
+const isFile = (f: any) => isObject(f) && typeof f.path === 'string' && CHANGES.includes(f.change);
+const isStepResult = (r: any) =>
+  isObject(r) &&
+  typeof r.of === 'string' &&
+  typeof r.ok === 'boolean' &&
+  (r.exitCode === undefined || Number.isInteger(r.exitCode)) &&
+  optional(r.note, 'string') &&
+  (r.files === undefined || (Array.isArray(r.files) && r.files.every(isFile)));
 
 /**
  * Confere a estrutura inteira, campo a campo do que a retomada usa: um JSON válido mas incompleto quebraria a
@@ -245,7 +313,7 @@ export class Recorder {
       this.timer = undefined;
     }
     if (!this.store || (this.data.turns.length === 0 && this.data.log.items.length === 0)) return;
-    if (this.data.screen.length > MAX_SCREEN) this.data.screen.splice(0, this.data.screen.length - MAX_SCREEN);
+    this.data.screen = trimScreen(this.data.screen);
     if (this.data.turns.length > MAX_TURNS) {
       // os que ainda estão na fila ou rodando ficam: é por eles que a retomada avisa o que foi interrompido
       const cut = this.data.turns.length - MAX_TURNS;

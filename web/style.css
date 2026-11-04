@@ -12,6 +12,7 @@
   --focus: #4f9dff;
   --switch-on: #2f7cf6;
   --warn: #a35d00;
+  --ok: #2f7d4f;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 4px 16px rgba(0, 0, 0, 0.06);
   color-scheme: light;
 }
@@ -30,6 +31,7 @@
     --error: #ef7a6f;
     --switch-on: #4a8ff7;
     --warn: #e9a23b;
+    --ok: #6cc08b;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 16px rgba(0, 0, 0, 0.35);
     color-scheme: dark;
   }
@@ -55,6 +57,7 @@ body {
 code,
 pre,
 .tool-line,
+.step-detail,
 .ask-text,
 .cmd-name {
   font-family: ui-monospace, 'Cascadia Code', Consolas, 'SF Mono', monospace;
@@ -307,6 +310,7 @@ button:disabled {
 .agent > .text,
 .agent > .error,
 .agent > .tool-line,
+.agent > .steps,
 .agent > .tool-summary,
 .agent > .tool-list {
   margin-left: 17px;
@@ -433,6 +437,73 @@ button:disabled {
   border-left: 2px solid var(--border);
   padding: 2px 0 2px 10px;
   margin-top: 4px;
+}
+
+.step-line {
+  display: flex;
+  align-items: flex-start;
+}
+
+.step-mark {
+  flex: none;
+  width: 1.3em;
+}
+
+.step-body {
+  min-width: 0;
+}
+
+.step-mark.ok,
+.step-why.ok {
+  color: var(--ok);
+}
+
+.step-mark.fail,
+.step-why.fail {
+  color: var(--error);
+}
+
+.step-mark.off,
+.step-why.off {
+  color: var(--faint);
+}
+
+.step-open {
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-decoration: underline dotted var(--faint);
+  text-underline-offset: 3px;
+}
+
+.step-open:hover {
+  color: var(--fg);
+}
+
+.step-detail {
+  margin: 2px 0 6px 1.3em;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.step-detail pre {
+  margin: 0 0 4px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: var(--fg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.step-detail ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.step-change {
+  color: var(--faint);
 }
 
 .busy {

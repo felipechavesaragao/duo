@@ -3,7 +3,9 @@
 //                   result de erro SEM init, stderr "No conversation found...", sai com 1.
 // "PEDE <comando>" → imita uma regra "ask" do settings (medido em 02/11/2026, 2.1.316): com
 //                   --permission-prompt-tool stdio manda can_use_tool e espera o control_response;
-//                   sem ele, nega sozinho e só conta no permission_denials do result.
+//                   sem ele, nega sozinho e só conta no permission_denials do result. O tool_use vem antes do
+//                   can_use_tool, e o tool_result depois da resposta: negado, com is_error e a mensagem (medido em
+//                   03/11/2026, 2.1.316).
 // "CHAMA <texto>"  → usa a ferramenta do servidor MCP "duo" (sdk, via --mcp-config), como o 2.1.316:
 //                   initialize, notifications/initialized, tools/list e tools/call em mcp_message.
 // "AGENTE" / "FIM" → um subagente começa (task_started com description e subagent_type, um task_progress, mais
@@ -17,7 +19,16 @@
 //                   chega nesses 300ms entra no mesmo turno: eco dela, a resposta e um result só para os dois.
 //                   "SOZINHO FIM <texto>": além disso, o subagente do "AGENTE" termina neste turno, antes da resposta.
 //                   "SOZINHO MORRE <texto>": o processo cai (código 3) no meio do turno que ele abriu sozinho.
-// "CALADO"         → como "SOZINHO", mas o turno que ele abre sozinho só usa uma ferramenta: nenhum texto.
+// "CALADO"         → como "SOZINHO", mas o turno que ele abre sozinho só usa uma ferramenta (o tool_use e o
+//                   tool_result): nenhum texto.
+// "PASSOS"         → os passos medidos no 2.1.316 (03/11/2026): dois Bash em paralelo (os dois tool_use antes dos dois
+//                   tool_result), um que dá certo e um que sai com 3 ("Exit code 3"); um Write que cria um arquivo na
+//                   pasta (tool_use_result type "create"); um Edit nele (sem type); um Read fora da pasta; um Read de
+//                   arquivo que não existe (erro sem código, com a primeira linha comprida). Depois, o que não foi
+//                   medido, na mesma forma: um Write que reescreve (type "update"), um Write sem tool_use_result, um
+//                   MultiEdit e um NotebookEdit (notebook_path). Responde "fim".
+// "SEMFIM"         → um Bash cujo tool_result nunca vem: o result fecha o turno com ele aberto.
+// "CAI"            → um Bash começa, e o processo cai (código 3) antes do fim dele.
 // Com --replay-user-messages, ecoa cada mensagem lida (com o uuid dela), como o 2.1.316. O command_lifecycle
 // "started" vem antes do eco; numa mensagem que entra no turno que ele abriu sozinho, logo depois.
 // "/<comando>"     → comando local, como o /context no 2.1.316: "started", a saída (modelo <synthetic>), o eco
@@ -47,6 +58,7 @@
 //                   can_use_tool (estavam a caminho), espera as respostas e fecha como parado. "TARDIAS" → responde
 //                   com o que o duo devolveu a elas.
 // Toda resposta traz usage (contexto = 1000 × número da mensagem) e o result traz o contextWindow.
+import path from 'node:path';
 import readline from 'node:readline';
 
 const args = process.argv.slice(2);
@@ -145,6 +157,17 @@ if (resume === 'sumiu') {
       });
     });
 
+  /** o fim de um passo, como o 2.1.316: o tool_result e, junto, o tool_use_result (quando vem) */
+  const toolResult = (id, content, is_error, structured) =>
+    out({
+      type: 'user',
+      session_id: sid,
+      parent_tool_use_id: null,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content, ...(is_error === undefined ? {} : { is_error }) }] },
+      ...(structured === undefined ? {} : { tool_use_result: structured }),
+    });
+  const toolUse = (...blocks) => out({ type: 'assistant', session_id: sid, message: { model, usage: usage(), content: blocks } });
+
   /** mensagens que chegaram no meio do turno que ele abriu sozinho; null = nenhum aberto */
   let own = null;
   const ownTurn = async (text) => {
@@ -154,6 +177,7 @@ if (resume === 'sumiu') {
     if (text === null) {
       const content = [{ type: 'tool_use', id: 'toolu_calado', name: 'Read', input: { file_path: 'saida.txt' } }];
       out({ type: 'assistant', session_id: sid, message: { model, usage: usage(), content } });
+      toolResult('toolu_calado', 'linha 1');
     } else say(`sozinho: ${text}`);
     if (text?.startsWith('MORRE ')) {
       process.stderr.write('caiu no meio do turno\n');
@@ -324,14 +348,67 @@ if (resume === 'sumiu') {
       return reply(`eco: rodei ${command}`);
     }
 
+    if (text === 'PASSOS') {
+      const file = path.join(process.cwd(), 'sub', 'novo.txt');
+      const ok = `node -e "console.log('oi')" && echo ${'x'.repeat(130)}`;
+      toolUse(
+        { type: 'tool_use', id: 'toolu_p1', name: 'Bash', input: { command: ok, description: 'imprime oi' } },
+        { type: 'tool_use', id: 'toolu_p2', name: 'Bash', input: { command: 'node -e "process.exit(3)"', description: 'sai com 3' } },
+      );
+      toolResult('toolu_p1', 'oi', false, { stdout: 'oi', stderr: '', interrupted: false, isImage: false, noOutputExpected: false });
+      toolResult('toolu_p2', 'Exit code 3\nfalhou de propósito', true, 'Error: Exit code 3\nfalhou de propósito');
+      toolUse({ type: 'tool_use', id: 'toolu_p3', name: 'Write', input: { file_path: file, content: 'linha a' } });
+      toolResult('toolu_p3', `File created successfully at: ${file}`, undefined, { type: 'create', filePath: file, content: 'linha a', structuredPatch: [], originalFile: null });
+      toolUse({ type: 'tool_use', id: 'toolu_p4', name: 'Edit', input: { file_path: file, old_string: 'linha a', new_string: 'linha b' } });
+      toolResult('toolu_p4', `The file ${file} has been updated successfully.`, undefined, { filePath: file, oldString: 'linha a', newString: 'linha b', structuredPatch: [] });
+      const outside = path.resolve(process.cwd(), '..', 'outro', 'fora.txt');
+      toolUse({ type: 'tool_use', id: 'toolu_p5', name: 'Read', input: { file_path: outside } });
+      toolResult('toolu_p5', 'conteúdo', undefined, { type: 'text' });
+      toolUse({ type: 'tool_use', id: 'toolu_p6', name: 'Read', input: { file_path: 'nao-existe.txt' } });
+      const why = `File does not exist. Note: your current working directory is ${'/uma/pasta/comprida'.repeat(6)}. Did you mean nao-existe.md?`;
+      toolResult('toolu_p6', `<tool_use_error>${why}</tool_use_error>\nmais uma linha`, true, `Error: ${why}`);
+      toolUse({ type: 'tool_use', id: 'toolu_p7', name: 'Write', input: { file_path: file, content: 'linha c' } });
+      toolResult('toolu_p7', `The file ${file} has been updated successfully.`, undefined, { type: 'update', filePath: file, content: 'linha c' });
+      toolUse({ type: 'tool_use', id: 'toolu_p8', name: 'Write', input: { file_path: file, content: 'linha d' } });
+      toolResult('toolu_p8', `The file ${file} has been updated successfully.`);
+      toolUse({ type: 'tool_use', id: 'toolu_p9', name: 'MultiEdit', input: { file_path: file, edits: [] } });
+      toolResult('toolu_p9', `Applied 0 edits to ${file}`);
+      const notebook = path.join(process.cwd(), 'nb.ipynb');
+      toolUse({ type: 'tool_use', id: 'toolu_p10', name: 'NotebookEdit', input: { notebook_path: notebook, new_source: 'x' } });
+      toolResult('toolu_p10', 'Updated cell');
+      return reply('fim');
+    }
+    if (text === 'SEMFIM') {
+      toolUse({ type: 'tool_use', id: 'toolu_semfim', name: 'Bash', input: { command: 'sleep 9' } });
+      return reply('fim');
+    }
+    if (text === 'CAI') {
+      toolUse({ type: 'tool_use', id: 'toolu_cai', name: 'Bash', input: { command: 'npm test' } });
+      process.stderr.write('caiu no meio do passo\n');
+      return void setTimeout(() => process.exit(3), 100);
+    }
+
     if (!text.startsWith('PEDE ')) return reply(`eco: ${text}`);
     const call = { tool_name: 'Bash', tool_use_id: `toolu_${n}`, tool_input: { command: text.slice(5) } };
-    if (!canAsk) return reply('eco: negado sem perguntar', [call]);
-    const asked = await stoppable(control({ subtype: 'can_use_tool', tool_name: call.tool_name, input: call.tool_input, tool_use_id: call.tool_use_id }));
+    toolUse({ type: 'tool_use', id: call.tool_use_id, name: call.tool_name, input: call.tool_input });
+    if (!canAsk) {
+      toolResult(call.tool_use_id, 'Claude requested permissions to use Bash, but you haven\'t granted it yet.', true);
+      return reply('eco: negado sem perguntar', [call]);
+    }
+    // parado com a pergunta aberta: o duo nega, e o fim do passo traz a negativa dele (suposto, não medido)
+    const asked = await stoppable(
+      control({ subtype: 'can_use_tool', tool_name: call.tool_name, input: call.tool_input, tool_use_id: call.tool_use_id }),
+      () => toolResult(call.tool_use_id, 'O usuário parou o Claude pela janela do duo.', true),
+    );
     if (asked === null) return;
     const r = asked.response;
-    if (r.behavior === 'allow') reply(`eco: rodei ${r.updatedInput.command}`);
-    else reply(`eco: negado (${r.message})`, [call]);
+    if (r.behavior === 'allow') {
+      toolResult(call.tool_use_id, 'pronto', false);
+      reply(`eco: rodei ${r.updatedInput.command}`);
+    } else {
+      toolResult(call.tool_use_id, r.message, true, `Error: ${r.message}`);
+      reply(`eco: negado (${r.message})`, [call]);
+    }
   };
   readline.createInterface({ input: process.stdin }).on('line', (line) => onMessage(JSON.parse(line)));
 }

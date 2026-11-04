@@ -2,10 +2,13 @@ import spawn from 'cross-spawn';
 import type { ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
-import { killTree, onJsonLines, stderrTail } from './process.js';
+import { killTree, onJsonLines, relPath, stderrTail } from './process.js';
 import {
   createQueue,
   ResumeFailedError,
+  stepEnd,
+  STEP_STOPPED,
+  STEP_UNFINISHED,
   truncate,
   patchStats,
   peerLoopHint,
@@ -20,6 +23,7 @@ import {
   type ModelChoice,
   type PeerRequest,
   type PermissionRequest,
+  type StepResult,
 } from './types.js';
 
 /** A ferramenta que o duo dá ao Claude para falar com o Codex (servidor MCP "duo", hospedado pelo próprio duo). */
@@ -91,6 +95,8 @@ interface Running {
   controls: Map<string, { resolve: (response: any) => void; reject: (err: Error) => void }>;
   /** as ferramentas rodando no turno (o da conversa principal), por tool_use_id: o quadro da janela */
   tools: Map<string, AgentTool>;
+  /** os passos que a tela mostrou e ainda não terminaram, por tool_use_id: o fim de cada um vai para a tela */
+  steps: Map<string, { name: string; file?: string }>;
   /** o que ele espera de você ou do Codex (permissão, a ferramenta do duo): parar o solta */
   waits: Set<AbortController>;
   /** o duo pediu para parar: o result de erro que vem é o da interrupção, não uma falha */
@@ -155,6 +161,14 @@ interface Turn {
  * for tool use]" e um `result` error_during_execution; a conversa segue, e o turno seguinte sabe que foi parado.
  * Com a ferramenta do duo esperando o Codex, o turno fecha na hora, sem esperar a resposta dela e sem avisar o
  * duo (nenhum control_cancel_request): quem a respondia tem de ser solto pelo próprio duo.
+ *
+ * Passos (medido em 03/11/2026, 2.1.316): o `tool_use` traz o argumento inteiro (`command` do Bash, `file_path` do
+ * Write e do Edit). O fim vem num `user` com o `tool_result` (o mesmo `tool_use_id`): Bash que deu certo tem
+ * `is_error` false e nenhum código; o que saiu com 3 tem `is_error` true e o conteúdo começa com "Exit code 3". O
+ * `tool_use_result` da mesma mensagem diz o que houve com o arquivo: o do Write tem `type` "create" ou "update"; o do
+ * Edit não tem `type`. Dois comandos em paralelo vêm como dois `tool_use` antes dos dois `tool_result`. Com o
+ * pedido de permissão, o `tool_use` vem antes do can_use_tool; negado, o `tool_result` tem `is_error` true e a
+ * mensagem que o duo mandou.
  *
  * Modelo e esforço (medido em 03/11/2026, 2.1.316): o initialize traz `models` [{value, resolvedModel,
  * displayName, description, supportedEffortLevels, supportsFastMode}]; o `control_request` set_model {model} troca
@@ -335,6 +349,7 @@ export class ClaudeAgent implements Agent {
       initRequest: `duo-init-${randomUUID()}`,
       controls: new Map(),
       tools: new Map(),
+      steps: new Map(),
       waits: new Set(),
       interrupting: false,
     };
@@ -357,6 +372,9 @@ export class ClaudeAgent implements Agent {
 
   private onExit(run: Running, code: number | null): void {
     for (const ask of run.asks.values()) ask.abort(); // a pergunta sai da tela: ninguém mais espera a resposta
+    // os passos abertos morreram junto (o de um processo trocado de propósito, pelo /novo, não aparece mais)
+    if (this.run === run) this.closeSteps(run, STEP_UNFINISHED);
+    else run.steps.clear();
     this.dropControls(run, new Error(`o processo do claude encerrou (código ${code ?? '?'})`));
     if (this.run === run || !this.run) {
       patchStats(this, { subagents: 0 }); // os subagentes morreram junto
@@ -470,7 +488,7 @@ export class ClaudeAgent implements Agent {
     }
     if (msg.type === 'user') {
       if (!msg.isReplay) {
-        this.toolsDone(run, msg.message?.content);
+        this.toolsDone(run, msg);
         return;
       }
       if (turn && msg.uuid === turn.uuid) {
@@ -508,9 +526,15 @@ export class ClaudeAgent implements Agent {
           emit({ kind: 'text', text: block.text });
         } else if (block.type === 'tool_use' && !String(block.name).startsWith('mcp__duo__')) {
           // a ferramenta do duo não entra aqui: a tela mostra a mensagem inteira quando ela chega ao Codex
-          const text = describeTool(block.name, block.input);
-          emit({ kind: 'tool', text });
-          if (typeof block.id === 'string') run.tools.set(block.id, { id: block.id, text, startedAt: Date.now() });
+          const full = this.stepText(block.name, block.input);
+          const text = truncate(full);
+          if (typeof block.id === 'string') {
+            emit({ kind: 'tool', text, step: { id: block.id, full } });
+            run.tools.set(block.id, { id: block.id, text, startedAt: Date.now() });
+            run.steps.set(block.id, { name: String(block.name), file: this.fileOf(block.input) });
+          } else {
+            emit({ kind: 'tool', text });
+          }
         }
       }
       if (run.tools.size !== before) this.showTools(run);
@@ -526,6 +550,7 @@ export class ClaudeAgent implements Agent {
         run.tools.clear();
         this.showTools(run);
       }
+      this.closeSteps(run, stopped ? STEP_STOPPED : STEP_UNFINISHED);
       for (const denial of msg.permission_denials ?? []) {
         if (run.deniedByYou.has(denial.tool_use_id)) continue;
         emit({
@@ -543,12 +568,60 @@ export class ClaudeAgent implements Agent {
     }
   }
 
-  /** As ferramentas que terminaram (os tool_result da conversa principal) saem do quadro. */
-  private toolsDone(run: Running, content: unknown): void {
-    if (!Array.isArray(content) || run.tools.size === 0) return;
+  /**
+   * As ferramentas que terminaram (os tool_result da conversa principal) saem do quadro, e o fim de cada passo vai para
+   * a tela. O tool_use_result só diz de qual passo é quando a mensagem traz um tool_result só (é o que o CLI manda).
+   */
+  private toolsDone(run: Running, msg: any): void {
+    const content = msg.message?.content;
+    if (!Array.isArray(content)) return;
+    const results = content.filter((b) => b?.type === 'tool_result' && typeof b.tool_use_id === 'string');
     const before = run.tools.size;
-    for (const block of content) if (block?.type === 'tool_result') run.tools.delete(block.tool_use_id);
+    for (const block of results) run.tools.delete(block.tool_use_id);
     if (run.tools.size !== before) this.showTools(run);
+    const structured = results.length === 1 ? msg.tool_use_result : undefined;
+    for (const block of results) {
+      const step = run.steps.get(block.tool_use_id);
+      if (!step) continue; // de um subagente, ou a ferramenta do duo
+      run.steps.delete(block.tool_use_id);
+      this.emitNow(run)(stepEnd(stepResult(run, block, step, structured)));
+    }
+  }
+
+  /** Os passos que ficaram sem fim (o turno acabou ou o processo caiu sem o tool_result deles). */
+  private closeSteps(run: Running, note: string): void {
+    if (run.steps.size === 0) return;
+    const emit = this.emitNow(run);
+    for (const id of run.steps.keys()) emit(stepEnd({ of: id, ok: false, note }));
+    run.steps.clear();
+  }
+
+  /**
+   * Para onde vai o que chega agora: o turno do duo, se o CLI já leu a mensagem dele; senão o turno que ele abriu
+   * sozinho (só se já abriu: o fim de um passo nunca abre um turno).
+   */
+  private emitNow(run: Running): EmitFn {
+    const turn = this.turn?.proc === run.proc ? this.turn : undefined;
+    if (turn?.started) return turn.emit;
+    return (ev) => {
+      if (run.ownOpen) this.onOwnTurnEvent?.(ev);
+    };
+  }
+
+  private get cwd(): string {
+    return this.opts.cwd ?? process.cwd();
+  }
+
+  /** O passo inteiro: "Bash <o comando todo>", "Write src/x.ts" (o arquivo relativo à pasta do projeto). */
+  private stepText(name: string, input: any): string {
+    const file = this.fileOf(input);
+    return file !== undefined && input?.command === undefined ? `${name} ${file}` : toolCall(name, input);
+  }
+
+  /** O arquivo em que a ferramenta mexe, relativo à pasta do projeto quando está dentro dela. */
+  private fileOf(input: any): string | undefined {
+    const file = input?.file_path ?? input?.notebook_path;
+    return typeof file === 'string' && file ? relPath(this.cwd, file) : undefined;
   }
 
   private showTools(run: Running): void {
@@ -784,6 +857,40 @@ function userText(content: any): string {
 
 function resultError(msg: any): string {
   return typeof msg.result === 'string' && msg.result ? msg.result : String(msg.subtype);
+}
+
+/** As ferramentas que gravam arquivo: o fim delas diz qual arquivo mudou. */
+const EDITS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
+
+/** Como o passo terminou, pelo tool_result e, quando é dele, pelo tool_use_result. */
+function stepResult(run: Running, block: any, step: { name: string; file?: string }, structured: any): StepResult {
+  const of: string = block.tool_use_id;
+  if (block.is_error === true) {
+    // parar nega o pedido de permissão aberto (e o marca como seu): o motivo é o parar
+    if (run.interrupting) return { of, ok: false, note: STEP_STOPPED };
+    if (run.deniedByYou.has(of)) return { of, ok: false, note: 'você negou' };
+    const text = resultText(block.content).replace(/<\/?tool_use_error>/g, '');
+    const code = /^Exit code (\d+)/.exec(text);
+    if (code) return { of, ok: false, exitCode: Number(code[1]) };
+    // o motivo vai inteiro (a primeira linha) para a janela e para o disco; só a linha do terminal corta
+    return { of, ok: false, note: `erro: ${text.split('\n')[0].trim() || 'sem detalhe'}` };
+  }
+  if (step.file === undefined || !EDITS.has(step.name)) return { of, ok: true };
+  if (step.name !== 'Write') return { of, ok: true, files: [{ path: step.file, change: 'alterado' }] };
+  // o Write cria ou reescreve: só o tool_use_result diz qual; sem ele, a linha do passo já diz o arquivo
+  const type = structured?.type;
+  if (type !== 'create' && type !== 'update') return { of, ok: true };
+  return { of, ok: true, files: [{ path: step.file, change: type === 'create' ? 'criado' : 'alterado' }] };
+}
+
+/** O texto de um tool_result (vem como string ou como lista de blocos). */
+function resultText(content: any): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text)
+    .join('\n');
 }
 
 /** "Bash git push origin master": a ferramenta e o argumento que importa, inteiro. */

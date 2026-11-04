@@ -1,5 +1,14 @@
 import { spawnSync, type ChildProcess } from 'node:child_process';
+import path from 'node:path';
 import readline from 'node:readline';
+
+/** O arquivo relativo à pasta do projeto, quando está dentro dela; fora dela, o caminho como veio. */
+export function relPath(cwd: string, file: string): string {
+  if (!path.isAbsolute(file)) return file;
+  const rel = path.relative(cwd, file);
+  const outside = rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel); // absoluto: outro disco
+  return rel && !outside ? rel : file;
+}
 
 /** Prazo do taskkill: a tela trava enquanto ele roda (é síncrono, para valer também no 'exit' do duo). */
 const TASKKILL_TIMEOUT_MS = 5000;

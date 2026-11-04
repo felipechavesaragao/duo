@@ -1,9 +1,11 @@
 import path from 'node:path';
 import {
   createQueue,
+  quietStep,
   ResumeFailedError,
   truncate,
   type Agent,
+  type AgentEvent,
   type AgentCommand,
   type AgentId,
   type AgentModel,
@@ -15,6 +17,7 @@ import {
   type ModelChoice,
 } from './agents/types.js';
 import {
+  closeOpenSteps,
   markInterrupted,
   newSessionData,
   Recorder,
@@ -112,6 +115,8 @@ export class Duo {
   private nextId = 0;
   private nextAsk = 0;
   private lastWho: Who | null = null;
+  /** os passos na tela ainda sem fim: quantos de cada id (o /limpar tira todos) */
+  private openSteps = new Map<string, number>();
   // Muda a cada /novo: o que ainda era da conversa anterior (na fila, rodando, o brain) não roda nem aparece na nova.
   private session = 0;
   // O turno que ele abriu sozinho (ou que você abriu pelo app): o modo de quando começou, guardado para a resposta
@@ -152,9 +157,10 @@ export class Duo {
     this.rec = recorder ?? new Recorder(newSessionData(process.cwd()));
     this.resumed = resumed;
     this.log = new SharedLog(this.rec.data.log);
-    // Na retomada, a tela volta como estava.
+    // Na retomada, a tela volta como estava; o passo que o duo deixou aberto ao fechar diz que não terminou.
+    if (resumed) closeOpenSteps(this.rec.data.screen);
     const restored = this.rec.data.screen.map((e) => ({ ...e, id: this.nextId++ }));
-    this.lastWho = restored.at(-1)?.who ?? null;
+    this.lastWho = [...restored].reverse().find((e) => !quietStep(e))?.who ?? null; // o fim que deu certo não conta
     this.state = {
       entries: restored,
       target: this.rec.data.target,
@@ -198,14 +204,35 @@ export class Duo {
     this.emit(ev);
   }
 
-  private add(who: Who, kind: Entry['kind'], text: string, images?: string[]): void {
-    const label = this.lastWho !== who;
-    this.lastWho = who;
-    const entry: ScreenEntry = images?.length ? { who, kind, text, label, images } : { who, kind, text, label };
+  private add(who: Who, kind: Entry['kind'], text: string, extra: Pick<ScreenEntry, 'images' | 'step' | 'result'> = {}): void {
+    // o fim de um passo que deu certo não aparece no terminal: não conta como quem falou por último
+    const quiet = quietStep({ kind, ...extra });
+    const label = !quiet && this.lastWho !== who;
+    if (!quiet) this.lastWho = who;
+    const entry: ScreenEntry = { who, kind, text, label };
+    if (extra.images?.length) entry.images = extra.images;
+    if (extra.step) entry.step = extra.step;
+    if (extra.result) entry.result = extra.result;
     this.rec.data.screen.push(entry);
     this.rec.saveSoon();
     const shown = { ...entry, id: this.nextId++ };
     this.update({ entries: [...this.state.entries, shown] }, { type: 'entry', entry: shown });
+  }
+
+  /** O que um agente mandou para a tela: um passo e o fim dele vão junto da linha. */
+  private addEvent(who: AgentId, ev: AgentEvent): void {
+    if (ev.kind !== 'tool') return this.add(who, ev.kind, ev.text);
+    if (ev.result && !ev.step) {
+      // o fim de um passo que não está na tela (você limpou com ele rodando) não entra: sozinho, não diz de que passo
+      // era, e não toma o lugar de quem falou por último
+      const open = this.openSteps.get(ev.result.of);
+      if (!open) return;
+      if (open > 1) this.openSteps.set(ev.result.of, open - 1);
+      else this.openSteps.delete(ev.result.of);
+    } else if (ev.step && !ev.result) {
+      this.openSteps.set(ev.step.id, (this.openSteps.get(ev.step.id) ?? 0) + 1);
+    }
+    this.add(who, 'tool', ev.text, { step: ev.step, result: ev.result });
   }
 
   private setBusy(id: AgentId, delta: number): void {
@@ -285,7 +312,7 @@ export class Duo {
       agent.onOwnTurnEvent = (ev) => {
         this.own[agent.id] ??= { shared: rec.data.shared };
         this.setRunning(agent.id, 'own', true);
-        this.add(agent.id, ev.kind, ev.text);
+        this.addEvent(agent.id, ev);
       };
       // Compartilhada só se o modo era compartilhado quando o turno começou E a origem dele também: as tarefas que o
       // abriram (o agente diz se todas vieram de mensagens compartilhadas), as suas mensagens pelo app que ele diz que
@@ -443,7 +470,7 @@ export class Duo {
         rec.saveNow();
         try {
           const emit: EmitFn = (ev) => {
-            if (!stale()) this.add(id, ev.kind, ev.text);
+            if (!stale()) this.addEvent(id, ev);
           };
           this.setRunning(id, 'duo', true);
           const answer = await agents[id].send(prepared.prompt, emit, sharedTurn, images);
@@ -572,6 +599,7 @@ export class Duo {
       case 'clear':
         this.emit({ type: 'clear' });
         this.lastWho = null;
+        this.openSteps.clear();
         rec.data.screen = [];
         rec.saveNow();
         this.update({ entries: [] });
@@ -653,7 +681,7 @@ export class Duo {
           return true;
         }
         const shown = cmd.targets.length > 1 ? `[para os dois] ${cmd.prompt}`.trimEnd() : cmd.prompt;
-        this.add('voce', 'text', shown, images.map((img) => path.basename(img.path)));
+        this.add('voce', 'text', shown, { images: images.map((img) => path.basename(img.path)) });
         // quem recebe vê o print; o outro (no compartilhado) fica sabendo que ele existiu
         const n = images.length;
         const note = n === 0 ? '' : `[${n === 1 ? 'um print colado' : `${n} prints colados`} pelo usuário]`;

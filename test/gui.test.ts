@@ -3,9 +3,21 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { Agent, AgentCommand, AgentId, AgentModel, AgentStats, AgentTask, EmitFn, ImageInput, ModelChoice } from '../src/agents/types.js';
+import type {
+  Agent,
+  AgentCommand,
+  AgentEvent,
+  AgentId,
+  AgentModel,
+  AgentStats,
+  AgentTask,
+  EmitFn,
+  ImageInput,
+  ModelChoice,
+} from '../src/agents/types.js';
 import { Duo } from '../src/core.js';
 import { currentModel, modelLabel } from '../src/display.js';
+import { newSessionData, Recorder } from '../src/persist.js';
 import { startGui, type Gui } from '../src/gui/server.js';
 
 class FakeAgent implements Agent {
@@ -25,6 +37,8 @@ class FakeAgent implements Agent {
   disposed = 0;
   /** enquanto existir, o turno espera por ele */
   gate?: Promise<void>;
+  /** o que o turno manda para a tela antes da resposta (passos, o fim deles) */
+  events: AgentEvent[] = [];
   askPermission?: Agent['askPermission'];
   onTasks?: Agent['onTasks'];
   onSignal?: Agent['onSignal'];
@@ -50,6 +64,7 @@ class FakeAgent implements Agent {
     // parar derruba o turno que o gate segura, como o adaptador de verdade
     await Promise.race([this.gate, new Promise<never>((_, reject) => (this.stopTurn = reject))]);
     this.stopTurn = undefined;
+    for (const ev of this.events) emit(ev);
     const answer = `${this.name} responde ${this.prompts.length}`;
     emit({ kind: 'text', text: answer });
     return answer;
@@ -278,6 +293,74 @@ describe('janela: conversa', () => {
     expect(now.shared).toBe(false);
     events.close();
     again.close();
+  });
+
+  it('passos: a linha leva o texto inteiro e o fim dele; o fim que deu certo não conta como quem falou', async () => {
+    const { agents, port, cookie, post } = await setup();
+    agents.claude.events = [
+      { kind: 'tool', text: '$ ls', step: { id: 's0', full: '$ ls' } }, // o fim dele chega depois do Codex falar
+      { kind: 'tool', text: '$ npm test', step: { id: 's1', full: '$ npm test -- --run' } },
+      { kind: 'tool', text: '  ↳ saiu com código 1', result: { of: 's1', ok: false, exitCode: 1 } },
+    ];
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    await post('/api/submit', { text: 'oi' });
+    expect(await events.next('entry', (e) => e.step?.id === 's0')).toMatchObject({ kind: 'tool', label: true });
+    expect(await events.next('entry', (e) => e.step?.id === 's1')).toMatchObject({
+      kind: 'tool',
+      label: false,
+      step: { id: 's1', full: '$ npm test -- --run' },
+    });
+    expect(await events.next('entry', (e) => e.result?.of === 's1')).toMatchObject({
+      label: false,
+      result: { of: 's1', ok: false, exitCode: 1 },
+    });
+    await events.next('entry', (e) => e.text === 'Claude responde 1');
+    // o fim que deu certo não leva o nome, nem faz a linha seguinte de quem falava perder o dela
+    agents.codex.onOwnTurnEvent!({ kind: 'text', text: 'enquanto isso' });
+    agents.claude.onOwnTurnEvent!({ kind: 'tool', text: '  ↳ ok', result: { of: 's0', ok: true } });
+    agents.codex.onOwnTurnEvent!({ kind: 'text', text: 'continuo' });
+    expect(await events.next('entry', (e) => e.result?.of === 's0')).toMatchObject({ who: 'claude', label: false });
+    expect(await events.next('entry', (e) => e.text === 'continuo')).toMatchObject({ who: 'codex', label: false });
+    // quem abre a janela depois recebe o mesmo
+    const again = listen(port, cookie);
+    const snap = await again.next('snapshot');
+    expect(snap.entries.filter((e: any) => e.step || e.result).map((e: any) => e.step?.id ?? e.result.of)).toEqual(['s0', 's1', 's1', 's0']);
+    events.close();
+    again.close();
+  });
+
+  it('passos: o fim de um passo que você limpou da tela não aparece, nem fica com o nome de quem fala', async () => {
+    const agents = { claude: new FakeAgent('claude', 'Claude'), codex: new FakeAgent('codex', 'Codex') };
+    const duo = new Duo({ agents });
+    duo.start();
+    agents.claude.onOwnTurnEvent!({ kind: 'tool', text: '$ npm test', step: { id: 's1', full: '$ npm test' } });
+    await duo.submit('/limpar');
+    agents.claude.onOwnTurnEvent!({ kind: 'tool', text: '  ↳ saiu com código 1', result: { of: 's1', ok: false, exitCode: 1 } });
+    agents.claude.onOwnTurnEvent!({ kind: 'text', text: 'falhou um teste' });
+    expect(duo.getState().entries.map((e) => [e.text, e.label])).toEqual([['falhou um teste', true]]);
+  });
+
+  it('passos: na conversa retomada, o passo que o duo deixou aberto diz que não terminou', () => {
+    const data = newSessionData('/p');
+    data.screen.push({ who: 'claude', kind: 'tool', text: '$ npm test', label: true, step: { id: 's1', full: '$ npm test' } });
+    const agents = { claude: new FakeAgent('claude', 'Claude'), codex: new FakeAgent('codex', 'Codex') };
+    const duo = new Duo({ agents, recorder: new Recorder(data), resumed: true });
+    expect(duo.getState().entries.slice(0, 2)).toMatchObject([
+      { step: { id: 's1' } },
+      { who: 'claude', kind: 'tool', label: false, result: { of: 's1', ok: false, note: 'não terminou' } },
+    ]);
+    const plain = new Duo({ agents, recorder: new Recorder(newSessionData('/p')) }); // conversa nova: nada a fechar
+    expect(plain.getState().entries.some((e) => e.result)).toBe(false);
+    // o fim que deu certo, na última linha gravada, não conta como quem falou por último
+    const quiet = newSessionData('/p');
+    quiet.screen.push(
+      { who: 'sistema', kind: 'text', text: 'antes', label: true },
+      { who: 'claude', kind: 'tool', text: '  ↳ ok', label: false, result: { of: 's9', ok: true } },
+    );
+    const back = new Duo({ agents, recorder: new Recorder(quiet), resumed: true });
+    back.start();
+    expect(back.getState().entries[2]).toMatchObject({ who: 'sistema', text: expect.stringContaining('retomada'), label: false });
   });
 
   it('pedido de permissão: aparece na janela, a resposta vai pelo id e não vale duas vezes', async () => {

@@ -10,6 +10,7 @@ import {
   type Agent,
   type AgentCommand,
   type AgentId,
+  type AgentEvent,
   type AgentStats,
   type EmitFn,
 } from '../src/agents/types.js';
@@ -40,6 +41,8 @@ class FakeAgent implements Agent {
   delayMs = 0;
   /** roda no meio do turno, antes da resposta (ex.: chamar o outro pela ferramenta do duo) */
   during?: () => Promise<void>;
+  /** passos (e o fim deles) que o turno manda antes da resposta */
+  events: AgentEvent[] = [];
 
   constructor(
     readonly id: AgentId,
@@ -62,6 +65,7 @@ class FakeAgent implements Agent {
     const scripted = this.script.shift();
     if (scripted === '!erro') throw new Error('caiu');
     emit({ kind: 'tool', text: 'Bash ls' });
+    for (const ev of this.events) emit(ev);
     const answer = scripted ?? `${this.name} responde ${this.prompts.length}`;
     emit({ kind: 'text', text: answer });
     return answer;
@@ -115,6 +119,24 @@ describe('App', () => {
     expect(all).toContain('● Codex');
     expect(all).toContain('↳ Bash ls');
     expect(lastFrame()).toContain('/todos ›');
+  });
+
+  it('passos: o fim que deu certo não aparece; o que não deu, sim', async () => {
+    const { claude, codex } = fakes();
+    claude.events = [
+      { kind: 'tool', text: '$ npm test', step: { id: 's1', full: '$ npm test' } },
+      { kind: 'tool', text: '  ↳ ok', result: { of: 's1', ok: true } },
+      { kind: 'tool', text: '$ npm run build', step: { id: 's2', full: '$ npm run build' } },
+      { kind: 'tool', text: '  ↳ saiu com código 2', result: { of: 's2', ok: false, exitCode: 2 } },
+    ];
+    const { stdin, frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    await type(stdin, 'oi');
+    await waitFor(frames, 'Claude responde 1');
+    const all = frames.join('\n');
+    expect(all).toContain('↳ $ npm test');
+    expect(all).toContain('↳   ↳ saiu com código 2');
+    expect(all).not.toContain('↳ ok');
   });
 
   it('/privado desliga o compartilhamento', async () => {
