@@ -48,6 +48,8 @@
 //                   Control): o eco dela com um uuid que não é do duo, e um turno inteiro respondendo.
 //                   "APP DENTRO <texto>": o eco dela chega no meio deste turno, e a resposta é deste turno.
 //                   "APP ANTES <texto>": ele lê a dela antes desta, sem responder no meio: uma resposta para as duas.
+// "AVISO DENTRO <texto>" → um comando em segundo plano termina no meio do turno: o eco do aviso dele, com a origem
+//                   "task-notification" e um uuid que não é do duo, e a resposta <texto> deste turno.
 // "LONGO <comando>" → roda um Bash que demora 2s ("CURTO <comando>": 50ms): o tool_use, e no fim o tool_result.
 // control_request "interrupt" → como o 2.1.316 (medido em 03/11/2026): responde na hora {still_queued: []}, mesmo
 //                   sem turno. No meio do LONGO, do CHAMA (esperando a ferramenta do duo), do PEDE (esperando a
@@ -293,6 +295,24 @@ if (resume === 'sumiu') {
       return reply(`eco: ${text.slice(11)}`);
     }
     if (text.startsWith('APP ANTES ')) return reply(`eco: ${text.slice(10)}`);
+    if (text.startsWith('AVISO DENTRO ')) {
+      // como o 2.1.316 (medido em 04/11/2026): o comando em segundo plano termina no meio do turno; o eco do aviso
+      // chega com um uuid que não é do duo e a origem "task-notification", e a resposta é deste turno
+      out({ type: 'system', subtype: 'task_started', task_id: 'tarefa-aviso', task_type: 'local_bash', session_id: sid });
+      out({ type: 'system', subtype: 'task_notification', task_id: 'tarefa-aviso', status: 'completed', session_id: sid });
+      const notice = '<task-notification>\n<task-id>tarefa-aviso</task-id>\n<status>completed</status>\n</task-notification>';
+      replay &&
+        out({
+          type: 'user',
+          session_id: sid,
+          uuid: 'aviso-de-tarefa',
+          isReplay: true,
+          parent_tool_use_id: null,
+          origin: { kind: 'task-notification', producer: 'session-task' },
+          message: { role: 'user', content: notice },
+        });
+      return reply(`eco: ${text.slice(13)}`);
+    }
     if (text.startsWith('APP ')) {
       reply('eco: ok');
       setTimeout(() => {

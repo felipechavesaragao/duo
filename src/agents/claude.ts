@@ -157,6 +157,11 @@ interface Turn {
  * sessões dele): a resposta traz `session_url` e chegam `system/bridge_state` ready e connected. O que você
  * digita no app entra na fila como uma mensagem; o eco dela tem um uuid que não é nosso.
  *
+ * Aviso de tarefa (medido em 04/11/2026, 2.1.316): o comando em segundo plano que termina no meio de um turno manda o
+ * `system/task_notification` e, quando o CLI o lê, um eco de mensagem de usuário com um uuid que não é nosso, o texto
+ * `<task-notification>…` e `origin` {kind: "task-notification"} (a mensagem do duo não traz `origin`). O que termina
+ * com ele parado abre o turno dele sem eco nenhum.
+ *
  * Comandos (medido em 02/11/2026, 2.1.316): o `control_request` initialize responde na hora, antes de
  * qualquer mensagem, com `commands` [{name, description, argumentHint}]; `system/commands_changed` traz a
  * lista nova quando ela muda (plugins e MCP carregando). Um "/context" mandado puro roda como comando e a
@@ -500,8 +505,10 @@ export class ClaudeAgent implements Agent {
       }
       if (turn && msg.uuid === turn.uuid) {
         this.startTurn(run, turn);
-      } else if (this.opts.remoteControl && !msg.isSynthetic) {
-        // outra mensagem lida pelo CLI: só pode ter vindo do app, pelo Remote Control. Lida no meio de um turno do duo,
+      } else if (this.opts.remoteControl && !msg.isSynthetic && msg.origin?.kind !== 'task-notification') {
+        // o aviso de fim de tarefa que chega no meio de um turno também vem com eco (ver "Aviso de tarefa" acima): é do
+        // CLI, não seu, e o quadro de tarefas já o mostra pelo system/task_notification.
+        // Outra mensagem lida pelo CLI: só pode ter vindo do app, pelo Remote Control. Lida no meio de um turno do duo,
         // é dele; senão é do turno dele que está aberto ou do próximo (a não ser que o CLI leia a do duo antes de
         // responder: aí entrou no turno do duo, e o startTurn esquece)
         const text = userText(msg.message?.content);

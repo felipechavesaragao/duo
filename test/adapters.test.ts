@@ -545,6 +545,18 @@ describe('ClaudeAgent', () => {
     ]);
   });
 
+  it('Remote Control: o aviso de fim de tarefa que chega no meio do turno não vira mensagem sua pelo app', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude, remoteControl: true }));
+    const typed: string[] = [];
+    agent.onRemoteMessage = (text) => typed.push(text);
+    const texts: string[] = [];
+    expect(await agent.send('AVISO DENTRO feito', (ev) => texts.push(ev.text))).toBe('eco: feito');
+    expect(texts).toEqual(['eco: feito']);
+    // o que você digita no app continua chegando
+    expect(await agent.send('APP DENTRO do celular', noop)).toBe('eco: do celular');
+    expect(typed).toEqual(['do celular']);
+  });
+
   it('Remote Control: a lida antes da do duo, sem resposta no meio, não passa para o turno dele seguinte', async () => {
     const agent = track(new ClaudeAgent({ bin: fakeClaude, remoteControl: true }));
     const replies: [string, boolean | undefined][] = [];
