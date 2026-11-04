@@ -21,7 +21,8 @@ import {
   type ModelChoice,
 } from '../src/agents/types.js';
 import type { Ask, Entry } from '../src/core.js';
-import { COLORS, currentModel, footerText, modelLabel, NAMES } from '../src/display.js';
+import type { ChangedFile, WorktreeChanges } from '../src/changes.js';
+import { CHANGES_CAVEAT, COLORS, countText, currentModel, footerText, modelLabel, NAMES } from '../src/display.js';
 import type { Who } from '../src/persist.js';
 import type { ModelBody, PastedImage, ServerEvents, Snapshot, StopBody } from '../src/gui/protocol.js';
 import {
@@ -629,6 +630,7 @@ function EntryView({ entry }: { entry: Entry }) {
       </div>
     );
   }
+  if (entry.changes) return <ChangesCard changes={entry.changes} title={entry.text.split('\n')[0]} />;
   if (entry.who === 'sistema') {
     return (
       <div className={`entry system${entry.kind === 'error' ? ' error' : ''}`}>
@@ -676,6 +678,84 @@ function ToolGroup({ block }: { block: Extract<Block, { tools: StepRow[] }> }) {
         </>
       )}
     </div>
+  );
+}
+
+/** O que mudou num worktree no fim de um trabalho: cada arquivo com as linhas e, num clique, a diferença dele. */
+function ChangesCard({ changes, title }: { changes: WorktreeChanges; title: string }) {
+  return (
+    <section className="entry changes" aria-label="O que mudou">
+      <div className="changes-title">{title}</div>
+      {changes.files.length > 0 && (
+        <ul className="changes-files">
+          {changes.files.map((f) => (
+            <ChangedFileRow key={`${f.from ?? ''}>${f.path}`} file={f} />
+          ))}
+        </ul>
+      )}
+      {changes.more > 0 && (
+        <div className="changes-more">
+          e mais {changes.more} {changes.more === 1 ? 'arquivo' : 'arquivos'}
+        </div>
+      )}
+      <div className="changes-caveat">{CHANGES_CAVEAT}</div>
+    </section>
+  );
+}
+
+function ChangedFileRow({ file }: { file: ChangedFile }) {
+  const [open, setOpen] = useState(false);
+  const name = file.from ? `${file.from} → ${file.path}` : file.path;
+  const count = countText(file);
+  const line = (
+    <>
+      <span className={`changes-status ${file.status}`}>{file.status}</span>
+      <span className="changes-path">{name}</span>
+      {count && <span className="changes-count">{count}</span>}
+    </>
+  );
+  return (
+    <li>
+      {file.diff !== undefined ? (
+        <button className="changes-file" aria-expanded={open} title="Ver a diferença" onClick={() => setOpen((o) => !o)}>
+          {line}
+        </button>
+      ) : (
+        <div className="changes-file">
+          {line}
+          {file.cut && <span className="changes-count"> · diferença grande demais para mostrar aqui</span>}
+        </div>
+      )}
+      {open && file.diff !== undefined && <DiffView diff={file.diff} cut={file.cut === true} />}
+    </li>
+  );
+}
+
+/**
+ * A diferença de um arquivo, com o que entrou e o que saiu em cores. Sempre como texto. Até o primeiro @@ (depois de
+ * cada "diff --git") é cabeçalho: um "+++" ali é o nome do arquivo; depois, é uma linha que entrou começando com "++".
+ */
+function DiffView({ diff, cut }: { diff: string; cut: boolean }) {
+  let header = true;
+  const tone = (l: string): string | undefined => {
+    if (l.startsWith('diff --git ')) header = true;
+    else if (l.startsWith('@@')) {
+      header = false;
+      return 'hunk';
+    }
+    if (header) return 'meta';
+    return l.startsWith('+') ? 'add' : l.startsWith('-') ? 'del' : l.startsWith('\\') ? 'meta' : undefined;
+  };
+  return (
+    <pre className="diff">
+      {diff.split('\n').map((l, i) => (
+        <span key={i} className={tone(l)}>
+          {l}
+          {'\n'}
+        </span>
+      ))}
+      {cut && <span className="meta">… cortada aqui: o resto está no git</span>}
+    </pre>
   );
 }
 

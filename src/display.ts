@@ -1,7 +1,18 @@
 import type { AgentModel, AgentStats } from './agents/types.js';
+import type { ChangedFile } from './changes.js';
 import type { Who } from './persist.js';
 
 /** O que as duas telas (terminal e janela) mostram do mesmo jeito. Sem nada de Node: a janela também usa. */
+
+/** As linhas de um arquivo no "O que mudou": "+12 −3", "+40", "−7"; ou o motivo de não ter contagem. */
+export function countText(f: ChangedFile): string {
+  if (f.added === undefined || f.removed === undefined) return f.note ?? '';
+  // só renomeado, ou arquivo novo vazio: não há linha para contar
+  return [f.added > 0 ? `+${f.added}` : '', f.removed > 0 ? `−${f.removed}` : ''].filter(Boolean).join(' ');
+}
+
+/** O aviso que acompanha o "O que mudou". */
+export const CHANGES_CAVEAT = 'Mostra o que mudou, não que funciona, nem quem fez cada mudança.';
 
 /** 950, 12k, 1M, 1,5M */
 function shortCount(n: number): string {

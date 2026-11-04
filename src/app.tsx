@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Box, Static, Text, useApp, useInput, useStdout } from 'ink';
 import TextInput from 'ink-text-input';
 import { quietStep, truncate, type Agent, type AgentCommand, type AgentId } from './agents/types.js';
+import type { ChangeWatcher } from './changes.js';
 import { Duo, type Entry } from './core.js';
 import { COLORS, footerText, NAMES } from './display.js';
 import type { Recorder } from './persist.js';
@@ -17,14 +18,16 @@ export interface AppProps {
   recorder?: Recorder;
   /** true quando veio de `duo -c` */
   resumed?: boolean;
+  /** mede o que mudou no projeto no fim do trabalho de cada um */
+  changes?: ChangeWatcher;
 }
 
 /** A tela do terminal: mostra o estado do duo (core.ts) e manda para ele o que você digita. */
-export function App({ agents, recorder, resumed = false }: AppProps) {
+export function App({ agents, recorder, resumed = false, changes }: AppProps) {
   const { exit } = useApp();
   const { stdout } = useStdout();
   const duoRef = useRef<Duo | null>(null);
-  duoRef.current ??= new Duo({ agents, recorder, resumed });
+  duoRef.current ??= new Duo({ agents, recorder, resumed, changes });
   const duo = duoRef.current;
   const { entries, target, shared, busy, asks, stats, commands } = useSyncExternalStore(duo.subscribe, duo.getState);
 

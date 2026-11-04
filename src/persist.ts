@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { quietStep, STEP_UNFINISHED, stepEnd, type AgentId, type StepInfo, type StepResult } from './agents/types.js';
+import type { WorktreeChanges } from './changes.js';
 import type { Target } from './router.js';
 import { emptyLogState, type SharedLogState } from './shared.js';
 
@@ -21,6 +22,8 @@ export interface ScreenEntry {
   step?: StepInfo;
   /** a linha é o fim de um passo: a janela mostra no passo, o terminal só quando não deu certo */
   result?: StepResult;
+  /** a linha é o "O que mudou" de um worktree no fim de um trabalho: a janela mostra o quadro, o terminal o texto */
+  changes?: WorktreeChanges;
 }
 
 /**
@@ -162,8 +165,29 @@ const isScreenEntry = (e: any) =>
   typeof e.label === 'boolean' &&
   (e.images === undefined || (Array.isArray(e.images) && e.images.every((n: unknown) => typeof n === 'string'))) &&
   (e.step === undefined || (e.kind === 'tool' && isStep(e.step))) &&
-  (e.result === undefined || (e.kind === 'tool' && isStepResult(e.result)));
-const isStep = (s: any) => isObject(s) && typeof s.id === 'string' && typeof s.full === 'string';
+  (e.result === undefined || (e.kind === 'tool' && isStepResult(e.result))) &&
+  (e.changes === undefined || (e.who === 'sistema' && e.kind === 'text' && isWorktreeChanges(e.changes)));
+const COUNT = (v: unknown) => v === undefined || (Number.isInteger(v) && (v as number) >= 0);
+const isChangedFile = (f: any) =>
+  isObject(f) &&
+  typeof f.path === 'string' &&
+  ['novo', 'alterado', 'apagado', 'renomeado'].includes(f.status) &&
+  optional(f.from, 'string') &&
+  COUNT(f.added) &&
+  COUNT(f.removed) &&
+  optional(f.note, 'string') &&
+  optional(f.diff, 'string') &&
+  optional(f.cut, 'boolean');
+const isWorktreeChanges = (c: any) =>
+  isObject(c) &&
+  typeof c.root === 'string' &&
+  (c.branch === null || typeof c.branch === 'string') &&
+  typeof c.base === 'string' &&
+  Array.isArray(c.files) &&
+  c.files.every(isChangedFile) &&
+  Number.isInteger(c.more) &&
+  c.more >= 0;
+const isStep =(s: any) => isObject(s) && typeof s.id === 'string' && typeof s.full === 'string';
 const CHANGES = ['criado', 'alterado', 'apagado', 'movido'];
 const isFile = (f: any) => isObject(f) && typeof f.path === 'string' && CHANGES.includes(f.change);
 const isStepResult = (r: any) =>

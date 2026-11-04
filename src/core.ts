@@ -27,6 +27,7 @@ import {
   type Who,
 } from './persist.js';
 import { BRAIN_MAX, brainOpening, brainReview, brainVerdict, otherOf } from './brain.js';
+import { describeChanges, type ChangeWatcher, type Fingerprints } from './changes.js';
 import { currentModel, modelLabel } from './display.js';
 import { HELP_TEXT, parseInput, targetsOf, type Target } from './router.js';
 import { SharedLog } from './shared.js';
@@ -87,10 +88,15 @@ export interface DuoOptions {
   recorder?: Recorder;
   /** true quando veio de `duo -c` */
   resumed?: boolean;
+  /** mede o que mudou no projeto no fim do trabalho de cada um (o git da pasta); sem ele, o duo não mede nada */
+  changes?: ChangeWatcher;
 }
 
 /** De quanto em quanto tempo o último sinal é atualizado: chega coisa do processo o tempo todo. */
 const SIGNAL_STEP_MS = 1000;
+/** Até quanto o primeiro trabalho espera a primeira medida do "O que mudou" (o que ele editar antes dela entraria no
+ * "antes" sem quadro). Passou disso, ele começa assim mesmo. */
+const FIRST_MEASURE_WAIT_MS = 10_000;
 
 const YES = ['s', 'sim'];
 const NO = ['n', 'não', 'nao'];
@@ -149,11 +155,28 @@ export class Duo {
   /** quem responde cada pedido de permissão da fila */
   private readonly answers = new Map<number, (ok: boolean) => void>();
   private started = false;
+  private readonly watcher?: ChangeWatcher;
+  /**
+   * como cada worktree estava na última medida (ao abrir o duo, e no fim de cada trabalho); null = não se sabe (a
+   * primeira falhou): o próximo fim só mede, sem quadro
+   */
+  private known: Promise<Fingerprints | null> = Promise.resolve(null);
+  /** a primeira medida, enquanto não termina: o trabalho do duo espera por ela (até FIRST_MEASURE_WAIT_MS) */
+  private firstMeasure: Promise<void> | undefined;
+  /**
+   * a medida que valia quando cada um começou a rodar, e de qual conversa ele era: no fim, o que ficou diferente vira
+   * o "O que mudou" (se ainda for a mesma conversa)
+   */
+  private readonly watchFrom: Record<AgentId, { from: Promise<Fingerprints | null>; session: number } | undefined> = {
+    claude: undefined,
+    codex: undefined,
+  };
   private state: DuoState;
   private readonly listeners = new Set<(ev: DuoEvent) => void>();
 
-  constructor({ agents, recorder, resumed = false }: DuoOptions) {
+  constructor({ agents, recorder, resumed = false, changes }: DuoOptions) {
     this.agents = agents;
+    this.watcher = changes;
     this.rec = recorder ?? new Recorder(newSessionData(process.cwd()));
     this.resumed = resumed;
     this.log = new SharedLog(this.rec.data.log);
@@ -204,7 +227,12 @@ export class Duo {
     this.emit(ev);
   }
 
-  private add(who: Who, kind: Entry['kind'], text: string, extra: Pick<ScreenEntry, 'images' | 'step' | 'result'> = {}): void {
+  private add(
+    who: Who,
+    kind: Entry['kind'],
+    text: string,
+    extra: Pick<ScreenEntry, 'images' | 'step' | 'result' | 'changes'> = {},
+  ): void {
     // o fim de um passo que deu certo não aparece no terminal: não conta como quem falou por último
     const quiet = quietStep({ kind, ...extra });
     const label = !quiet && this.lastWho !== who;
@@ -213,6 +241,7 @@ export class Duo {
     if (extra.images?.length) entry.images = extra.images;
     if (extra.step) entry.step = extra.step;
     if (extra.result) entry.result = extra.result;
+    if (extra.changes) entry.changes = extra.changes;
     this.rec.data.screen.push(entry);
     this.rec.saveSoon();
     const shown = { ...entry, id: this.nextId++ };
@@ -262,11 +291,48 @@ export class Duo {
     else if (!value) stops.delete(part);
     if (stops.size === 0 && this.state.stopping[id]) this.update({ stopping: { ...this.state.stopping, [id]: false } });
     if (on === (this.state.runningSince[id] !== null)) return;
+    this.watchChanges(id, on);
     const now = Date.now();
     this.update({
       runningSince: { ...this.state.runningSince, [id]: on ? now : null },
       ...(on ? { lastSignal: { ...this.state.lastSignal, [id]: now } } : {}),
     });
+  }
+
+  /**
+   * Começou a rodar: fica com a última medida de cada worktree, na hora (medir agora correria com a primeira edição
+   * dele). Parou: mede de novo, e o que ficou diferente aparece na conversa, um quadro por worktree (o "O que mudou");
+   * essa medida vira a de quem começar depois. O git roda por fora, sem segurar o turno; sem git ou fora de um
+   * repositório, não aparece nada.
+   */
+  private watchChanges(id: AgentId, on: boolean): void {
+    if (!this.watcher) return;
+    if (on) {
+      this.watchFrom[id] = { from: this.known, session: this.session };
+      return;
+    }
+    const start = this.watchFrom[id];
+    this.watchFrom[id] = undefined;
+    if (!start) return;
+    const { from, session } = start;
+    const watcher = this.watcher;
+    // sem a medida de antes (a primeira falhou), não se sabe o que mudou: só mede, e esta passa a valer
+    const result = from.then((before) =>
+      before ? watcher.changedSince(before) : watcher.fingerprints().then((now) => ({ changes: [], now })),
+    );
+    this.known = result.then(
+      (r) => r.now,
+      () => from, // o git falhou (ou isto não é um repositório): continua valendo a medida anterior
+    );
+    void result.then(
+      ({ changes }) => {
+        if (this.session !== session) return; // houve /novo: o trabalho era da conversa anterior
+        for (const c of changes) {
+          this.add('sistema', 'text', describeChanges(c, this.agents[id].name, this.cwd), { changes: c });
+        }
+      },
+      () => undefined,
+    );
   }
 
   private signal(id: AgentId): void {
@@ -291,6 +357,20 @@ export class Duo {
     if (this.started) return;
     this.started = true;
     const { agents, rec } = this;
+    // a primeira medida: o que já estava mudado ao abrir não é de ninguém e não vira quadro
+    if (this.watcher) {
+      const first = this.watcher.fingerprints().catch(() => null);
+      this.known = first;
+      let timer: NodeJS.Timeout | undefined;
+      const waited = new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, FIRST_MEASURE_WAIT_MS);
+        timer.unref?.();
+      });
+      this.firstMeasure = Promise.race([first.then(() => undefined), waited]).finally(() => {
+        clearTimeout(timer);
+        this.firstMeasure = undefined;
+      });
+    }
     rec.onError = (msg) => this.add('sistema', 'error', `não consegui salvar a conversa: ${msg}`);
     // Os ids das conversas são gravados assim que aparecem.
     agents.claude.onSessionId = (id) => {
@@ -463,6 +543,8 @@ export class Duo {
     const cut = () => this.cut[id] !== cutAt; // você parou ele: o turno (rodando ou na fila) não segue
     this.setBusy(id, +1);
     return this.queues[id](async (): Promise<string | null> => {
+      // o primeiro trabalho não começa antes da primeira medida: o que ele editasse nesse meio entraria no "antes"
+      if (this.firstMeasure) await this.firstMeasure;
       for (let attempt = 0; ; attempt++) {
         if (stale() || cut()) return null;
         const prepared = myLog.prepare(id, text, sharedTurn, msgIndex, call?.from);

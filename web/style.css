@@ -1216,3 +1216,113 @@ textarea::placeholder {
     padding-left: 16px;
   }
 }
+
+/* o "O que mudou": um quadro por worktree no fim de um trabalho */
+.entry.changes {
+  margin: 14px 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: var(--side);
+}
+
+.changes-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+  overflow-wrap: anywhere;
+}
+
+.changes-files {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.changes-file {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  width: 100%;
+  padding: 3px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+}
+
+button.changes-file {
+  cursor: pointer;
+}
+
+button.changes-file:hover {
+  background: var(--hover);
+}
+
+.changes-status {
+  flex: none;
+  width: 72px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.changes-status.novo {
+  color: var(--ok);
+}
+
+.changes-status.apagado {
+  color: var(--error);
+}
+
+.changes-path {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.changes-count,
+.changes-more,
+.changes-caveat {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.changes-count {
+  margin-left: auto;
+  flex: none;
+}
+
+.changes-more {
+  padding: 3px 4px;
+}
+
+.changes-caveat {
+  margin-top: 6px;
+}
+
+.diff {
+  margin: 2px 0 8px;
+  max-height: 420px;
+  overflow: auto;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--fg);
+}
+
+.diff .add {
+  color: var(--ok);
+}
+
+.diff .del {
+  color: var(--error);
+}
+
+.diff .hunk,
+.diff .meta {
+  color: var(--muted);
+}

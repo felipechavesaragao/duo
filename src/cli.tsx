@@ -5,6 +5,7 @@ import { parseArgs } from 'node:util';
 import { App } from './app.js';
 import { ClaudeAgent } from './agents/claude.js';
 import { CodexAgent } from './agents/codex.js';
+import { gitChanges } from './changes.js';
 import { remoteControlAtStartup } from './claudeSettings.js';
 import { Duo } from './core.js';
 import { openWindow } from './gui/open.js';
@@ -105,7 +106,7 @@ if (values.gui) {
   // vai pelo próprio /sair, e ela fica sabendo que o duo acabou (senão fica tentando religar). O segundo sai na hora.
   let ctrlC: () => void = () => process.exit(0);
   process.on('SIGINT', () => ctrlC());
-  const duo = new Duo({ agents, recorder, resumed });
+  const duo = new Duo({ agents, recorder, resumed, changes: gitChanges(cwd) });
   const gui = await startGui(duo, { imagesDir: store.imagesDir }).catch((err: Error) => {
     console.error(err.message);
     process.exit(1);
@@ -123,7 +124,7 @@ if (values.gui) {
   await quit;
   await gui.close();
 } else {
-  const app = render(<App agents={agents} recorder={recorder} resumed={resumed} />);
+  const app = render(<App agents={agents} recorder={recorder} resumed={resumed} changes={gitChanges(cwd)} />);
   await app.waitUntilExit();
 }
 process.exit(0);
