@@ -1,5 +1,45 @@
 import { describe, expect, it } from 'vitest';
-import { agentCommandQuery, ALIASES, COMMAND_NAMES, COMMANDS, matchCommands, parseInput } from '../src/router.js';
+import {
+  agentCommandQuery,
+  ALIASES,
+  COMMAND_NAMES,
+  COMMANDS,
+  DUO_COMMANDS,
+  duoCommandQuery,
+  matchCommands,
+  matchDuoCommands,
+  parseInput,
+} from '../src/router.js';
+
+describe('lista de comandos do duo ("/" na janela)', () => {
+  it('aparece enquanto você digita só o nome: "/" e "/li"; some com espaço, quebra de linha ou outra barra', () => {
+    expect(duoCommandQuery('/')).toBe('');
+    expect(duoCommandQuery('/Li')).toBe('li');
+    expect(duoCommandQuery('/cla oi')).toBeNull();
+    expect(duoCommandQuery('/cla ')).toBeNull(); // o nome já foi escolhido
+    expect(duoCommandQuery('/a\nb')).toBeNull();
+    expect(duoCommandQuery('/fog /rev')).toBeNull(); // essa é a lista do Codex
+    expect(duoCommandQuery('@cla /')).toBeNull();
+    expect(duoCommandQuery('oi /')).toBeNull();
+  });
+
+  it('"/" sozinho mostra todos; o filtro vale para qualquer nome e mostra o que bateu', () => {
+    expect(matchDuoCommands('').map((c) => c.name)).toEqual(DUO_COMMANDS.map((c) => c.name));
+    expect(matchDuoCommands('li').map((c) => c.name)).toEqual(['limpar']);
+    expect(matchDuoCommands('cod').map((c) => c.name)).toEqual(['codex']);
+    expect(matchDuoCommands('c').map((c) => c.name)).toEqual(['cla', 'codex', 'compartilhado', 'clear']);
+    expect(matchDuoCommands('ar').map((c) => c.name)).toEqual(['parar', 'compartilhado', 'limpar']); // só contêm
+    expect(matchDuoCommands('zz')).toEqual([]);
+  });
+
+  it('⛔ a lista tem todo nome que o duo aceita, e só eles; cada outro nome faz o mesmo que o da linha', () => {
+    const listed = DUO_COMMANDS.flatMap((c) => [c.name, ...c.also]);
+    expect([...listed].sort()).toEqual([...Object.keys(ALIASES), ...COMMAND_NAMES].sort());
+    for (const c of DUO_COMMANDS) {
+      for (const other of c.also) expect(parseInput(`/${other}`, 'claude')).toEqual(parseInput(`/${c.name}`, 'claude'));
+    }
+  });
+});
 
 describe('lista de comandos de cada agente', () => {
   it('reconhece "@cla /..." e "/fog /..." enquanto você digita', () => {

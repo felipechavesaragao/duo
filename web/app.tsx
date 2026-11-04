@@ -24,7 +24,15 @@ import type { Ask, Entry } from '../src/core.js';
 import { COLORS, currentModel, footerText, modelLabel, NAMES } from '../src/display.js';
 import type { Who } from '../src/persist.js';
 import type { ModelBody, PastedImage, ServerEvents, Snapshot, StopBody } from '../src/gui/protocol.js';
-import { agentCommandQuery, matchCommands, targetsOf, type Target } from '../src/router.js';
+import {
+  agentCommandQuery,
+  DUO_COMMANDS,
+  duoCommandQuery,
+  matchCommands,
+  matchDuoCommands,
+  targetsOf,
+  type Target,
+} from '../src/router.js';
 import { blocksOf, stepStatus, type Block, type StepRow } from './blocks.js';
 
 /**
@@ -814,12 +822,18 @@ function Composer(props: {
   const close = useMemo(() => () => setMenu(null), []);
   useOutside(boxRef, menu !== null, close);
 
-  // "@cla /co": a lista de comandos de quem você chamou, filtrada pelo que já digitou
+  // "@cla /co": a lista de comandos de quem você chamou, filtrada pelo que já digitou;
+  // "/" ou "/li", sem mais nada: a lista dos comandos do próprio duo
   const query = agentCommandQuery(text);
-  const matches = query ? matchCommands(snap.commands[query.target], query.query) : [];
+  const duoQuery = query ? null : duoCommandQuery(text);
+  const matches = query
+    ? matchCommands(snap.commands[query.target], query.query)
+    : duoQuery !== null
+      ? matchDuoCommands(duoQuery)
+      : [];
   const complete = (name: string) => {
-    if (!query) return;
-    prefill(`${query.head}/${name} `);
+    if (query) prefill(`${query.head}/${name} `);
+    else if (duoQuery !== null) prefill(`/${name} `);
   };
 
   // a caixa cresce com o texto, até um limite
@@ -888,7 +902,7 @@ function Composer(props: {
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Tab' && query && matches[0]) {
+    if (e.key === 'Tab' && matches[0]) {
       e.preventDefault();
       complete(matches[0].name);
     } else if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -910,6 +924,16 @@ function Composer(props: {
           name={snap.names[query.target]}
           color={COLORS[query.target]}
           total={snap.commands[query.target].length}
+          matches={matches}
+          onPick={complete}
+        />
+      )}
+      {duoQuery !== null && (
+        <CommandList
+          name="duo"
+          color="var(--fg)"
+          total={DUO_COMMANDS.length}
+          all
           matches={matches}
           onPick={complete}
         />
@@ -1122,15 +1146,18 @@ function CommandList(props: {
   name: string;
   color: string;
   total: number;
+  /** mostra todos, sem o "+N" (os do duo são poucos e cabem) */
+  all?: boolean;
   matches: AgentCommand[];
   onPick: (name: string) => void;
 }) {
-  const { name, color, total, matches, onPick } = props;
+  const { name, color, total, all = false, matches, onPick } = props;
   if (total === 0) return <div className="menu cmds empty">os comandos do {name} ainda não carregaram</div>;
   if (matches.length === 0) return <div className="menu cmds empty">nenhum comando do {name} com esse nome</div>;
-  const shown = matches.slice(0, LIST_MAX);
+  const max = all ? matches.length : LIST_MAX;
+  const shown = matches.slice(0, max);
   return (
-    <div className="menu cmds" style={tint(color)}>
+    <div className={`menu cmds${all ? ' all' : ''}`} style={tint(color)}>
       {shown.map((c, i) => (
         <button
           key={c.name}
@@ -1144,7 +1171,7 @@ function CommandList(props: {
         </button>
       ))}
       <div className="cmds-hint">
-        {matches.length > LIST_MAX ? `+${matches.length - LIST_MAX} · ` : ''}Tab completa /{shown[0].name}
+        {matches.length > max ? `+${matches.length - max} · ` : ''}Tab completa /{shown[0].name}
       </div>
     </div>
   );

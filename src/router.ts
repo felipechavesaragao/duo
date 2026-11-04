@@ -113,6 +113,47 @@ export function matchCommands(commands: AgentCommand[], query: string): AgentCom
   return [...starts, ...contains];
 }
 
+/**
+ * Os comandos do duo para a lista que aparece quando você digita "/" na janela: um por linha, com os outros nomes
+ * que também valem. ⛔ Todo nome de ALIASES e COMMAND_NAMES tem de estar aqui, e só eles (o teste do roteador cobra).
+ */
+export const DUO_COMMANDS: { name: string; also: string[]; description: string }[] = [
+  { name: 'cla', also: ['claude', 'c'], description: 'manda só para o Claude; sozinho, vira o destino padrão' },
+  { name: 'fog', also: ['codex', 'x'], description: 'manda só para o Codex; sozinho, vira o destino padrão' },
+  { name: 'todos', also: ['ambos', 'all'], description: 'manda para os dois; sozinho, vira o destino padrão' },
+  { name: 'brain', also: [], description: '/brain /cla <msg>: um responde, o outro avalia, até concordarem' },
+  { name: 'parar', also: [], description: 'encerra o brain depois da resposta em andamento' },
+  { name: 'compartilhado', also: ['compartilhar'], description: 'cada um vê o que você e o outro disseram' },
+  { name: 'privado', also: [], description: 'só quem recebe vê; o outro não fica sabendo nem depois' },
+  { name: 'novo', also: ['new'], description: 'começa conversas novas com os dois' },
+  { name: 'limpar', also: ['clear'], description: 'limpa a tela' },
+  { name: 'ajuda', also: ['help'], description: 'mostra o que cada comando faz' },
+  { name: 'sair', also: ['quit', 'exit'], description: 'encerra o duo' },
+];
+
+/** Você está digitando um comando do duo ("/", "/li"): o que já digitou do nome. null = não é isso. */
+export function duoCommandQuery(input: string): string | null {
+  const m = input.match(/^\/([\p{L}\p{N}_-]*)$/u);
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
+ * Os comandos do duo que batem com o que você digitou, por qualquer um dos nomes: os que começam com ele primeiro,
+ * depois os que o contêm. Cada um aparece pelo nome que bateu, que é o que o Tab completa ("/cod" → /codex).
+ */
+export function matchDuoCommands(query: string): AgentCommand[] {
+  const starts: AgentCommand[] = [];
+  const contains: AgentCommand[] = [];
+  for (const { name, also, description } of DUO_COMMANDS) {
+    const names = [name, ...also];
+    const start = names.find((n) => n.startsWith(query));
+    const inside = names.find((n) => n.includes(query));
+    if (start !== undefined) starts.push({ name: start, description });
+    else if (inside !== undefined) contains.push({ name: inside, description });
+  }
+  return [...starts, ...contains];
+}
+
 export const HELP_TEXT = [
   '/claude <msg>     manda só para o Claude      (atalhos: /c, /cla)',
   '/codex <msg>      manda só para o Codex       (atalhos: /x, /fog)',

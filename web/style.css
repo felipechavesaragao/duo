@@ -897,6 +897,11 @@ textarea::placeholder {
   overflow-y: auto;
 }
 
+/* a lista do "/" (os comandos do duo): cabe inteira, a não ser que a janela seja baixa */
+.cmds.all {
+  max-height: min(440px, 70vh);
+}
+
 .cmds.empty {
   color: var(--muted);
   font-size: 13px;
