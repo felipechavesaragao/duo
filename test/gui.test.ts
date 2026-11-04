@@ -383,6 +383,58 @@ describe('janela: conversa', () => {
     events.close();
   });
 
+  it('pergunta com opções: chega na janela com as perguntas, e só respostas para todas e nenhuma a mais valem', async () => {
+    const { agents, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    const questions = [
+      { question: 'Qual cor?', options: [{ label: 'azul' }, { label: 'verde' }] },
+      { question: 'Quais sabores?', options: [{ label: 'uva' }], multiSelect: true },
+    ];
+    const asked = agents.claude.askPermission!({ text: 'AskUserQuestion …', signal: new AbortController().signal, questions });
+    const ask = (await events.next('status', (s) => s.asks.length === 1)).asks[0];
+    expect(ask.questions).toEqual(questions);
+
+    const answer = async (body: object) => JSON.parse((await post('/api/answer', { id: ask.id, ...body })).body);
+    const refused = async (answers?: unknown) => {
+      const res = await post('/api/answer', { id: ask.id, ok: true, ...(answers === undefined ? {} : { answers }) });
+      return [res.status, res.body];
+    };
+    const invalid = [400, 'as respostas não servem às perguntas: responda cada uma'];
+    expect(await refused()).toEqual(invalid); // responder sem as respostas
+    expect(await refused({ 'Qual cor?': 'azul' })).toEqual(invalid); // faltou uma
+    expect(await refused({ 'Qual cor?': 'azul', 'Quais sabores?': '  ' })).toEqual(invalid);
+    expect(await refused({ 'Qual cor?': 'azul', 'Quais sabores?': 'uva', 'Outra?': 'x' })).toEqual(invalid);
+    expect((await refused({ 'Qual cor?': 1 }))[0]).toBe(400);
+    expect((await refused(['azul']))[0]).toBe(400);
+    // nada disso respondeu: o pedido continua esperando
+    let settled = false;
+    void asked.then(() => (settled = true));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(settled).toBe(false);
+    expect(await answer({ ok: true, answers: { 'Qual cor?': ' roxo ', 'Quais sabores?': 'uva' } })).toEqual({ ok: true });
+    await expect(asked).resolves.toEqual({ answers: { 'Qual cor?': 'roxo', 'Quais sabores?': 'uva' } });
+    await events.next('entry', (e) => e.text === 'você respondeu: Qual cor? → roxo · Quais sabores? → uva');
+    // respondido (aqui ou no terminal): a segunda resposta não decide nada, e não é "pedido inválido"
+    expect(await answer({ ok: true, answers: { 'Qual cor?': 'azul', 'Quais sabores?': 'uva' } })).toEqual({ ok: false });
+    events.close();
+  });
+
+  it('não responder uma pergunta: o agente recebe não, e a conversa diz que você não quis', async () => {
+    const { agents, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    const questions = [{ question: 'Qual cor?', options: [{ label: 'azul' }] }];
+    const asked = agents.claude.askPermission!({ text: 'AskUserQuestion Qual cor?', signal: new AbortController().signal, questions });
+    const ask = (await events.next('status', (s) => s.asks.length === 1)).asks[0];
+    expect(JSON.parse((await post('/api/answer', { id: ask.id, ok: false, answers: { 'Qual cor?': 'azul' } })).body)).toEqual({
+      ok: true,
+    });
+    await expect(asked).resolves.toBe(false);
+    await events.next('entry', (e) => e.text === 'você não quis responder: AskUserQuestion Qual cor?');
+    events.close();
+  });
+
   it('a janela sabe quando tem brain rodando (o botão de parar aparece e some)', async () => {
     const { port, cookie, post } = await setup();
     const events = listen(port, cookie);

@@ -15,6 +15,8 @@ import {
   type EmitFn,
   type ImageInput,
   type ModelChoice,
+  type AskQuestion,
+  type PermissionAnswer,
 } from './agents/types.js';
 import {
   closeOpenSteps,
@@ -46,6 +48,8 @@ export interface Ask {
   id: number;
   who: AgentId;
   text: string;
+  /** é uma pergunta com opções: as perguntas, para você responder (em vez de permitir ou negar) */
+  questions?: AskQuestion[];
 }
 
 export interface DuoState {
@@ -101,6 +105,58 @@ const FIRST_MEASURE_WAIT_MS = 10_000;
 const YES = ['s', 'sim'];
 const NO = ['n', 'não', 'nao'];
 
+/** As respostas que servem a estas perguntas: um texto não vazio para cada uma, e nenhuma a mais. null = não servem. */
+export function cleanAnswers(questions: AskQuestion[], answers: unknown): Record<string, string> | null {
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) return null;
+  const given = answers as Record<string, unknown>;
+  // as perguntas têm textos diferentes (o adaptador recusa repetidas): mesma quantidade e todas presentes = nenhuma a mais
+  if (Object.keys(given).length !== questions.length) return null;
+  const out: [string, string][] = [];
+  for (const q of questions) {
+    const a = Object.prototype.hasOwnProperty.call(given, q.question) ? given[q.question] : undefined;
+    if (typeof a !== 'string' || !a.trim()) return null;
+    out.push([q.question, a.trim()]);
+  }
+  return Object.fromEntries(out);
+}
+
+/**
+ * O que você digitou no terminal para as perguntas. Para cada uma: o nome de uma opção, o número dela, ou um texto seu;
+ * na que deixa escolher mais de uma, vários separados por vírgula (números, nomes e texto seu juntos). Mais de uma
+ * pergunta: as respostas separadas por ";". O nome vem antes do número (uma opção pode se chamar "2026"), e um número
+ * que não é de nenhuma opção não vale, em vez de virar texto: para responder com um número seu, escreva-o com texto.
+ * null = não deu para tirar uma resposta para cada uma.
+ */
+export function answersFromText(questions: AskQuestion[], value: string): Record<string, string> | null {
+  const parts = questions.length === 1 ? [value] : value.split(';');
+  if (parts.length !== questions.length) return null;
+  /** uma escolha: o nome da opção, o número dela, ou o texto como veio; null = um número que não é de nenhuma */
+  const one = (q: AskQuestion, text: string): string | null => {
+    const named = q.options.find((o) => o.label.trim().toLowerCase() === text.toLowerCase());
+    if (named) return named.label;
+    if (!/^[+-]?\d+$/.test(text)) return text;
+    return q.options[Number(text) - 1]?.label ?? null;
+  };
+  const pick = (q: AskQuestion, raw: string): string | null => {
+    const text = raw.trim();
+    // sem opções, não há o que escolher: o texto vai como veio, vírgulas inclusive, mesmo na de várias escolhas
+    if (q.options.length === 0) return text;
+    if (!q.multiSelect) return one(q, text);
+    // o nome inteiro de uma opção pode ter vírgula
+    const whole = q.options.find((o) => o.label.trim().toLowerCase() === text.toLowerCase());
+    if (whole) return whole.label;
+    const picked = text
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => one(q, s));
+    return picked.includes(null) ? null : [...new Set(picked)].join(', ');
+  };
+  const picked = questions.map((q, i) => [q.question, pick(q, parts[i])] as const);
+  if (picked.some(([, a]) => a === null)) return null;
+  return cleanAnswers(questions, Object.fromEntries(picked));
+}
+
 function newTurn(data: SessionData, agent: AgentId, text: string): number {
   const id = data.nextTurn++;
   data.turns.push({ id, agent, text, status: 'pending' });
@@ -153,7 +209,7 @@ export class Duo {
   /** O brain em andamento (só um por vez). `stop` = /parar: encerra depois da resposta em andamento. */
   private brain: { stop: boolean } | null = null;
   /** quem responde cada pedido de permissão da fila */
-  private readonly answers = new Map<number, (ok: boolean) => void>();
+  private readonly answers = new Map<number, (reply: PermissionAnswer) => void>();
   private started = false;
   private readonly watcher?: ChangeWatcher;
   /**
@@ -419,22 +475,22 @@ export class Duo {
         rec.saveSoon();
       };
       agent.onNotice = (ev) => this.add('sistema', ev.kind, ev.text);
-      agent.askPermission = ({ text, signal }) =>
-        new Promise<boolean>((resolve) => {
-          const ask: Ask = { id: this.nextAsk++, who: agent.id, text };
+      agent.askPermission = ({ text, signal, questions }) =>
+        new Promise<PermissionAnswer>((resolve) => {
+          const ask: Ask = { id: this.nextAsk++, who: agent.id, text, ...(questions ? { questions } : {}) };
           const drop = () => {
             this.answers.delete(ask.id);
             this.update({ asks: this.state.asks.filter((a) => a !== ask) });
           };
           const cancel = () => {
             drop();
-            this.add(agent.id, 'error', `pedido de permissão cancelado: ${truncate(text)}`);
+            this.add(agent.id, 'error', `${questions ? 'pergunta cancelada' : 'pedido de permissão cancelado'}: ${truncate(text)}`);
             resolve(false);
           };
-          this.answers.set(ask.id, (ok) => {
+          this.answers.set(ask.id, (reply) => {
             signal.removeEventListener('abort', cancel);
             drop();
-            resolve(ok);
+            resolve(reply);
           });
           signal.addEventListener('abort', cancel, { once: true });
           this.update({ asks: [...this.state.asks, ask] });
@@ -850,21 +906,60 @@ export class Duo {
     }
   }
 
-  /** Responde a um pedido da fila. false = ele já não espera (respondido em outra tela, ou cancelado). */
-  answer(askId: number, ok: boolean): boolean {
+  /**
+   * Responde a um pedido da fila. Numa pergunta com opções, ok = responder (com `answers`) e não = não quis responder.
+   * false = não valeu: ele já não espera (respondido em outra tela, ou cancelado), ou as respostas não servem às perguntas.
+   */
+  answer(askId: number, ok: boolean, answers?: unknown): boolean {
     const ask = this.state.asks.find((a) => a.id === askId);
     const reply = this.answers.get(askId);
     if (!ask || !reply) return false;
-    this.add(ask.who, ok ? 'tool' : 'error', `${ok ? 'você permitiu' : 'você negou'}: ${truncate(ask.text)}`);
+    if (ask.questions && ok) {
+      const clean = cleanAnswers(ask.questions, answers);
+      if (!clean) return false;
+      // inteira, sem corte: é o registro do que você respondeu (fica na conversa gravada)
+      const said = ask.questions.map((q) => `${q.question} → ${clean[q.question]}`).join(' · ');
+      this.add(ask.who, 'tool', `você respondeu: ${said}`);
+      reply({ answers: clean });
+      return true;
+    }
+    const what = ask.questions ? 'você não quis responder' : ok ? 'você permitiu' : 'você negou';
+    this.add(ask.who, ok ? 'tool' : 'error', `${what}: ${truncate(ask.text)}`);
     reply(ok);
     return true;
   }
 
-  /** Responde ao pedido da vez pelo que você digitou. Só s ou n: qualquer outra coisa não decide nada e ele pergunta de novo. */
+  /**
+   * Responde ao pedido da vez pelo que você digitou. Permissão: só s ou n. Pergunta: o número da opção, o nome dela ou
+   * um texto seu (e n para não responder). O que não decide nada não vale, e ele pergunta de novo.
+   */
   answerText(value: string): void {
     const ask = this.state.asks[0];
     if (!ask) return;
     const reply = value.trim().toLowerCase();
+    if (ask.questions) {
+      const [only] = ask.questions;
+      // "n" responde quando é o nome de uma opção: numa pergunta de sim ou não, "Não" é uma resposta
+      const isOption = ask.questions.length === 1 && only.options.some((o) => o.label.trim().toLowerCase() === reply);
+      if (NO.includes(reply) && !isOption) {
+        this.answer(ask.id, false);
+        return;
+      }
+      const answers = answersFromText(ask.questions, value);
+      if (!answers) {
+        const how = 'o número da opção, o nome dela ou um texto seu';
+        this.add(
+          'sistema',
+          'error',
+          ask.questions.length > 1
+            ? `responda as ${ask.questions.length} perguntas separadas por ";" (${how}), ou n para não responder.`
+            : `responda com ${how}, ou n para não responder.`,
+        );
+        return;
+      }
+      this.answer(ask.id, true, answers);
+      return;
+    }
     const ok = YES.includes(reply) ? true : NO.includes(reply) ? false : null;
     if (ok === null) {
       this.add('sistema', 'error', 'responda s para permitir ou n para negar.');

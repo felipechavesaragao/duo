@@ -58,13 +58,31 @@ export function quietStep(entry: { kind: string; step?: StepInfo; result?: StepR
 
 export type EmitFn = (event: AgentEvent) => void;
 
+/** Uma pergunta com opções que o agente faz a você (a ferramenta AskUserQuestion do Claude). */
+export interface AskQuestion {
+  question: string;
+  /** o rótulo curto dela ("Cor") */
+  header?: string;
+  options: { label: string; description?: string }[];
+  /** dá para escolher mais de uma */
+  multiSelect?: boolean;
+}
+
 /** A pergunta que o terminal do CLI faria (regra "ask" do settings, modo default...). */
 export interface PermissionRequest {
   /** o que ele quer fazer, inteiro: "Bash git push origin master" */
   text: string;
   /** dispara quando o pedido deixa de valer (o processo caiu, o CLI desistiu): ninguém espera mais a resposta */
   signal: AbortSignal;
+  /** quando o pedido é uma pergunta com opções: as perguntas, para você ver e responder */
+  questions?: AskQuestion[];
 }
+
+/**
+ * A resposta a um pedido: permitiu (true) ou negou (false). Numa pergunta com opções, o que você respondeu a cada
+ * uma, pelo texto da pergunta ("Qual cor?" → "Verde"; mais de uma escolha vai junta, separada por vírgula).
+ */
+export type PermissionAnswer = boolean | { answers: Record<string, string> };
 
 /** Um agente chamando o outro pela ferramenta do duo. */
 export interface PeerRequest {
@@ -187,7 +205,7 @@ export interface Agent {
   /** chamado assim que o id da conversa aparece ou muda: o duo grava na hora */
   onSessionId?: (id: string) => void;
   /** pergunta a você se ele pode fazer algo; resolve true = permitido. Sem ele, o pedido é negado. */
-  askPermission?: (req: PermissionRequest) => Promise<boolean>;
+  askPermission?: (req: PermissionRequest) => Promise<PermissionAnswer>;
   /** fala com o outro agente da janela; resolve com a resposta dele. Sem ele, o agente não ganha a ferramenta. */
   askPeer?: (req: PeerRequest) => Promise<string>;
   /**

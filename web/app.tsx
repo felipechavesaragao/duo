@@ -18,6 +18,7 @@ import {
   type AgentStats,
   type AgentTask,
   type AgentTool,
+  type AskQuestion,
   type ModelChoice,
 } from '../src/agents/types.js';
 import type { Ask, Entry } from '../src/core.js';
@@ -205,7 +206,10 @@ export function App() {
   const send = (value: string, images: PastedImage[] = []) =>
     run('/api/submit', images.length ? { text: value, images } : { text: value });
   const command = (cmd: string) => void send(cmd).catch(() => undefined);
-  const answer = (ask: Ask, ok: boolean) => void run('/api/answer', { id: ask.id, ok }).catch(() => undefined);
+  // respostas que não servem voltam como erro (aparece aqui); { ok: false } é só "já respondido ou cancelado", e o
+  // cartão sai sozinho
+  const answer = (ask: Ask, ok: boolean, answers?: Record<string, string>) =>
+    void run('/api/answer', answers ? { id: ask.id, ok, answers } : { id: ask.id, ok }).catch(() => undefined);
   const setModel = (agent: AgentId, choice: ModelChoice) =>
     void run('/api/modelo', { agent, ...choice } satisfies ModelBody).catch(() => undefined);
   const stop = (agent: AgentId) => void run('/api/parar', { agent } satisfies StopBody).catch(() => undefined);
@@ -266,11 +270,13 @@ export function App() {
         <footer className="dock">
           {snap.asks[0] && (
             <AskCard
+              // o que você marcou valia para o pedido da vez: o próximo começa em branco
+              key={snap.asks[0].id}
               ask={snap.asks[0]}
               more={snap.asks.length - 1}
               name={snap.names[snap.asks[0].who]}
               disabled={!live}
-              onAnswer={(ok) => answer(snap.asks[0], ok)}
+              onAnswer={(ok, answers) => answer(snap.asks[0], ok, answers)}
             />
           )}
           {error && <div className="send-error">{error}</div>}
@@ -843,8 +849,17 @@ function Inline({ text }: { text: string }) {
 
 /* pedido de permissão, caixa de texto */
 
-function AskCard(props: { ask: Ask; more: number; name: string; disabled: boolean; onAnswer: (ok: boolean) => void }) {
+type AskProps = {
+  ask: Ask;
+  more: number;
+  name: string;
+  disabled: boolean;
+  onAnswer: (ok: boolean, answers?: Record<string, string>) => void;
+};
+
+function AskCard(props: AskProps) {
   const { ask, more, name, disabled, onAnswer } = props;
+  if (ask.questions) return <QuestionCard {...props} questions={ask.questions} />;
   return (
     <div className="ask" style={tint(COLORS[ask.who])}>
       <div className="ask-title">
@@ -858,6 +873,84 @@ function AskCard(props: { ask: Ask; more: number; name: string; disabled: boolea
         </button>
         <button className="allow" disabled={disabled} onClick={() => onAnswer(true)}>
           Permitir
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Uma pergunta com opções (a ferramenta de perguntar do agente): você escolhe uma opção, ou mais quando a pergunta
+ * deixa, ou escreve a sua. A resposta volta para ele como se você tivesse respondido no terminal dele.
+ */
+function QuestionCard(props: AskProps & { questions: AskQuestion[] }) {
+  const { ask, more, name, disabled, onAnswer, questions } = props;
+  const [picked, setPicked] = useState<string[][]>(() => questions.map(() => []));
+  const [other, setOther] = useState<string[]>(() => questions.map(() => ''));
+  const replies = questions.map((_, i) => [...picked[i], other[i].trim()].filter(Boolean).join(', '));
+  const ready = replies.every(Boolean);
+  const at = <T,>(list: T[], i: number, value: T) => list.map((v, j) => (j === i ? value : v));
+  const choose = (i: number, label: string) => {
+    if (questions[i].multiSelect) {
+      setPicked(at(picked, i, picked[i].includes(label) ? picked[i].filter((l) => l !== label) : [...picked[i], label]));
+    } else {
+      // uma só: a opção troca a escolha e apaga o texto seu
+      setPicked(at(picked, i, [label]));
+      setOther(at(other, i, ''));
+    }
+  };
+  const write = (i: number, value: string) => {
+    setOther(at(other, i, value));
+    if (!questions[i].multiSelect && value.trim()) setPicked(at(picked, i, []));
+  };
+  const send = () => {
+    if (ready && !disabled) onAnswer(true, Object.fromEntries(questions.map((q, i) => [q.question, replies[i]])));
+  };
+  return (
+    <div className="ask" style={tint(COLORS[ask.who])}>
+      <div className="ask-title">
+        <span className="dot" />
+        {name} pergunta{more > 0 ? ` (+${more} na fila)` : ''}
+      </div>
+      {questions.map((q, i) => (
+        <div className="question" key={i}>
+          {q.header && <div className="question-header">{q.header}</div>}
+          <div className="question-text">
+            {q.question}
+            {q.multiSelect && <span className="question-hint"> (pode escolher mais de uma)</span>}
+          </div>
+          <div className="question-options">
+            {q.options.map((o, j) => (
+              <button
+                key={j}
+                className={`option${picked[i].includes(o.label) ? ' on' : ''}`}
+                aria-pressed={picked[i].includes(o.label)}
+                disabled={disabled}
+                onClick={() => choose(i, o.label)}
+              >
+                <span className="option-label">{o.label}</span>
+                {o.description && <span className="option-desc">{o.description}</span>}
+              </button>
+            ))}
+          </div>
+          <input
+            className="question-other"
+            placeholder={q.multiSelect ? 'Outra (soma às escolhidas)' : 'Outra resposta'}
+            value={other[i]}
+            disabled={disabled}
+            onChange={(e) => write(i, e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') send();
+            }}
+          />
+        </div>
+      ))}
+      <div className="ask-actions">
+        <button className="deny" disabled={disabled} onClick={() => onAnswer(false)}>
+          Não responder
+        </button>
+        <button className="allow" disabled={disabled || !ready} onClick={send}>
+          Responder
         </button>
       </div>
     </div>

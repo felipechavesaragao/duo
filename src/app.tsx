@@ -102,7 +102,37 @@ export function App({ agents, recorder, resumed = false, changes }: AppProps) {
               {busy[id] > 1 ? ` (+${busy[id] - 1} na fila)` : ''}…
             </Text>
           ))}
-        {asking ? (
+        {asking?.questions ? (
+          <Box flexDirection="column">
+            <Text color={COLORS[asking.who]} bold>
+              ? {agents[asking.who].name} pergunta{asks.length > 1 ? ` (+${asks.length - 1} na fila)` : ''}:
+            </Text>
+            {asking.questions.map((q, i) => (
+              <Box key={i} flexDirection="column">
+                <Text bold>
+                  {asking.questions!.length > 1 ? `${i + 1}. ` : ''}
+                  {q.header ? `[${q.header}] ` : ''}
+                  {q.question}
+                  {q.multiSelect ? ' (pode escolher mais de uma, com vírgula)' : ''}
+                </Text>
+                {q.options.map((o, j) => (
+                  <Text key={j}>
+                    {'  '}
+                    {j + 1}) {o.label}
+                    {o.description ? <Text dimColor> — {o.description}</Text> : null}
+                  </Text>
+                ))}
+              </Box>
+            ))}
+            <Box>
+              <Text bold>
+                {asking.questions.length > 1 ? 'respostas separadas por ";"' : 'número, nome ou texto seu'} (n = não
+                responder) ›{' '}
+              </Text>
+              <TextInput value={answer} onChange={setAnswer} onSubmit={onAnswer} />
+            </Box>
+          </Box>
+        ) : asking ? (
           <Box flexDirection="column">
             <Text color={COLORS[asking.who]} bold>
               ? {agents[asking.who].name} pede permissão{asks.length > 1 ? ` (+${asks.length - 1} na fila)` : ''}:{' '}

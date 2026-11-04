@@ -3,9 +3,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ClaudeAgent } from '../src/agents/claude.js';
+import { ClaudeAgent, parseQuestions } from '../src/agents/claude.js';
 import { CodexAgent } from '../src/agents/codex.js';
-import { ResumeFailedError, type Agent, type AgentEvent, type AgentTask, type StepResult } from '../src/agents/types.js';
+import {
+  ResumeFailedError,
+  type Agent,
+  type AgentEvent,
+  type AgentTask,
+  type PermissionRequest,
+  type StepResult,
+} from '../src/agents/types.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fakeClaude = [process.execPath, path.join(here, 'fixtures', 'fake-claude.mjs')];
@@ -283,6 +290,81 @@ describe('ClaudeAgent', () => {
     const errors: string[] = [];
     await agent.send('PEDE git push', (ev) => ev.kind === 'error' && errors.push(ev.text));
     expect(errors).toEqual(['permissão negada: Bash git push (veja --claude-permission)']);
+  });
+
+  const COR = {
+    questions: [
+      { question: 'Qual cor?', header: 'Cor', options: [{ label: 'azul', description: 'a do mar' }, { label: 'verde' }], multiSelect: false },
+    ],
+  };
+
+  it('pergunta com opções chega a você com as perguntas, e a resposta volta ao Claude pelo texto de cada uma', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const asked: PermissionRequest[] = [];
+    agent.askPermission = async (req) => (asked.push(req), { answers: { 'Qual cor?': 'verde' } });
+    const events: AgentEvent[] = [];
+    expect(await agent.send(`PERGUNTA ${JSON.stringify(COR)}`, (ev) => events.push(ev))).toBe(
+      'eco: respondeu {"Qual cor?":"verde"}',
+    );
+    expect(asked.map(({ text, questions }) => ({ text, questions }))).toEqual([
+      {
+        text: 'AskUserQuestion Qual cor?',
+        questions: [{ question: 'Qual cor?', header: 'Cor', options: [{ label: 'azul', description: 'a do mar' }, { label: 'verde' }] }],
+      },
+    ]);
+    expect(stepsOf(events).ends).toEqual([{ of: 'toolu_1', ok: true }]);
+  });
+
+  it('várias perguntas, uma de várias escolhas e uma resposta sua: cada uma volta ao Claude pelo texto dela', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const two = {
+      questions: [
+        ...COR.questions,
+        { question: 'Quais frutas?', header: 'Frutas', options: [{ label: 'uva' }, { label: 'manga' }], multiSelect: true },
+      ],
+    };
+    const answers = { 'Qual cor?': 'roxo', 'Quais frutas?': 'uva, manga, kiwi' };
+    let got: PermissionRequest | undefined;
+    agent.askPermission = async (req) => ((got = req), { answers });
+    expect(await agent.send(`PERGUNTA ${JSON.stringify(two)}`, noop)).toBe(`eco: respondeu ${JSON.stringify(answers)}`);
+    expect(got?.questions?.map((q) => [q.question, q.multiSelect ?? false])).toEqual([
+      ['Qual cor?', false],
+      ['Quais frutas?', true],
+    ]);
+  });
+
+  it('você não responde: o Claude sabe que você não quis, e o passo diz isso (não "você negou")', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    agent.askPermission = async () => false;
+    const events: AgentEvent[] = [];
+    expect(await agent.send(`PERGUNTA ${JSON.stringify(COR)}`, (ev) => events.push(ev))).toBe(
+      'eco: sem resposta (O usuário não quis responder pela janela do duo.)',
+    );
+    expect(stepsOf(events).ends).toEqual([{ of: 'toolu_1', ok: false, note: 'você não respondeu' }]);
+  });
+
+  it('pergunta numa forma que o duo não conhece: você vê o pedido inteiro, como permissão', async () => {
+    const agent = track(new ClaudeAgent({ bin: fakeClaude }));
+    const odd = { questions: [{ question: 'Qual cor?', options: 'azul ou verde' }] };
+    const asked: PermissionRequest[] = [];
+    agent.askPermission = async (req) => (asked.push(req), false);
+    await agent.send(`PERGUNTA ${JSON.stringify(odd)}`, noop);
+    expect(asked.map(({ text, questions }) => ({ text, questions }))).toEqual([
+      { text: `AskUserQuestion ${JSON.stringify(odd)}`, questions: undefined },
+    ]);
+  });
+
+  it('as perguntas: só o que o duo mostra, e nada de duas com o mesmo texto (as respostas vão pelo texto)', () => {
+    const one = { question: 'Q?', options: [{ label: 'a', extra: 1 }], multiSelect: true, outro: 'x' };
+    expect(parseQuestions({ questions: [one] })).toEqual([{ question: 'Q?', options: [{ label: 'a' }], multiSelect: true }]);
+    expect(parseQuestions({ questions: [one, { ...one, multiSelect: false }] })).toBeUndefined();
+    expect(parseQuestions({ questions: [] })).toBeUndefined();
+    expect(parseQuestions({ questions: [{ question: ' ', options: [] }] })).toBeUndefined();
+    expect(parseQuestions({ questions: [{ question: 'Q?', options: [{ label: '' }] }] })).toBeUndefined();
+    // um campo conhecido com outro tipo não é reinterpretado: o pedido cai no inteiro
+    expect(parseQuestions({ questions: [{ ...one, multiSelect: 'true' }] })).toBeUndefined();
+    expect(parseQuestions({ questions: [{ ...one, header: 1 }] })).toBeUndefined();
+    expect(parseQuestions({ questions: [{ ...one, options: [{ label: 'a', description: 2 }] }] })).toBeUndefined();
   });
 
   it('turno que ele abre sozinho (tarefa em segundo plano terminou) aparece, e a próxima mensagem não leva a resposta dele', async () => {

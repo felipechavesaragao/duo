@@ -524,6 +524,75 @@ describe('pedido de permissão', () => {
     expect(lastFrame()).toContain('/claude › rascunho meu');
   });
 
+  it('pergunta com opções: o terminal mostra as opções numeradas, e o número, o nome ou um texto seu respondem', async () => {
+    const { claude, codex } = fakes();
+    const { stdin, lastFrame, frames } = render(<App agents={{ claude, codex }} />);
+    await tick();
+    const signal = new AbortController().signal;
+    const cor = { question: 'Qual cor?', header: 'Cor', options: [{ label: 'Azul', description: 'a do mar' }, { label: 'Verde' }] };
+    const first = claude.askPermission!({ text: 'AskUserQuestion Qual cor?', signal, questions: [cor] });
+    await tick();
+    expect(lastFrame()).toContain('? Claude pergunta:');
+    expect(lastFrame()).toContain('[Cor] Qual cor?');
+    expect(lastFrame()).toContain('1) Azul — a do mar');
+    expect(lastFrame()).toContain('2) Verde');
+    expect(lastFrame()).not.toContain('s/n');
+    await type(stdin, '3'); // número que não é de nenhuma opção: não vira texto
+    expect(frames.join('\n')).toContain('responda com o número da opção, o nome dela ou um texto seu, ou n para não responder.');
+    await type(stdin, '2');
+    expect(await first).toEqual({ answers: { 'Qual cor?': 'Verde' } });
+    expect(frames.join('\n')).toContain('você respondeu: Qual cor? → Verde');
+
+    // duas perguntas, uma de várias: as respostas separadas por ";", as opções por vírgula
+    const sabores = { question: 'Quais sabores?', options: [{ label: 'uva' }, { label: 'limão' }], multiSelect: true };
+    const second = claude.askPermission!({ text: 'AskUserQuestion …', signal, questions: [sabores, { ...cor, header: undefined }] });
+    await tick();
+    expect(lastFrame()).toContain('1. Quais sabores? (pode escolher mais de uma, com vírgula)');
+    expect(lastFrame()).toContain('respostas separadas por ";"');
+    await type(stdin, 'verde');
+    expect(frames.join('\n')).toContain('responda as 2 perguntas separadas por ";"');
+    await type(stdin, '2, 1 ; roxo');
+    expect(await second).toEqual({ answers: { 'Quais sabores?': 'limão, uva', 'Qual cor?': 'roxo' } });
+
+    // n não responde; mas numa pergunta de sim ou não, "não" é a resposta
+    const third = claude.askPermission!({ text: 'AskUserQuestion Qual cor?', signal, questions: [cor] });
+    await tick();
+    await type(stdin, 'n');
+    expect(await third).toBe(false);
+    expect(frames.join('\n')).toContain('você não quis responder: AskUserQuestion Qual cor?');
+    const yesNo = { question: 'Continua?', options: [{ label: 'Sim' }, { label: 'Não' }] };
+    const fourth = claude.askPermission!({ text: 'AskUserQuestion Continua?', signal, questions: [yesNo] });
+    await tick();
+    await type(stdin, 'não');
+    expect(await fourth).toEqual({ answers: { 'Continua?': 'Não' } });
+
+    // uma opção que se chama "2026" é escolhida pelo nome; o número de outra também vale; -1 não é de nenhuma
+    const year = { question: 'Qual ano?', options: [{ label: '2024' }, { label: '2026' }] };
+    const fifth = claude.askPermission!({ text: 'AskUserQuestion Qual ano?', signal, questions: [year] });
+    await tick();
+    const hints = () => frames.join('\n').split('responda com o número da opção').length;
+    const before = hints();
+    await type(stdin, '-1');
+    expect(hints()).toBeGreaterThan(before);
+    await type(stdin, '2026');
+    expect(await fifth).toEqual({ answers: { 'Qual ano?': '2026' } });
+
+    // na múltipla, número e texto seu juntos; vírgula sobrando não conta; a resposta longa fica inteira na conversa
+    const sixth = claude.askPermission!({ text: 'AskUserQuestion Quais sabores?', signal, questions: [sabores] });
+    await tick();
+    const long = 'k'.repeat(150);
+    await type(stdin, `1, ${long},`);
+    expect(await sixth).toEqual({ answers: { 'Quais sabores?': `uva, ${long}` } });
+    expect(frames.join('\n').replace(/\s+/g, '')).toContain(`vocêrespondeu:Quaissabores?→uva,${long}`);
+
+    // sem opções (mesmo na de várias escolhas), o texto vai como veio: nada é separado nem juntado
+    const free = { question: 'O que mais?', options: [], multiSelect: true };
+    const seventh = claude.askPermission!({ text: 'AskUserQuestion O que mais?', signal, questions: [free] });
+    await tick();
+    await type(stdin, '1, 1,,b');
+    expect(await seventh).toEqual({ answers: { 'O que mais?': '1, 1,,b' } });
+  });
+
   it('pedido cancelado (o processo caiu) sai da tela e vale como não', async () => {
     const { claude, codex } = fakes();
     const { lastFrame, frames } = render(<App agents={{ claude, codex }} />);

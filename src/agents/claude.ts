@@ -18,11 +18,13 @@ import {
   type AgentModel,
   type AgentStats,
   type AgentTask,
+  type AskQuestion,
   type AgentTool,
   type EmitFn,
   type ImageInput,
   type ModelChoice,
   type PeerRequest,
+  type PermissionAnswer,
   type PermissionRequest,
   type StepResult,
 } from './types.js';
@@ -74,8 +76,9 @@ interface Running {
   tail: () => string;
   /** pedidos do CLI esperando resposta (permissão, chamada ao Codex), por request_id */
   asks: Map<string, AbortController>;
-  /** tool_use_id do que você negou: a tela já mostra, não repete como "permissão negada" */
-  deniedByYou: Set<string>;
+  /** tool_use_id do que você negou (ou não quis responder), com a nota do passo: a tela já mostra, não repete como
+   * "permissão negada" */
+  deniedByYou: Map<string, string>;
   /** task_id dos subagentes rodando */
   subagents: Set<string>;
   /** subagentes e comandos em segundo plano rodando, por task_id (o quadro da janela) */
@@ -188,7 +191,7 @@ export class ClaudeAgent implements Agent {
   readonly id = 'claude' as const;
   readonly name = 'Claude';
   onSessionId?: (id: string) => void;
-  askPermission?: (req: PermissionRequest) => Promise<boolean>;
+  askPermission?: (req: PermissionRequest) => Promise<PermissionAnswer>;
   askPeer?: (req: PeerRequest) => Promise<string>;
   onOwnTurnEvent?: EmitFn;
   onOwnTurnReply?: (text: string, tasksShared?: boolean, fromApp?: boolean) => void;
@@ -342,7 +345,7 @@ export class ClaudeAgent implements Agent {
       sawInit: false,
       tail: stderrTail(proc),
       asks: new Map(),
-      deniedByYou: new Set(),
+      deniedByYou: new Map(),
       subagents: new Set(),
       tasks: new Map(),
       own: [],
@@ -789,23 +792,36 @@ export class ClaudeAgent implements Agent {
     if (run.interrupting) ctrl.abort(STOPPED);
     run.asks.set(msg.request_id, ctrl);
     run.waits.add(ctrl);
-    const text = toolCall(req.tool_name, req.input);
-    const allowed = ask && !ctrl.signal.aborted ? await ask({ text, signal: ctrl.signal }).catch(() => false) : false;
+    // A pergunta com opções (AskUserQuestion) chega como um pedido destes: você vê as perguntas e responde. A resposta
+    // volta ao CLI em updatedInput.answers, pelo texto de cada pergunta; o "allow" sem ela, ele entende como "não
+    // respondeu" (medido em 04/11/2026, 2.1.316).
+    const questions = req.tool_name === 'AskUserQuestion' ? parseQuestions(req.input) : undefined;
+    // numa forma que o duo não conhece, você ao menos lê as perguntas (e responde negando e escrevendo)
+    const text = questions
+      ? `AskUserQuestion ${questions.map((q) => q.question).join(' · ')}`
+      : req.tool_name === 'AskUserQuestion'
+        ? `AskUserQuestion ${JSON.stringify(req.input ?? {})}`
+        : toolCall(req.tool_name, req.input);
+    const request = { text, signal: ctrl.signal, ...(questions ? { questions } : {}) };
+    const answer = ask && !ctrl.signal.aborted ? await ask(request).catch(() => false) : false;
     run.asks.delete(msg.request_id);
     run.waits.delete(ctrl);
     // parado pelo duo: nega, para o CLI não ficar esperando (se ele já desistiu, a resposta não muda nada)
     const stopped = ctrl.signal.reason === STOPPED;
     if (ctrl.signal.aborted && !stopped) return;
-    if (allowed) {
-      reply({ subtype: 'success', response: { behavior: 'allow', updatedInput: req.input } });
+    if (answer) {
+      const updatedInput = typeof answer === 'object' ? { ...req.input, answers: answer.answers } : req.input;
+      reply({ subtype: 'success', response: { behavior: 'allow', updatedInput } });
       return;
     }
-    if (ask) run.deniedByYou.add(req.tool_use_id);
+    if (ask) run.deniedByYou.set(req.tool_use_id, questions ? 'você não respondeu' : 'você negou');
     const message = stopped
       ? 'O usuário parou o Claude pela janela do duo.'
-      : ask
-        ? 'O usuário negou pela janela do duo.'
-        : 'O duo não tinha como perguntar ao usuário.';
+      : !ask
+        ? 'O duo não tinha como perguntar ao usuário.'
+        : questions
+          ? 'O usuário não quis responder pela janela do duo.'
+          : 'O usuário negou pela janela do duo.';
     reply({ subtype: 'success', response: { behavior: 'deny', message } });
   }
 
@@ -871,7 +887,8 @@ function stepResult(run: Running, block: any, step: { name: string; file?: strin
   if (block.is_error === true) {
     // parar nega o pedido de permissão aberto (e o marca como seu): o motivo é o parar
     if (run.interrupting) return { of, ok: false, note: STEP_STOPPED };
-    if (run.deniedByYou.has(of)) return { of, ok: false, note: 'você negou' };
+    const yours = run.deniedByYou.get(of);
+    if (yours) return { of, ok: false, note: yours };
     const text = resultText(block.content).replace(/<\/?tool_use_error>/g, '');
     const code = /^Exit code (\d+)/.exec(text);
     if (code) return { of, ok: false, exitCode: Number(code[1]) };
@@ -894,6 +911,38 @@ function resultText(content: any): string {
     .filter((b) => b?.type === 'text' && typeof b.text === 'string')
     .map((b) => b.text)
     .join('\n');
+}
+
+/**
+ * As perguntas do AskUserQuestion, no formato do 2.1.316: `questions: [{ question, header, options: [{ label,
+ * description }], multiSelect }]`. Fora dele, undefined, e o pedido segue como uma permissão comum, com o input
+ * inteiro na tela. Fora dele é: um desses campos com outro tipo (um `multiSelect: "true"` não vira escolha única
+ * calado), pergunta ou opção sem texto, ou duas perguntas de mesmo texto (a resposta vai pelo texto e não as separa).
+ * Campos que o duo não conhece ficam de fora da tela, sem mudar o sentido dos que ele mostra.
+ */
+export function parseQuestions(input: any): AskQuestion[] | undefined {
+  const list = input?.questions;
+  if (!Array.isArray(list) || list.length === 0) return undefined;
+  /** ausente, ou do tipo esperado */
+  const maybe = (v: unknown, type: 'string' | 'boolean') => v === undefined || typeof v === type;
+  const out: AskQuestion[] = [];
+  for (const q of list) {
+    if (typeof q?.question !== 'string' || q.question.trim() === '' || !Array.isArray(q.options)) return undefined;
+    if (!maybe(q.header, 'string') || !maybe(q.multiSelect, 'boolean')) return undefined;
+    if (out.some((o) => o.question === q.question)) return undefined;
+    const options: AskQuestion['options'] = [];
+    for (const o of q.options) {
+      if (typeof o?.label !== 'string' || o.label.trim() === '' || !maybe(o.description, 'string')) return undefined;
+      options.push({ label: o.label, ...(typeof o.description === 'string' ? { description: o.description } : {}) });
+    }
+    out.push({
+      question: q.question,
+      ...(typeof q.header === 'string' ? { header: q.header } : {}),
+      options,
+      ...(q.multiSelect === true ? { multiSelect: true } : {}),
+    });
+  }
+  return out;
 }
 
 /** "Bash git push origin master": a ferramenta e o argumento que importa, inteiro. */

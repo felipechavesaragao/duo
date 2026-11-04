@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ImageInput } from '../agents/types.js';
-import type { Duo, DuoState } from '../core.js';
+import { cleanAnswers, type Duo, type DuoState } from '../core.js';
 import type { ModelBody, ServerEvents, Snapshot, Status } from './protocol.js';
 
 /**
@@ -169,6 +169,13 @@ function isModelBody(body: any): body is ModelBody {
     optional(body.effort, 'string') &&
     optional(body.fast, 'boolean') &&
     (body.model !== undefined || body.effort !== undefined || body.fast !== undefined)
+  );
+}
+
+/** Um objeto de textos (as respostas, pergunta → resposta). Se servem às perguntas, o duo confere. */
+function isTextRecord(v: unknown): v is Record<string, string> {
+  return (
+    typeof v === 'object' && v !== null && !Array.isArray(v) && Object.values(v).every((a) => typeof a === 'string')
   );
 }
 
@@ -337,8 +344,19 @@ export async function startGui(duo: Duo, opts: GuiOptions = {}): Promise<Gui> {
           throw err;
         }
         if (!ok) drop();
-      } else if (url.pathname === '/api/answer' && Number.isInteger(body?.id) && typeof body?.ok === 'boolean') {
-        ok = duo.answer(body.id, body.ok);
+      } else if (
+        url.pathname === '/api/answer' &&
+        Number.isInteger(body?.id) &&
+        typeof body?.ok === 'boolean' &&
+        (body.answers === undefined || isTextRecord(body.answers))
+      ) {
+        // Responder uma pergunta com opções pede uma resposta para cada uma, e nenhuma a mais: o que não serve é pedido
+        // inválido (400). Já respondido (aqui ou no terminal) ou cancelado continua sendo { ok: false }.
+        const ask = duo.getState().asks.find((a) => a.id === body.id);
+        if (ask?.questions && body.ok && !cleanAnswers(ask.questions, body.answers)) {
+          throw new HttpError(400, 'as respostas não servem às perguntas: responda cada uma');
+        }
+        ok = duo.answer(body.id, body.ok, body.answers);
       } else if (url.pathname === '/api/parar' && (body?.agent === 'claude' || body?.agent === 'codex')) {
         void duo.interrupt(body.agent);
         ok = true;

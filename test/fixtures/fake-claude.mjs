@@ -28,6 +28,8 @@
 //                   medido, na mesma forma: um Write que reescreve (type "update"), um Write sem tool_use_result, um
 //                   MultiEdit e um NotebookEdit (notebook_path). Responde "fim".
 // "SEMFIM"         → um Bash cujo tool_result nunca vem: o result fecha o turno com ele aberto.
+// "PERGUNTA <json>" → a ferramenta AskUserQuestion com esse input ({questions}): pede pelo can_use_tool e responde
+//                   com o que voltou no updatedInput.answers.
 // "CAI"            → um Bash começa, e o processo cai (código 3) antes do fim dele.
 // Com --replay-user-messages, ecoa cada mensagem lida (com o uuid dela), como o 2.1.316. O command_lifecycle
 // "started" vem antes do eco; numa mensagem que entra no turno que ele abriu sozinho, logo depois.
@@ -388,6 +390,29 @@ if (resume === 'sumiu') {
       return void setTimeout(() => process.exit(3), 100);
     }
 
+    if (text.startsWith('PERGUNTA ')) {
+      // a ferramenta de perguntar (AskUserQuestion): o can_use_tool traz as perguntas, e a resposta volta no
+      // updatedInput.answers, pergunta → resposta (medido em 04/11/2026, 2.1.316). O texto do tool_result é suposto.
+      const input = JSON.parse(text.slice(9));
+      const id = `toolu_${n}`;
+      toolUse({ type: 'tool_use', id, name: 'AskUserQuestion', input });
+      const asked = await stoppable(
+        control({ subtype: 'can_use_tool', tool_name: 'AskUserQuestion', input, tool_use_id: id }),
+        () => toolResult(id, 'O usuário parou o Claude pela janela do duo.', true),
+      );
+      if (asked === null) return;
+      const r = asked.response;
+      if (r.behavior !== 'allow') {
+        toolResult(id, r.message, true);
+        return reply(`eco: sem resposta (${r.message})`);
+      }
+      if (!r.updatedInput.answers) {
+        toolResult(id, 'The user did not answer the questions.');
+        return reply('eco: sem resposta');
+      }
+      toolResult(id, `User has answered your questions: ${JSON.stringify(r.updatedInput.answers)}`);
+      return reply(`eco: respondeu ${JSON.stringify(r.updatedInput.answers)}`);
+    }
     if (!text.startsWith('PEDE ')) return reply(`eco: ${text}`);
     const call = { tool_name: 'Bash', tool_use_id: `toolu_${n}`, tool_input: { command: text.slice(5) } };
     toolUse({ type: 'tool_use', id: call.tool_use_id, name: call.tool_name, input: call.tool_input });
