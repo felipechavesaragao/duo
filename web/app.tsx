@@ -281,6 +281,7 @@ export function App() {
             inputRef={inputRef}
             send={send}
             command={command}
+            stop={stop}
             setModel={setModel}
             prefill={prefill}
             onError={setError}
@@ -803,11 +804,13 @@ function Composer(props: {
   inputRef: RefObject<HTMLTextAreaElement>;
   send: (text: string, images?: PastedImage[]) => Promise<boolean>;
   command: (cmd: string) => void;
+  /** o mesmo Parar do painel: só aquele agente, o que ele faz e a fila dele */
+  stop: (agent: AgentId) => void;
   setModel: (agent: AgentId, choice: ModelChoice) => void;
   prefill: (text: string) => void;
   onError: (msg: string) => void;
 }) {
-  const { snap, disabled, text, setText, inputRef, send, command, setModel, prefill, onError } = props;
+  const { snap, disabled, text, setText, inputRef, send, command, stop, setModel, prefill, onError } = props;
   const [menu, setMenu] = useState<'mais' | 'destino' | AgentId | null>(null);
   const [images, setImages] = useState<Pasted[]>([]);
   /** prints colados que ainda estão sendo preparados (lidos, reduzidos) */
@@ -835,6 +838,18 @@ function Composer(props: {
     if (query) prefill(`${query.head}/${name} `);
     else if (duoQuery !== null) prefill(`/${name} `);
   };
+
+  // O destino padrão (o "Para …" embaixo da caixa, não um @fog escrito na mensagem), se está trabalhando (rodando ou
+  // com fila) e ainda não está parando: é quem o Esc e o botão ■ da caixa param, pelo mesmo caminho do Parar do
+  // painel. Com "os dois", os dois que estiverem.
+  const toStop = targetsOf(snap.target).filter((id) => working(snap, id) && !snap.stopping[id]);
+  const stopLabel = `Parar ${toStop.length > 1 ? 'os dois' : `o ${snap.names[toStop[0]]}`} (Esc)`;
+  const stopTargets = () => {
+    toStop.forEach(stop);
+    inputRef.current?.focus(); // o clique no ■ não tira você da caixa: a correção vem logo depois
+  };
+  // com a caixa vazia, o botão de mandar não tem o que mandar: vira o Parar; com texto, continua mandando (para a fila)
+  const showStop = toStop.length > 0 && !text.trim() && images.length === 0 && preparing === 0;
 
   // a caixa cresce com o texto, até um limite
   useLayoutEffect(() => {
@@ -905,6 +920,10 @@ function Composer(props: {
     if (e.key === 'Tab' && matches[0]) {
       e.preventDefault();
       complete(matches[0].name);
+    } else if (e.key === 'Escape' && toStop.length > 0 && !now.current.sending && !e.nativeEvent.isComposing) {
+      // com a mensagem ainda a caminho do duo, o Esc não para: ela iria para a fila e o parar a descartaria
+      e.preventDefault();
+      stopTargets();
     } else if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       void submit();
@@ -1023,12 +1042,16 @@ function Composer(props: {
           onKeyDown={onKeyDown}
           onPaste={onPaste}
         />
-        <IconButton
-          icon={icons.enter}
-          label="Enviar"
-          disabled={disabled || sending || (!text.trim() && images.length === 0 && preparing === 0)}
-          onClick={() => void submit()}
-        />
+        {showStop ? (
+          <IconButton icon={icons.stop} label={stopLabel} className="stop-now" disabled={disabled} onClick={stopTargets} />
+        ) : (
+          <IconButton
+            icon={icons.enter}
+            label="Enviar"
+            disabled={disabled || sending || (!text.trim() && images.length === 0 && preparing === 0)}
+            onClick={() => void submit()}
+          />
+        )}
       </div>
 
       <div className="under">
@@ -1179,9 +1202,15 @@ function CommandList(props: {
 
 /* peças pequenas */
 
-function IconButton(props: { icon: ReactNode; label: string; disabled?: boolean; onClick: () => void }) {
+function IconButton(props: { icon: ReactNode; label: string; className?: string; disabled?: boolean; onClick: () => void }) {
   return (
-    <button className="icon-btn" title={props.label} aria-label={props.label} disabled={props.disabled} onClick={props.onClick}>
+    <button
+      className={`icon-btn${props.className ? ` ${props.className}` : ''}`}
+      title={props.label}
+      aria-label={props.label}
+      disabled={props.disabled}
+      onClick={props.onClick}
+    >
       {props.icon}
     </button>
   );

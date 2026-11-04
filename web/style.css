@@ -132,6 +132,12 @@ button:disabled {
   color: var(--fg);
 }
 
+/* o botão de mandar virou o Parar: o agente para quem você escreve está trabalhando */
+.icon-btn.stop-now {
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+
 /* barra lateral */
 
 .side {
