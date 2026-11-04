@@ -37,6 +37,8 @@ class FakeAgent implements Agent {
   disposed = 0;
   /** enquanto existir, o turno espera por ele */
   gate?: Promise<void>;
+  /** respostas roteirizadas, na ordem; acabaram, ele responde "<nome> responde <n>" */
+  answers: string[] = [];
   /** o que o turno manda para a tela antes da resposta (passos, o fim deles) */
   events: AgentEvent[] = [];
   askPermission?: Agent['askPermission'];
@@ -65,7 +67,7 @@ class FakeAgent implements Agent {
     await Promise.race([this.gate, new Promise<never>((_, reject) => (this.stopTurn = reject))]);
     this.stopTurn = undefined;
     for (const ev of this.events) emit(ev);
-    const answer = `${this.name} responde ${this.prompts.length}`;
+    const answer = this.answers.shift() ?? `${this.name} responde ${this.prompts.length}`;
     emit({ kind: 'text', text: answer });
     return answer;
   }
@@ -443,6 +445,27 @@ describe('janela: conversa', () => {
     await events.next('status', (s) => s.brain === true);
     await events.next('entry', (e) => e.text.startsWith('🧠 sem acordo'));
     await events.next('status', (s) => s.brain === false);
+    events.close();
+  });
+
+  it('brain cada um por si: quando termina porque falta uma informação, a janela diz qual', async () => {
+    const { agents, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    agents.claude.answers = ['depende\n[FALTA: o volume de dados]', 'sem ele não dá\n[FALTA: o volume de dados]'];
+    agents.codex.answers = ['use Postgres', 'concordo que falta\n[CONCORDO]'];
+    await post('/api/submit', { text: '/brain qual banco?' });
+    const end = await events.next('entry', (e) => e.text.startsWith('🧠 falta a informação'));
+    expect(end).toMatchObject({
+      who: 'sistema',
+      kind: 'text',
+      text:
+        '🧠 falta a informação: o volume de dados. O Fog concordou com o Cla que sem ela não dá para responder ' +
+        '(4 respostas). Mande /brain de novo com ela.',
+    });
+    await events.next('status', (s) => s.brain === false);
+    expect(agents.claude.prompts).toHaveLength(2);
+    expect(agents.codex.prompts).toHaveLength(2);
     events.close();
   });
 
@@ -995,6 +1018,21 @@ describe('janela: parar só um agente', () => {
     await events.next('entry', (e) => e.text === '🧠 brain parou: você parou o Cla.');
     await now(events, duo, (s) => s.brain === false);
     expect(agents.codex.prompts).toHaveLength(0);
+    events.close();
+  });
+
+  it('brain cada um por si: parar um encerra na hora dizendo que foi você, sem esperar a resposta do outro', async () => {
+    const { agents, duo, port, cookie, post } = await setup();
+    const events = listen(port, cookie);
+    await events.next('snapshot');
+    agents.claude.gate = new Promise(() => undefined);
+    agents.codex.gate = new Promise(() => undefined); // o Fog segue respondendo à pergunta
+    await post('/api/submit', { text: '/brain qual banco?' });
+    await events.next('status', (s) => s.runningSince.claude !== null && s.runningSince.codex !== null);
+    await post('/api/parar', { agent: 'claude' });
+    await events.next('entry', (e) => e.text === '🧠 brain parou: você parou o Cla.');
+    await now(events, duo, (s) => s.brain === false && s.runningSince.codex !== null);
+    expect(agents.codex.prompts).toHaveLength(1); // só a resposta independente
     events.close();
   });
 

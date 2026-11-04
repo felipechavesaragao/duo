@@ -48,6 +48,7 @@ Depois é só rodar `duo` na pasta do projeto em que você quer trabalhar. Os do
 | `/fog` | sem mensagem: muda o destino padrão |
 | `/cla /init` | manda um comando do próprio agente (o `/init` vai para o Cla) |
 | `@cla /` | mostra a lista de comandos do Cla (`@fog /`: as skills do Fog); digite para filtrar, Tab completa |
+| `/brain <msg>` | o Cla e o Fog respondem cada um por si, sem ver a resposta do outro; depois o destino padrão abre o confronto (com `/todos`, o Cla), e eles revezam até concordarem ou concluírem que falta uma informação (no máximo 6 respostas, contando as duas primeiras) |
 | `/brain /cla <msg>` | o Cla responde, o Fog avalia, e eles revezam até concordarem (no máximo 6 respostas; `/brain /fog` faz o Fog começar) |
 | `/parar` | encerra o brain depois da resposta em andamento |
 | `/compartilhado` | (padrão) cada um vê o que você e o outro disseram |
@@ -62,6 +63,8 @@ Depois é só rodar `duo` na pasta do projeto em que você quer trabalhar. Os do
 **Comandos de cada agente**: o duo pede a lista a cada um quando abre. A do Claude é a que o `claude -p` informa (`/compact`, `/context`, `/usage`, as skills e os comandos de plugin); os poucos que só funcionam na tela do terminal, como `/focus`, respondem que não estão disponíveis. O Codex não aceita comandos `/` fora do terminal dele, então a lista dele são as skills ligadas: `@fog /nome-da-skill <texto>` chama a skill, como o `$nome-da-skill` no terminal do Codex. Um comando vai puro, sem o contexto da janela; o que o agente perdeu vai junto da mensagem seguinte.
 
 No `/todos`, os dois respondem ao mesmo tempo e nenhum vê a resposta do outro àquela mensagem. Cada um fica sabendo da resposta do outro na mensagem seguinte.
+
+O `/brain` tem dois jeitos, e o que decide é dizer ou não quem começa. Com `/brain /cla` (ou `/brain /fog`), o marcado responde e o outro avalia já vendo a resposta dele. Só com `/brain <msg>`, os dois primeiro respondem como no `/todos`: ao mesmo tempo, sem ver a resposta do outro. Com as duas respostas na mão, começa o confronto: o destino padrão lê a resposta do outro e diz se concorda, e eles revezam; com o destino `/todos`, quem abre é o Cla. Vale o destino da hora em que você mandou o `/brain`. Uma resposta pode dizer que falta uma informação para responder; se o outro concordar, o brain termina com `falta a informação: …` em vez de forçar um acordo. O limite é de 6 respostas, contando as duas primeiras. Nessa primeira fase, o `/parar` espera as duas respostas e não abre o confronto.
 
 **Um chama o outro sozinho**: o duo dá ao Claude a ferramenta `falar_com_codex` e ao Codex a `falar_com_claude`, e avisa os dois de que elas existem. A mensagem aparece na janela como `[para o Fog] …` (ou `[para o Cla] …`), vira um turno normal de quem foi chamado (na fila dele, com o contexto da janela) e a resposta volta para quem chamou, que continua de onde estava. Quem está esperando uma resposta não pode ser chamado de volta: o duo recusa na hora, em vez de deixar os dois travados um esperando o outro. Numa revisão, quem chamou insiste até os dois convergirem ou ficar claro que não vão convergir (aí a divergência vai para você); quem foi chamado termina dizendo se concorda ou o que ainda falta. Se o projeto tem um protocolo de revisão próprio, vale o dele.
 

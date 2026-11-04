@@ -28,7 +28,17 @@ import {
   type TurnStatus,
   type Who,
 } from './persist.js';
-import { BRAIN_MAX, brainOpening, brainReview, brainVerdict, otherOf } from './brain.js';
+import {
+  BRAIN_MAX,
+  brainAlone,
+  brainConfront,
+  brainMissing,
+  brainOpener,
+  brainOpening,
+  brainReview,
+  brainVerdict,
+  otherOf,
+} from './brain.js';
 import { describeChanges, type ChangeWatcher, type Fingerprints } from './changes.js';
 import { currentModel, modelLabel, NAMES } from './display.js';
 import { HELP_TEXT, parseInput, targetsOf, type Target } from './router.js';
@@ -711,6 +721,112 @@ export class Duo {
   }
 
   /**
+   * /brain <pergunta>, o jeito novo: os dois respondem cada um por si, ao mesmo tempo, vendo a janela só até a pergunta
+   * (como no /todos): nenhum vê a resposta do outro. Com as duas na mão, o destino padrão da hora do /brain abre o
+   * confronto (com /todos, o Claude: brainOpener), e eles revezam até um concordar com a última resposta do outro (que
+   * pode ser "falta a informação X"), ou até BRAIN_MAX respostas. Trocar o destino com o brain rodando não muda quem
+   * abre.
+   * Como no jeito velho, a conversa do brain é sempre compartilhada entre os dois, mesmo no modo privado.
+   */
+  private async runBrainApart(question: string): Promise<void> {
+    const first = brainOpener(this.rec.data.target);
+    const state = { stop: false };
+    this.brain = state;
+    this.update({ brain: true });
+    const data = this.rec.data;
+    const epoch = this.session;
+    const name = (id: AgentId) => NAMES[id]; // só tela: o que vai aos agentes sai do brain.ts
+    this.add(
+      'sistema',
+      'text',
+      `🧠 brain: o ${name(first)} e o ${name(otherOf(first))} respondem cada um por si, sem ver a resposta do outro. ` +
+        `Depois o ${name(first)} abre o confronto, e eles revezam até concordarem ou concluírem que falta uma ` +
+        `informação (no máximo ${BRAIN_MAX} respostas). /parar encerra.` +
+        `${data.shared ? '' : ' Os dois veem o brain, mesmo no modo privado.'}`,
+    );
+    this.add('voce', 'text', `[brain · cada um por si] ${question}`);
+    const both: AgentId[] = [first, otherOf(first)];
+    const msgIndex = this.log.userMessage(both, question, true);
+    /** a última resposta de cada um: é com ela que o outro concorda */
+    const last = {} as Record<AgentId, string>;
+    /** A resposta, se o brain segue com ela; null = ele para aqui (você parou ele, ou falhou: avisa; /novo: calado). */
+    const take = (who: AgentId, cutAt: number, answer: string | null): string | null => {
+      if (this.session !== epoch) return null; // /novo: o brain era da conversa anterior
+      if (answer === null) {
+        if (this.cut[who] !== cutAt) this.add('sistema', 'text', `🧠 brain parou: você parou o ${name(who)}.`);
+        else this.add('sistema', 'error', `🧠 brain parou: a resposta do ${name(who)} falhou.`);
+      }
+      return answer;
+    };
+    const stopped = (n: number) => {
+      if (!state.stop) return false;
+      this.add('sistema', 'text', `🧠 brain encerrado por você depois de ${n} ${n === 1 ? 'resposta' : 'respostas'}.`);
+      return true;
+    };
+
+    try {
+      // as duas respostas independentes: as duas na fila já, com a janela vista até a pergunta
+      const turns = both.map((who) => newTurn(data, who, question));
+      this.rec.saveNow();
+      const alone = await new Promise<boolean>((resolve) => {
+        let left = both.length;
+        both.forEach((who, i) => {
+          const cutAt = this.cut[who];
+          void this.untilCut(who, this.runTurn(who, turns[i], brainAlone(who, question), true, { msgIndex })).then(
+            (got) => {
+              // a primeira que falha (ou que você para) encerra o brain na hora, sem esperar a outra
+              if (left === 0) return;
+              const answer = take(who, cutAt, got);
+              if (answer === null) {
+                left = 0;
+                return resolve(false);
+              }
+              last[who] = answer;
+              if (--left === 0) resolve(true);
+            },
+          );
+        });
+      });
+      if (!alone || stopped(both.length)) return;
+      this.add('sistema', 'text', `🧠 os dois responderam. Confronto: o ${name(first)} avalia a resposta do ${name(otherOf(first))}.`);
+
+      let who = first;
+      for (let n = both.length + 1; n <= BRAIN_MAX; n++) {
+        const turnId = newTurn(data, who, `[brain] avaliar a resposta do ${name(otherOf(who))}`);
+        this.rec.saveNow();
+        const cutAt = this.cut[who];
+        // a resposta que ele avalia vai no prompt, e é dela que vem a falta anunciada: o acordo é sobre a mesma
+        // resposta, mesmo com uma mensagem sua ao outro no meio do brain (ela também entra no contexto)
+        const judged = last[otherOf(who)];
+        const answer = take(who, cutAt, await this.untilCut(who, this.runTurn(who, turnId, brainConfront(who, judged), true)));
+        if (answer === null) return;
+        if (brainVerdict(answer) === 'concordo') {
+          const missing = brainMissing(judged);
+          this.add(
+            'sistema',
+            'text',
+            missing === null
+              ? `🧠 concordaram: o ${name(who)} concordou com o ${name(otherOf(who))} (${n} respostas).`
+              : `🧠 falta a informação: ${missing}. O ${name(who)} concordou com o ${name(otherOf(who))} que sem ela ` +
+                  `não dá para responder (${n} respostas). Mande /brain de novo com ela.`,
+          );
+          return;
+        }
+        last[who] = answer;
+        if (stopped(n)) return;
+        who = otherOf(who);
+      }
+      this.add('sistema', 'text', `🧠 sem acordo em ${BRAIN_MAX} respostas. Mande /brain de novo para continuar.`);
+    } finally {
+      if (this.brain === state) {
+        this.brain = null;
+        this.update({ brain: false });
+      }
+      this.rec.saveNow();
+    }
+  }
+
+  /**
    * O que você digitou, e os prints que colou. false = não foi (só espaços, ou print junto de um comando do duo):
    * a tela deixa na caixa de texto o que estava lá.
    */
@@ -789,7 +905,9 @@ export class Duo {
           this.add('sistema', 'error', 'já tem um brain rodando: espere terminar ou digite /parar.');
           return true;
         }
-        void this.runBrain(cmd.first, cmd.prompt);
+        // com quem começa (/brain /cla|/fog), o jeito velho; sem, o novo
+        if (cmd.first) void this.runBrain(cmd.first, cmd.prompt);
+        else void this.runBrainApart(cmd.prompt);
         return true;
       case 'stop':
         if (!this.brain) {

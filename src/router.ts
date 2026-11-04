@@ -5,7 +5,8 @@ export type Target = AgentId | 'todos';
 
 export type Command =
   | { type: 'ask'; targets: AgentId[]; prompt: string; newDefault: Target }
-  | { type: 'brain'; first: AgentId; prompt: string }
+  /** `first` = quem começa (/brain /cla|/fog: o jeito velho); sem ele, o jeito novo (os dois respondem cada um por si) */
+  | { type: 'brain'; first?: AgentId; prompt: string }
   | { type: 'stop' }
   | { type: 'share'; on: boolean }
   | { type: 'new' }
@@ -51,7 +52,9 @@ export const COMMANDS: Record<string, Exclude<Command, { type: 'ask' | 'invalid'
 /** Comandos que levam argumento. Entram na checagem de nomes junto com COMMANDS. */
 export const COMMAND_NAMES = [...Object.keys(COMMANDS), 'brain'];
 
-const BRAIN_USAGE = 'use /brain /cla <pergunta> (o Cla começa) ou /brain /fog <pergunta> (o Fog começa)';
+const BRAIN_USAGE =
+  'use /brain <pergunta> (os dois respondem cada um por si, depois se confrontam) ou /brain /cla <pergunta> ' +
+  '(o Cla responde, o Fog avalia; /brain /fog: o Fog começa)';
 
 /** O nome é só letras/números: "/fog?" é /fog + "?", e "/codex, revisa" é /codex + "revisa". */
 const NAMED = /^([/@])([\p{L}\p{N}_-]+)([\s\S]*)$/u;
@@ -71,8 +74,13 @@ export function parseInput(raw: string, current: Target): Command | null {
 
   if (sigil === '/' && name === 'brain') {
     const who = rest.trim().match(NAMED);
-    const first = who ? targetOf(who[2].toLowerCase()) : undefined;
-    if (!who || !first || first === 'todos') return { type: 'invalid', message: `quem começa o brain? ${BRAIN_USAGE}` };
+    if (!who) {
+      // sem quem começa: o jeito novo
+      const prompt = cleanPrompt(rest);
+      return prompt ? { type: 'brain', prompt } : { type: 'invalid', message: `falta a pergunta: ${BRAIN_USAGE}` };
+    }
+    const first = targetOf(who[2].toLowerCase());
+    if (!first || first === 'todos') return { type: 'invalid', message: `quem começa o brain? ${BRAIN_USAGE}` };
     const prompt = cleanPrompt(who[3]);
     if (!prompt) return { type: 'invalid', message: `falta a pergunta: ${BRAIN_USAGE}` };
     return { type: 'brain', first, prompt };
@@ -121,7 +129,11 @@ export const DUO_COMMANDS: { name: string; also: string[]; description: string }
   { name: 'cla', also: ['claude', 'c'], description: 'manda só para o Cla; sozinho, vira o destino padrão' },
   { name: 'fog', also: ['codex', 'x'], description: 'manda só para o Fog; sozinho, vira o destino padrão' },
   { name: 'todos', also: ['ambos', 'all'], description: 'manda para os dois; sozinho, vira o destino padrão' },
-  { name: 'brain', also: [], description: '/brain /cla <msg>: um responde, o outro avalia, até concordarem' },
+  {
+    name: 'brain',
+    also: [],
+    description: '/brain <msg>: os dois respondem por si, depois se confrontam; /brain /cla <msg>: o Cla responde, o Fog avalia',
+  },
   { name: 'parar', also: [], description: 'encerra o brain depois da resposta em andamento' },
   { name: 'compartilhado', also: ['compartilhar'], description: 'cada um vê o que você e o outro disseram' },
   { name: 'privado', also: [], description: 'só quem recebe vê; o outro não fica sabendo nem depois' },
@@ -164,8 +176,12 @@ export const HELP_TEXT = [
   '@cla /  @fog /    mostra a lista de comandos de cada um (do Fog, as skills);',
   '                  digite para filtrar, Tab completa o primeiro',
   '                  (com @ também funciona: @fog, @todos...)',
+  '/brain <msg>      o Cla e o Fog respondem cada um por si, sem ver o outro;',
+  '                  depois o destino padrão abre o confronto (com /todos, o Cla),',
+  '                  e revezam até concordarem ou concluírem que falta uma informação',
   '/brain /cla <msg> o Cla responde, o Fog avalia, e revezam até concordarem',
-  `                  (no máximo ${BRAIN_MAX} respostas; /brain /fog: o Fog começa)`,
+  '                  (/brain /fog: o Fog começa)',
+  `                  (nos dois, no máximo ${BRAIN_MAX} respostas)`,
   '/parar            encerra o brain depois da resposta em andamento',
   '/compartilhado    (padrão) cada um vê o que você e o outro disseram',
   '/privado          só quem recebe vê; o outro não fica sabendo nem depois',

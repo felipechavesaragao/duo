@@ -111,9 +111,15 @@ describe('/brain e /parar', () => {
     expect(parseInput('/brain @codex, revisa', 'claude')).toMatchObject({ first: 'codex', prompt: 'revisa' });
     expect(parseInput('/BRAIN /Claude oi\nlinha 2', 'codex')).toMatchObject({ first: 'claude', prompt: 'oi\nlinha 2' });
   });
-  it('sem quem começa, com /todos ou sem pergunta: avisa como usar', () => {
-    expect(parseInput('/brain', 'claude')).toMatchObject({ type: 'invalid' });
-    expect(parseInput('/brain qual banco?', 'claude')).toMatchObject({ type: 'invalid' });
+  it('sem quem começa: o jeito novo, os dois respondem cada um por si', () => {
+    expect(parseInput('/brain qual banco usar?', 'codex')).toEqual({ type: 'brain', prompt: 'qual banco usar?' });
+    expect(parseInput('/brain, qual banco?\nlinha 2', 'claude')).toEqual({ type: 'brain', prompt: 'qual banco?\nlinha 2' });
+    expect(parseInput('/brain cla ou fog?', 'claude')).toEqual({ type: 'brain', prompt: 'cla ou fog?' }); // sem / ou @ não é nome
+    expect(parseInput('/brain qual banco?', 'claude')).not.toHaveProperty('first');
+  });
+  it('sem pergunta, com /todos ou com um nome que não existe: avisa como usar', () => {
+    expect(parseInput('/brain', 'claude')).toMatchObject({ type: 'invalid', message: expect.stringContaining('falta a pergunta') });
+    expect(parseInput('/brain  ,', 'claude')).toMatchObject({ type: 'invalid', message: expect.stringContaining('falta a pergunta') });
     expect(parseInput('/brain /todos qual banco?', 'claude')).toMatchObject({ type: 'invalid' });
     expect(parseInput('/brain /gpt qual banco?', 'claude')).toMatchObject({ type: 'invalid' });
     expect(parseInput('/brain /cla', 'claude')).toMatchObject({ type: 'invalid', message: expect.stringContaining('falta a pergunta') });
