@@ -240,6 +240,7 @@ describe('ClaudeAgent', () => {
     const args = await agent.send('ARGS', noop);
     expect(args).toContain('--mcp-config');
     expect(args).toContain('--append-system-prompt');
+    expect(args).toContain('git worktree add'); // a regra de onde editar vai junto, em qualquer pasta
   });
 
   it('o Codex falha: a ferramenta devolve erro e o turno do Claude segue', async () => {
@@ -748,7 +749,9 @@ describe('CodexAgent (app-server)', () => {
     expect(answer).toBe('eco: [falar_com_claude] O Claude respondeu:\n\nconcordo');
     expect(errors).toEqual([]); // não é tratado como pedido recusado
     expect(JSON.parse(await agent.send('INIT', noop)).capabilities).toMatchObject({ experimentalApi: true });
-    expect(JSON.parse(await agent.send('PARAMS', noop)).developerInstructions).toContain('falar_com_claude');
+    const params = JSON.parse(await agent.send('PARAMS', noop));
+    expect(params.developerInstructions).toContain('falar_com_claude');
+    expect(params.developerInstructions).toContain('git worktree add'); // a regra de onde editar vai junto
   });
 
   it('o Claude falha: a ferramenta devolve erro e o turno do Codex segue', async () => {

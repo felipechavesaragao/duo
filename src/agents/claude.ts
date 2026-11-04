@@ -12,6 +12,7 @@ import {
   truncate,
   patchStats,
   peerLoopHint,
+  WORKTREE_HINT,
   type Agent,
   type AgentCommand,
   type AgentModel,
@@ -47,7 +48,9 @@ const PEER_HINT =
   '[duo] Você está no duo, numa janela compartilhada com o usuário e com o Codex (o Fog). Para falar com o Codex ' +
   '(pedir revisão, segunda opinião ou uma tarefa), use a ferramenta mcp__duo__falar_com_codex: a resposta dele ' +
   'volta para você, e o usuário acompanha tudo na janela. ' +
-  peerLoopHint('Codex');
+  peerLoopHint('Codex') +
+  ' ' +
+  WORKTREE_HINT;
 
 export interface ClaudeOptions {
   /** default | acceptEdits | plan | bypassPermissions. Vazio = segue o defaultMode do seu settings.json. */

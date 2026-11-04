@@ -5,6 +5,7 @@ import {
   createQueue,
   patchStats,
   peerLoopHint,
+  WORKTREE_HINT,
   ResumeFailedError,
   stepEnd,
   STEP_STOPPED,
@@ -45,7 +46,9 @@ const PEER_HINT =
   '(pedir revisão, segunda opinião ou uma tarefa), use a ferramenta falar_com_claude: a resposta dele volta para você, ' +
   'e o usuário acompanha tudo na janela. Se a ferramenta não estiver na sua lista, esta conversa começou antes dela ' +
   'existir: avise o usuário que só uma conversa nova (/novo no duo) a recebe. ' +
-  peerLoopHint('Claude');
+  peerLoopHint('Claude') +
+  ' ' +
+  WORKTREE_HINT;
 
 export interface CodexOptions {
   /** read-only | workspace-write | danger-full-access. Vazio = livre: sem sandbox e sem aprovações. */

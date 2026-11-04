@@ -264,6 +264,17 @@ export function peerLoopHint(other: string): string {
   );
 }
 
+/**
+ * Onde editar (vai na instrução de cada um, em qualquer pasta onde o duo abra): o CLAUDE.md e o AGENTS.md globais
+ * podem dizer o mesmo, e isto vale quando não disserem. As instruções do projeto vencem.
+ */
+export const WORKTREE_HINT =
+  'Mudança de código fica separada da master: antes de editar código num repositório git, crie um worktree ' +
+  '(git worktree add, numa pasta própria e com branch própria) e edite nele; a sessão continua na pasta onde o duo ' +
+  'abriu. Junte de volta na master/main só quando o usuário mandar commitar, e depois remova o worktree (git ' +
+  'worktree remove). Não vale para perguntas e leituras, nem para a sua memória, o seu handoff e a sua config. Se as ' +
+  'instruções do projeto (CLAUDE.md, AGENTS.md) dizem outra coisa sobre onde trabalhar, vale o que elas dizem.';
+
 export function truncate(s: string, max = 120): string {
   const oneLine = s.replace(/\s+/g, ' ').trim();
   return oneLine.length > max ? oneLine.slice(0, max - 1) + '…' : oneLine;
