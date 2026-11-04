@@ -4,12 +4,14 @@ Claude Code e Codex na mesma janela: no terminal ou numa janela própria (`duo -
 
 Você conversa com os dois ao mesmo tempo: manda uma mensagem para um, para o outro ou para os dois, e cada um vê o que você e o outro disseram. Por baixo rodam o próprio Claude Code e o próprio Codex, com os seus logins. O duo é só a tela que junta os dois.
 
+Na tela, cada um tem nome e carinha: o Claude é o **Cla** e o Codex é o **Fog**, cada um com um robozinho da sua cor na janela. O que o duo manda para eles continua com o nome do produto, que é como cada um se reconhece e reconhece o outro.
+
 ```
 /todos ›  qual banco usar para guardar sessões de um CLI pequeno?
 
-● Claude
+● Cla
   ...
-● Codex
+● Fog
   ...
 ```
 
@@ -39,14 +41,14 @@ Depois é só rodar `duo` na pasta do projeto em que você quer trabalhar. Os do
 
 | comando | o que faz |
 |---|---|
-| `/claude <msg>` | manda só para o Claude (atalhos: `/c`, `/cla`) |
-| `/codex <msg>` | manda só para o Codex (atalhos: `/x`, `/fog`) |
+| `/cla <msg>` | manda só para o Cla (atalhos: `/c`, `/claude`) |
+| `/fog <msg>` | manda só para o Fog (atalhos: `/x`, `/codex`) |
 | `/todos <msg>` | manda para os dois, em paralelo (ou `/ambos`) |
 | `<msg>` | manda para o destino padrão, que aparece antes do `›` |
-| `/codex` | sem mensagem: muda o destino padrão |
-| `/cla /init` | manda um comando do próprio agente (o `/init` vai para o Claude) |
-| `@cla /` | mostra a lista de comandos do Claude (`@fog /`: as skills do Codex); digite para filtrar, Tab completa |
-| `/brain /cla <msg>` | o Claude responde, o Codex avalia, e eles revezam até concordarem (no máximo 6 respostas; `/brain /fog` faz o Codex começar) |
+| `/fog` | sem mensagem: muda o destino padrão |
+| `/cla /init` | manda um comando do próprio agente (o `/init` vai para o Cla) |
+| `@cla /` | mostra a lista de comandos do Cla (`@fog /`: as skills do Fog); digite para filtrar, Tab completa |
+| `/brain /cla <msg>` | o Cla responde, o Fog avalia, e eles revezam até concordarem (no máximo 6 respostas; `/brain /fog` faz o Fog começar) |
 | `/parar` | encerra o brain depois da resposta em andamento |
 | `/compartilhado` | (padrão) cada um vê o que você e o outro disseram |
 | `/privado` | só quem recebe vê; o outro não fica sabendo nem depois |
@@ -61,7 +63,7 @@ Depois é só rodar `duo` na pasta do projeto em que você quer trabalhar. Os do
 
 No `/todos`, os dois respondem ao mesmo tempo e nenhum vê a resposta do outro àquela mensagem. Cada um fica sabendo da resposta do outro na mensagem seguinte.
 
-**Um chama o outro sozinho**: o duo dá ao Claude a ferramenta `falar_com_codex` e ao Codex a `falar_com_claude`, e avisa os dois de que elas existem. A mensagem aparece na janela como `[para o Codex] …` (ou `[para o Claude] …`), vira um turno normal de quem foi chamado (na fila dele, com o contexto da janela) e a resposta volta para quem chamou, que continua de onde estava. Quem está esperando uma resposta não pode ser chamado de volta: o duo recusa na hora, em vez de deixar os dois travados um esperando o outro. Numa revisão, quem chamou insiste até os dois convergirem ou ficar claro que não vão convergir (aí a divergência vai para você); quem foi chamado termina dizendo se concorda ou o que ainda falta. Se o projeto tem um protocolo de revisão próprio, vale o dele.
+**Um chama o outro sozinho**: o duo dá ao Claude a ferramenta `falar_com_codex` e ao Codex a `falar_com_claude`, e avisa os dois de que elas existem. A mensagem aparece na janela como `[para o Fog] …` (ou `[para o Cla] …`), vira um turno normal de quem foi chamado (na fila dele, com o contexto da janela) e a resposta volta para quem chamou, que continua de onde estava. Quem está esperando uma resposta não pode ser chamado de volta: o duo recusa na hora, em vez de deixar os dois travados um esperando o outro. Numa revisão, quem chamou insiste até os dois convergirem ou ficar claro que não vão convergir (aí a divergência vai para você); quem foi chamado termina dizendo se concorda ou o que ainda falta. Se o projeto tem um protocolo de revisão próprio, vale o dele.
 
 **Onde editar**: no mesmo aviso, o duo diz aos dois que mudança de código fica separada da master. Antes de editar código num repositório git, cada um cria um worktree (`git worktree add`, numa pasta própria e com branch própria) e edita nele; a sessão continua na pasta onde o duo abriu. A mudança só volta para a master/main quando você mandar commitar, e o worktree é removido depois. Perguntas e leituras não criam worktree. O aviso vai em qualquer pasta onde você abrir o duo, e o `CLAUDE.md` ou o `AGENTS.md` do projeto vence quando diz outra coisa.
 
@@ -69,7 +71,7 @@ No `/todos`, os dois respondem ao mesmo tempo e nenhum vê a resposta do outro �
 
 Quando um subagente ou comando do Claude em segundo plano termina, ele continua sozinho, sem mensagem sua. Esse turno aparece na janela como os outros, e a resposta entra no contexto do Codex.
 
-**Remote Control**: se o seu settings do Claude Code tem `"remoteControlAtStartup": true`, o duo liga o Remote Control na conversa do Claude, como o terminal faria (o `claude -p` que o duo usa não liga sozinho). A conversa aparece no app desktop e no claude.ai/code, e o link vai para a janela. O que você digitar lá aparece no duo como `[pelo app, para o Claude] …`, a resposta dele também, e o Codex recebe as duas como contexto.
+**Remote Control**: se o seu settings do Claude Code tem `"remoteControlAtStartup": true`, o duo liga o Remote Control na conversa do Claude, como o terminal faria (o `claude -p` que o duo usa não liga sozinho). A conversa aparece no app desktop e no claude.ai/code, e o link vai para a janela. O que você digitar lá aparece no duo como `[pelo app, para o Cla] …`, a resposta dele também, e o Codex recebe as duas como contexto.
 
 O Codex só recebe a ferramenta numa conversa nova: o app-server aceita ferramentas do cliente só ao abrir a conversa, não ao retomar. Uma conversa do Codex aberta por uma versão anterior do duo continua sem ela até um `/novo`.
 

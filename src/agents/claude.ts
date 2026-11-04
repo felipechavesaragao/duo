@@ -2,6 +2,7 @@ import spawn from 'cross-spawn';
 import type { ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import { NAMES } from '../display.js';
 import { killTree, onJsonLines, relPath, stderrTail } from './process.js';
 import {
   createQueue,
@@ -241,7 +242,7 @@ export class ClaudeAgent implements Agent {
                 })),
               ];
             } catch (err: any) {
-              reject(new Error(`não consegui ler a imagem para o Claude: ${err?.message ?? err}`));
+              reject(new Error(`não consegui ler a imagem para o ${NAMES.claude}: ${err?.message ?? err}`));
               return;
             }
           }
@@ -391,7 +392,7 @@ export class ClaudeAgent implements Agent {
     if (turn?.proc === run.proc && turn.resumeError !== undefined && /No conversation found/i.test(run.tail())) {
       if (this.sessionId === run.resumedWith) this.sessionId = undefined;
       if (this.run === run) this.run = undefined;
-      this.settle(turn, new ResumeFailedError(`a conversa ${run.resumedWith} não existe mais no Claude`));
+      this.settle(turn, new ResumeFailedError(`a conversa ${run.resumedWith} não existe mais no Claude Code`));
       return;
     }
     const reason = turn?.resumeError || `o processo do claude encerrou (código ${code ?? '?'})`;
@@ -454,7 +455,7 @@ export class ClaudeAgent implements Agent {
       }
       if (res.request_id !== run.remoteControlRequest) return;
       if (res.subtype === 'success') {
-        this.onNotice?.({ kind: 'text', text: `Claude no Remote Control: ${res.response?.session_url ?? '(sem link)'}` });
+        this.onNotice?.({ kind: 'text', text: `${NAMES.claude} no Remote Control: ${res.response?.session_url ?? '(sem link)'}` });
       } else {
         this.onNotice?.({ kind: 'error', text: `não consegui ligar o Remote Control: ${res.error ?? 'sem motivo'}` });
       }
@@ -569,7 +570,7 @@ export class ClaudeAgent implements Agent {
         this.finishOwnTurn(run);
         return;
       }
-      if (stopped) this.settle(mine, new Error('você parou o Claude'));
+      if (stopped) this.settle(mine, new Error(`você parou o ${NAMES.claude}`));
       else this.settle(mine, msg.is_error ? new Error(resultError(msg)) : mine.texts.join('\n\n'));
     }
   }

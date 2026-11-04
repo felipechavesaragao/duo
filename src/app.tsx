@@ -6,7 +6,7 @@ import type { ChangeWatcher } from './changes.js';
 import { Duo, type Entry } from './core.js';
 import { COLORS, footerText, NAMES } from './display.js';
 import type { Recorder } from './persist.js';
-import { agentCommandQuery, matchCommands } from './router.js';
+import { agentCommandQuery, matchCommands, type Target } from './router.js';
 
 export { COLORS, footerText } from './display.js';
 
@@ -98,14 +98,14 @@ export function App({ agents, recorder, resumed = false, changes }: AppProps) {
           .filter((id) => busy[id] > 0)
           .map((id) => (
             <Text key={id} color={COLORS[id]}>
-              {SPINNER[frame]} {agents[id].name} trabalhando
+              {SPINNER[frame]} {NAMES[id]} trabalhando
               {busy[id] > 1 ? ` (+${busy[id] - 1} na fila)` : ''}…
             </Text>
           ))}
         {asking?.questions ? (
           <Box flexDirection="column">
             <Text color={COLORS[asking.who]} bold>
-              ? {agents[asking.who].name} pergunta{asks.length > 1 ? ` (+${asks.length - 1} na fila)` : ''}:
+              ? {NAMES[asking.who]} pergunta{asks.length > 1 ? ` (+${asks.length - 1} na fila)` : ''}:
             </Text>
             {asking.questions.map((q, i) => (
               <Box key={i} flexDirection="column">
@@ -135,7 +135,7 @@ export function App({ agents, recorder, resumed = false, changes }: AppProps) {
         ) : asking ? (
           <Box flexDirection="column">
             <Text color={COLORS[asking.who]} bold>
-              ? {agents[asking.who].name} pede permissão{asks.length > 1 ? ` (+${asks.length - 1} na fila)` : ''}:{' '}
+              ? {NAMES[asking.who]} pede permissão{asks.length > 1 ? ` (+${asks.length - 1} na fila)` : ''}:{' '}
               {asking.text}
             </Text>
             <Box>
@@ -146,14 +146,14 @@ export function App({ agents, recorder, resumed = false, changes }: AppProps) {
         ) : (
           <Box>
             <Text color={promptColor} bold>
-              {shared ? '' : '🔒 '}/{target} ›{' '}
+              {shared ? '' : '🔒 '}/{TARGET_COMMAND[target]} ›{' '}
             </Text>
             <TextInput key={inputKey} value={input} onChange={setInput} onSubmit={onSubmit} />
           </Box>
         )}
         {query && (
           <CommandList
-            agent={agents[query.target].name}
+            agent={NAMES[query.target]}
             color={COLORS[query.target]}
             total={commands[query.target].length}
             matches={matches}
@@ -162,7 +162,7 @@ export function App({ agents, recorder, resumed = false, changes }: AppProps) {
         )}
         {(['claude', 'codex'] as AgentId[]).map((id) => (
           <Text key={id}>
-            <Text color={COLORS[id]}>{agents[id].name.padEnd(7)}</Text>
+            <Text color={COLORS[id]}>{NAMES[id].padEnd(4)}</Text>
             <Text dimColor>{footerText(stats[id])}</Text>
           </Text>
         ))}
@@ -170,6 +170,9 @@ export function App({ agents, recorder, resumed = false, changes }: AppProps) {
     </Box>
   );
 }
+
+/** O destino padrão como o comando que o escolhe: é o nome que aparece antes do ›. */
+const TARGET_COMMAND: Record<Target, string> = { claude: 'cla', codex: 'fog', todos: 'todos' };
 
 /** Quantos comandos a lista mostra de cada vez: o resto aparece conforme você filtra. */
 const LIST_MAX = 8;

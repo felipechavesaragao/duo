@@ -358,7 +358,7 @@ function Sidebar(props: {
           title={`Mandar para o ${snap.names[id]} por padrão`}
           onClick={() => snap.target !== id && onCommand(`/${id}`)}
         >
-          <span className={`dot${working(snap, id) ? ' pulse' : ''}`} />
+          <Face pulse={working(snap, id)} />
           <span className="agent-name">{snap.names[id]}</span>
           <span className="agent-status">{status(id)}</span>
         </button>
@@ -491,7 +491,7 @@ function RunningAgent(props: {
   return (
     <div className="running-agent" style={tint(color)}>
       <div className="running-head">
-        <span className={`dot${since !== null ? ' pulse' : ''}`} />
+        <Face pulse={since !== null} />
         <span className="running-name">{name}</span>
         {!stopping && (since !== null || queued > 0) && (
           <button
@@ -608,10 +608,33 @@ function Timeline({ entries, anyBusy, children }: { entries: Entry[]; anyBusy: b
   );
 }
 
+/**
+ * A carinha do Cla e do Fog: um robozinho na cor do agente (vem de --c, como a bolinha que ele substitui). As medidas
+ * são as do desenho escolhido, numa cabeça de raio 10. `pulse` pisca enquanto ele trabalha, como a bolinha piscava.
+ */
+function Face({ pulse = false }: { pulse?: boolean }) {
+  return (
+    <svg className={`face${pulse ? ' pulse' : ''}`} viewBox="-10.5 -11.5 21 21" aria-hidden="true">
+      <line x1="0" y1="-6.6" x2="0" y2="-9.6" stroke="currentColor" strokeWidth="0.9" strokeLinecap="round" />
+      <circle cx="0" cy="-10" r="1.2" fill="currentColor" />
+      <rect x="-9" y="-0.2" width="1.6" height="3.6" rx="0.6" fill="currentColor" />
+      <rect x="7.4" y="-0.2" width="1.6" height="3.6" rx="0.6" fill="currentColor" />
+      <rect x="-7.8" y="-6.6" width="15.6" height="15.6" rx="3.4" fill="currentColor" />
+      <rect x="-5" y="-2.2" width="3.4" height="3" rx="0.8" fill="#fff" />
+      <rect x="1.6" y="-2.2" width="3.4" height="3" rx="0.8" fill="#fff" />
+      <circle cx="-3.3" cy="-0.7" r="0.75" fill="#1f1f1e" />
+      <circle cx="3.3" cy="-0.7" r="0.75" fill="#1f1f1e" />
+      <rect x="-3.4" y="2.6" width="6.8" height="2" rx="0.7" fill="#fff" />
+      <line x1="-1.1" y1="2.6" x2="-1.1" y2="4.6" stroke="currentColor" strokeWidth="0.7" />
+      <line x1="1.1" y1="2.6" x2="1.1" y2="4.6" stroke="currentColor" strokeWidth="0.7" />
+    </svg>
+  );
+}
+
 function Label({ who }: { who: Who }) {
   return (
     <div className="who">
-      <span className="dot" />
+      {who === 'claude' || who === 'codex' ? <Face /> : <span className="dot" />}
       {NAMES[who]}
     </div>
   );
@@ -863,7 +886,7 @@ function AskCard(props: AskProps) {
   return (
     <div className="ask" style={tint(COLORS[ask.who])}>
       <div className="ask-title">
-        <span className="dot" />
+        <Face />
         {name} pede permissão{more > 0 ? ` (+${more} na fila)` : ''}
       </div>
       <code className="ask-text">{ask.text}</code>
@@ -909,7 +932,7 @@ function QuestionCard(props: AskProps & { questions: AskQuestion[] }) {
   return (
     <div className="ask" style={tint(COLORS[ask.who])}>
       <div className="ask-title">
-        <span className="dot" />
+        <Face />
         {name} pergunta{more > 0 ? ` (+${more} na fila)` : ''}
       </div>
       {questions.map((q, i) => (

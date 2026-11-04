@@ -51,7 +51,7 @@ export const COMMANDS: Record<string, Exclude<Command, { type: 'ask' | 'invalid'
 /** Comandos que levam argumento. Entram na checagem de nomes junto com COMMANDS. */
 export const COMMAND_NAMES = [...Object.keys(COMMANDS), 'brain'];
 
-const BRAIN_USAGE = 'use /brain /cla <pergunta> (o Claude começa) ou /brain /fog <pergunta> (o Codex começa)';
+const BRAIN_USAGE = 'use /brain /cla <pergunta> (o Cla começa) ou /brain /fog <pergunta> (o Fog começa)';
 
 /** O nome é só letras/números: "/fog?" é /fog + "?", e "/codex, revisa" é /codex + "revisa". */
 const NAMED = /^([/@])([\p{L}\p{N}_-]+)([\s\S]*)$/u;
@@ -118,8 +118,8 @@ export function matchCommands(commands: AgentCommand[], query: string): AgentCom
  * que também valem. ⛔ Todo nome de ALIASES e COMMAND_NAMES tem de estar aqui, e só eles (o teste do roteador cobra).
  */
 export const DUO_COMMANDS: { name: string; also: string[]; description: string }[] = [
-  { name: 'cla', also: ['claude', 'c'], description: 'manda só para o Claude; sozinho, vira o destino padrão' },
-  { name: 'fog', also: ['codex', 'x'], description: 'manda só para o Codex; sozinho, vira o destino padrão' },
+  { name: 'cla', also: ['claude', 'c'], description: 'manda só para o Cla; sozinho, vira o destino padrão' },
+  { name: 'fog', also: ['codex', 'x'], description: 'manda só para o Fog; sozinho, vira o destino padrão' },
   { name: 'todos', also: ['ambos', 'all'], description: 'manda para os dois; sozinho, vira o destino padrão' },
   { name: 'brain', also: [], description: '/brain /cla <msg>: um responde, o outro avalia, até concordarem' },
   { name: 'parar', also: [], description: 'encerra o brain depois da resposta em andamento' },
@@ -155,17 +155,17 @@ export function matchDuoCommands(query: string): AgentCommand[] {
 }
 
 export const HELP_TEXT = [
-  '/claude <msg>     manda só para o Claude      (atalhos: /c, /cla)',
-  '/codex <msg>      manda só para o Codex       (atalhos: /x, /fog)',
+  '/cla <msg>        manda só para o Cla         (atalhos: /c, /claude)',
+  '/fog <msg>        manda só para o Fog         (atalhos: /x, /codex)',
   '/todos <msg>      manda para os dois          (ou /ambos)',
-  '/codex            sem mensagem: muda o destino padrão',
+  '/fog              sem mensagem: muda o destino padrão',
   '<msg>             manda para o destino padrão (aparece antes do ›)',
-  '/cla /init        manda um comando do agente (o /init vai para o Claude)',
-  '@cla /  @fog /    mostra a lista de comandos de cada um (do Codex, as skills);',
+  '/cla /init        manda um comando do agente (o /init vai para o Cla)',
+  '@cla /  @fog /    mostra a lista de comandos de cada um (do Fog, as skills);',
   '                  digite para filtrar, Tab completa o primeiro',
   '                  (com @ também funciona: @fog, @todos...)',
-  '/brain /cla <msg> o Claude responde, o Codex avalia, e revezam até concordarem',
-  `                  (no máximo ${BRAIN_MAX} respostas; /brain /fog: o Codex começa)`,
+  '/brain /cla <msg> o Cla responde, o Fog avalia, e revezam até concordarem',
+  `                  (no máximo ${BRAIN_MAX} respostas; /brain /fog: o Fog começa)`,
   '/parar            encerra o brain depois da resposta em andamento',
   '/compartilhado    (padrão) cada um vê o que você e o outro disseram',
   '/privado          só quem recebe vê; o outro não fica sabendo nem depois',

@@ -1,5 +1,6 @@
 import spawn from 'cross-spawn';
 import type { ChildProcess } from 'node:child_process';
+import { NAMES } from '../display.js';
 import { killTree, onJsonLines, relPath, stderrTail } from './process.js';
 import {
   createQueue,
@@ -426,10 +427,10 @@ export class CodexAgent implements Agent {
       const message = e instanceof Error ? e.message : String(e);
       if (resumedWith && /no rollout found|invalid session id/i.test(message)) {
         if (this.threadId === resumedWith) this.threadId = undefined;
-        throw new ResumeFailedError(`a conversa ${resumedWith} não existe mais no Codex`);
+        throw new ResumeFailedError(`a conversa ${resumedWith} não existe mais no Codex CLI`);
       }
       if (/active writer/i.test(message)) {
-        throw new Error('a conversa do Codex está aberta em outro lugar (outro terminal?). Feche lá e mande de novo.');
+        throw new Error(`a conversa do ${NAMES.codex} está aberta em outro lugar (outro terminal do Codex?). Feche lá e mande de novo.`);
       }
       throw e;
     }
@@ -484,9 +485,9 @@ export class CodexAgent implements Agent {
   private async runTurn(prompt: string, emit: EmitFn, images: ImageInput[] = []): Promise<string> {
     const conn = await this.connect();
     const threadId = await this.openThread(conn);
-    if (this.stopAsked) throw new Error('o turno do Codex foi interrompido antes de começar');
+    if (this.stopAsked) throw new Error(`o turno do ${NAMES.codex} foi interrompido antes de começar`);
     conn.onServerRequest = (method) =>
-      emit({ kind: 'error', text: `o Codex pediu "${method}"; o duo não responde a pedidos, então foi recusado` });
+      emit({ kind: 'error', text: `o ${NAMES.codex} pediu "${method}"; o duo não responde a pedidos, então foi recusado` });
 
     return new Promise<string>((resolve, reject) => {
       const texts: string[] = [];
@@ -545,7 +546,7 @@ export class CodexAgent implements Agent {
             break;
           case 'error': {
             const message = p.error?.message ?? 'erro do codex';
-            if (p.willRetry) emit({ kind: 'error', text: truncate(`${message} (o Codex vai tentar de novo)`, 300) });
+            if (p.willRetry) emit({ kind: 'error', text: truncate(`${message} (o ${NAMES.codex} vai tentar de novo)`, 300) });
             else lastError = message;
             break;
           }
@@ -553,9 +554,9 @@ export class CodexAgent implements Agent {
             const status = p.turn?.status;
             if (status === 'completed') finish(() => resolve(texts.join('\n\n')));
             else if (status === 'interrupted') {
-              finish(() => reject(new Error('o turno do Codex foi interrompido')), STEP_STOPPED);
+              finish(() => reject(new Error(`o turno do ${NAMES.codex} foi interrompido`)), STEP_STOPPED);
             }
-            else finish(() => reject(new Error(p.turn?.error?.message ?? lastError ?? 'o turno do Codex falhou')));
+            else finish(() => reject(new Error(p.turn?.error?.message ?? lastError ?? `o turno do ${NAMES.codex} falhou`)));
             break;
           }
         }

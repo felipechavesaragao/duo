@@ -507,7 +507,7 @@ describe('ClaudeAgent', () => {
     const notices: string[] = [];
     agent.onNotice = (ev) => notices.push(ev.text);
     expect(await agent.send('oi', noop)).toBe('eco: oi');
-    expect(notices).toEqual(['Claude no Remote Control: https://claude.ai/code/session_falsa']);
+    expect(notices).toEqual(['Cla no Remote Control: https://claude.ai/code/session_falsa']);
   });
 
   it('Remote Control: o que você digita no app aparece como seu, e a resposta como turno dele', async () => {
@@ -637,7 +637,7 @@ describe('ClaudeAgent', () => {
     const turn = agent.send('LONGO npm test', (ev) => events.push(ev)).catch((e: Error) => e);
     await vi.waitFor(() => expect(seen.at(-1)).toEqual(['Bash npm test']));
     await agent.interrupt();
-    expect(((await turn) as Error).message).toBe('você parou o Claude');
+    expect(((await turn) as Error).message).toBe('você parou o Cla');
     expect(seen.at(-1)).toEqual([]);
     expect(events.filter((e) => e.kind === 'error')).toEqual([]);
     // o comando parado não aparece como falha: o fim dele diz que você parou
@@ -653,7 +653,7 @@ describe('ClaudeAgent', () => {
     await vi.waitFor(() => expect(signal).toBeDefined());
     await agent.interrupt();
     expect(signal!.aborted).toBe(true);
-    expect(((await turn) as Error).message).toBe('você parou o Claude');
+    expect(((await turn) as Error).message).toBe('você parou o Cla');
     expect(await agent.send('oi', noop)).toBe('eco: oi');
   });
 
@@ -669,7 +669,7 @@ describe('ClaudeAgent', () => {
     await vi.waitFor(() => expect(signal).toBeDefined());
     await agent.interrupt();
     expect(signal!.aborted).toBe(true);
-    expect(((await turn) as Error).message).toBe('você parou o Claude');
+    expect(((await turn) as Error).message).toBe('você parou o Cla');
     // o duo negou porque você parou: o passo diz que foi parado, não que você negou
     expect(stepsOf(events).ends).toEqual([{ of: 'toolu_1', ok: false, note: 'parado por você' }]);
   });
@@ -696,7 +696,7 @@ describe('ClaudeAgent', () => {
     const turn = agent.send('TARDE', (ev) => said.push(ev.text)).catch((e: Error) => e);
     await vi.waitFor(() => expect(said).toContain('esperando'));
     await agent.interrupt();
-    expect(((await turn) as Error).message).toBe('você parou o Claude');
+    expect(((await turn) as Error).message).toBe('você parou o Cla');
     expect(went).toEqual([]);
     const late = JSON.parse((await agent.send('TARDIAS', noop)).slice('eco: '.length));
     expect(late.called).toEqual({
@@ -1055,7 +1055,7 @@ describe('CodexAgent (app-server)', () => {
     const turn = agent.send('LONGO npm test', (ev) => events.push(ev)).catch((e: Error) => e);
     await vi.waitFor(() => expect(seen.at(-1)).toEqual(['$ npm test']));
     await agent.interrupt();
-    expect(((await turn) as Error).message).toBe('o turno do Codex foi interrompido');
+    expect(((await turn) as Error).message).toBe('o turno do Fog foi interrompido');
     expect(seen.at(-1)).toEqual([]);
     expect(stepsOf(events).ends).toEqual([{ of: 'longo', ok: false, note: 'parado por você' }]);
     expect(await agent.send('oi', noop)).toBe('eco: oi');
@@ -1069,7 +1069,7 @@ describe('CodexAgent (app-server)', () => {
     await vi.waitFor(() => expect(signal).toBeDefined());
     await agent.interrupt();
     expect(signal!.aborted).toBe(true);
-    expect(((await turn) as Error).message).toBe('o turno do Codex foi interrompido');
+    expect(((await turn) as Error).message).toBe('o turno do Fog foi interrompido');
     const [res] = JSON.parse(await agent.send('RESPOSTAS', noop));
     expect(res.success).toBe(false);
     expect(res.contentItems[0].text).toBe('o usuário parou o Codex antes de o Claude responder');
@@ -1083,7 +1083,7 @@ describe('CodexAgent (app-server)', () => {
     // o turn/start saiu; a chamada chega aos 300ms dele, e a resposta (com o id do turno) aos 600ms
     await vi.waitFor(() => expect((agent as any).waiting).toBeDefined());
     await agent.interrupt();
-    expect(((await turn) as Error).message).toBe('o turno do Codex foi interrompido');
+    expect(((await turn) as Error).message).toBe('o turno do Fog foi interrompido');
     expect(asked).toEqual([]);
     const [res] = JSON.parse(await agent.send('RESPOSTAS', noop));
     expect(res.success).toBe(false);
@@ -1094,7 +1094,7 @@ describe('CodexAgent (app-server)', () => {
     const agent = track(new CodexAgent({ bin: [...fakeCodex, '--thread-delay', '300'] }));
     const turn = agent.send('oi', noop).catch((e: Error) => e);
     await agent.interrupt();
-    expect(((await turn) as Error).message).toBe('o turno do Codex foi interrompido antes de começar');
+    expect(((await turn) as Error).message).toBe('o turno do Fog foi interrompido antes de começar');
     expect(await agent.send('de novo', noop)).toBe('eco: de novo');
   });
 });

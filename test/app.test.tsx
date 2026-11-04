@@ -115,8 +115,9 @@ describe('App', () => {
     expect(claude.prompts[1]).toContain('Codex responde 1'); // Claude viu a do Codex
 
     const all = frames.join('\n');
-    expect(all).toContain('● Claude');
-    expect(all).toContain('● Codex');
+    expect(all).toMatch(/^● Cla$/m); // o nome da tela
+    expect(all).toMatch(/^● Fog$/m);
+    expect(all).not.toMatch(/● (Claude|Codex)/);
     expect(all).toContain('↳ Bash ls');
     expect(lastFrame()).toContain('/todos ›');
   });
@@ -148,7 +149,7 @@ describe('App', () => {
     await type(stdin, 'oi');
     await type(stdin, '@codex oi');
     expect(codex.prompts[0]).toBe('oi');
-    expect(lastFrame()).toContain('🔒 /codex ›');
+    expect(lastFrame()).toContain('🔒 /fog ›');
   });
 
   it('grava a conversa e o `duo -c` retoma: tela, ids, modo e memória compartilhada', async () => {
@@ -174,7 +175,7 @@ describe('App', () => {
     const shown = app2.frames.join('\n');
     expect(shown).toContain('Conversa retomada');
     expect(shown).toContain('Claude responde 1'); // a tela voltou
-    expect(app2.lastFrame()).toContain('🔒 /claude ›'); // modo e destino voltaram
+    expect(app2.lastFrame()).toContain('🔒 /cla ›'); // modo e destino voltaram
 
     await type(app2.stdin, '/compartilhado');
     await type(app2.stdin, '@codex o que ele disse?');
@@ -193,7 +194,7 @@ describe('App', () => {
 
     const shown = app.frames.join('\n');
     expect(shown).toContain('interrompida');
-    expect(shown).toContain('faz o deploy');
+    expect(shown).toContain('"faz o deploy" para o Fog. Não foi reenviada.'); // o nome da tela
     expect(agents.codex.prompts).toHaveLength(0);
     expect(store.load(data.id)!.turns[0].status).toBe('interrupted');
     app.unmount();
@@ -212,7 +213,7 @@ describe('App', () => {
     expect(claude.prompts[2]).toContain('não pôde ser retomada');
     expect(claude.prompts[2]).toContain('PEDIDO-UM'); // inclusive o que era só dele
     expect(claude.prompts[2]).toContain('Codex responde 1');
-    expect(frames.join('\n')).toContain('não deu para retomar');
+    expect(frames.join('\n')).toContain('não deu para retomar a conversa anterior do Cla (');
     expect(frames.join('\n')).toContain('Claude responde 3');
   });
 
@@ -271,7 +272,7 @@ describe('o Claude chama o Codex', () => {
     expect(codex.prompts[0]).toContain('### Claude\nClaude responde 1'); // o contexto da janela foi junto
     expect(codex.prompts[0]).toMatch(/Mensagem do Claude para você:\n[\s\S]*revisa o plano$/);
     const shown = frames.join('\n');
-    expect(shown).toContain('[para o Codex] revisa o plano');
+    expect(shown).toContain('[para o Fog] revisa o plano');
     expect(shown).toContain('Codex responde 1');
 
     await type(stdin, 'e agora?');
@@ -285,7 +286,7 @@ describe('o Claude chama o Codex', () => {
     const answer = await codex.askPeer!({ text: 'confere o teste', signal: new AbortController().signal });
     expect(answer).toBe('Claude responde 1');
     expect(claude.prompts[0]).toContain('[duo] O Codex chamou você pela ferramenta do duo');
-    expect(frames.join('\n')).toContain('[para o Claude] confere o teste');
+    expect(frames.join('\n')).toContain('[para o Cla] confere o teste');
   });
 
   it('quem está esperando não pode ser chamado de volta: recusa em vez de travar os dois', async () => {
@@ -340,13 +341,13 @@ describe('turno que o agente abre sozinho', () => {
     const { claude, codex } = fakes();
     const { stdin, frames } = render(<App agents={{ claude, codex }} />);
     await tick();
-    claude.onNotice!({ kind: 'text', text: 'Claude no Remote Control: https://claude.ai/code/session_x' });
+    claude.onNotice!({ kind: 'text', text: 'Cla no Remote Control: https://claude.ai/code/session_x' });
     claude.onRemoteMessage!('OI DO CELULAR');
     claude.onOwnTurnReply!('RESPOSTA NO CELULAR');
     await tick();
     const shown = frames.join('\n');
-    expect(shown).toContain('Claude no Remote Control: https://claude.ai/code/session_x');
-    expect(shown).toContain('[pelo app, para o Claude] OI DO CELULAR');
+    expect(shown).toContain('Cla no Remote Control: https://claude.ai/code/session_x');
+    expect(shown).toContain('[pelo app, para o Cla] OI DO CELULAR');
 
     await type(stdin, '/codex viu?');
     expect(codex.prompts[0]).toContain('usuário → Claude\nOI DO CELULAR');
@@ -463,7 +464,7 @@ describe('lista de comandos de cada agente', () => {
     await tick();
     stdin.write('@fog /');
     await tick();
-    expect(lastFrame()).toContain('os comandos do Codex ainda não carregaram');
+    expect(lastFrame()).toContain('os comandos do Fog ainda não carregaram');
     codex.onCommands!([{ name: 'review-agent', description: 'Acha bugs' }]);
     await tick();
     expect(lastFrame()).toContain('/review-agent');
@@ -488,10 +489,10 @@ describe('rodapé', () => {
     claude.stats = { model: 'claude-opus-5-5', subagents: 0 };
     const { lastFrame } = render(<App agents={{ claude, codex }} />);
     await tick();
-    expect(lastFrame()).toContain('Claude claude-opus-5-5 · — tokens · sem agent\nCodex  modelo ? · — tokens · sem agent');
+    expect(lastFrame()).toContain('Cla claude-opus-5-5 · — tokens · sem agent\nFog modelo ? · — tokens · sem agent');
     codex.onStats!({ model: 'gpt-6.1-sol', contextTokens: 17_000, contextWindow: 475_000, subagents: 1 });
     await tick();
-    expect(lastFrame()).toContain('Codex  gpt-6.1-sol · 17k/475k tokens (4%) · 1 agent rodando');
+    expect(lastFrame()).toContain('Fog gpt-6.1-sol · 17k/475k tokens (4%) · 1 agent rodando');
   });
 });
 
@@ -507,21 +508,21 @@ describe('pedido de permissão', () => {
     const first = claude.askPermission!({ text: 'Bash git push origin HEAD:master', signal });
     const second = codex.askPermission!({ text: 'Bash git push origin producao', signal });
     await tick();
-    expect(lastFrame()).toContain('? Claude pede permissão (+1 na fila): Bash git push origin HEAD:master');
+    expect(lastFrame()).toContain('? Cla pede permissão (+1 na fila): Bash git push origin HEAD:master');
     expect(lastFrame()).toContain('permitir? s/n ›');
 
     await type(stdin, 'segue'); // não é s nem n: não decide nada
     expect(frames.join('\n')).toContain('responda s para permitir ou n para negar');
     await type(stdin, 's');
     expect(await first).toBe(true);
-    expect(lastFrame()).toContain('? Codex pede permissão: Bash git push origin producao');
+    expect(lastFrame()).toContain('? Fog pede permissão: Bash git push origin producao');
     await type(stdin, 'n');
     expect(await second).toBe(false);
 
     const all = frames.join('\n');
     expect(all).toContain('você permitiu: Bash git push origin HEAD:master');
     expect(all).toContain('você negou: Bash git push origin producao');
-    expect(lastFrame()).toContain('/claude › rascunho meu');
+    expect(lastFrame()).toContain('/cla › rascunho meu');
   });
 
   it('pergunta com opções: o terminal mostra as opções numeradas, e o número, o nome ou um texto seu respondem', async () => {
@@ -532,7 +533,7 @@ describe('pedido de permissão', () => {
     const cor = { question: 'Qual cor?', header: 'Cor', options: [{ label: 'Azul', description: 'a do mar' }, { label: 'Verde' }] };
     const first = claude.askPermission!({ text: 'AskUserQuestion Qual cor?', signal, questions: [cor] });
     await tick();
-    expect(lastFrame()).toContain('? Claude pergunta:');
+    expect(lastFrame()).toContain('? Cla pergunta:');
     expect(lastFrame()).toContain('[Cor] Qual cor?');
     expect(lastFrame()).toContain('1) Azul — a do mar');
     expect(lastFrame()).toContain('2) Verde');
@@ -623,7 +624,7 @@ describe('pedido de permissão', () => {
     ctrl.abort(); // o primeiro sai: o processo caiu
     expect(await first).toBe(false);
     await tick();
-    expect(lastFrame()).toContain('? Codex pede permissão: Bash git push origin dois');
+    expect(lastFrame()).toContain('? Fog pede permissão: Bash git push origin dois');
     stdin.write('\r');
     await tick();
     expect(decided).toBe(false);
@@ -650,7 +651,7 @@ describe('/brain', () => {
     expect(codex.prompts[0]).toContain('A última resposta do Claude');
     expect(claude.prompts[1]).toContain('### Codex\ntroque o banco');
     expect(claude.prompts[1]).not.toContain('PROPOSTA-A'); // a dele mesmo não volta
-    expect(frames.join('\n')).toContain('o Claude concordou com o Codex (3 respostas)');
+    expect(frames.join('\n')).toContain('o Cla concordou com o Fog (3 respostas)');
   });
 
   it('/brain /fog: o Codex começa', async () => {
@@ -663,7 +664,7 @@ describe('/brain', () => {
     await waitFor(frames, 'concordaram');
     expect(codex.prompts).toHaveLength(1);
     expect(claude.prompts[0]).toContain('### Codex\nPLANO-DO-CODEX');
-    expect(frames.join('\n')).toContain('o Claude concordou com o Codex (2 respostas)');
+    expect(frames.join('\n')).toContain('o Cla concordou com o Fog (2 respostas)');
   });
 
   it('sem acordo para no limite de 6 respostas, 3 de cada', async () => {
@@ -701,7 +702,7 @@ describe('/brain', () => {
     await type(stdin, '/brain /cla primeiro');
     await type(stdin, '/brain /fog segundo');
     expect(frames.join('\n')).toContain('já tem um brain rodando');
-    await waitFor(frames, 'brain parou: a resposta do Codex falhou');
+    await waitFor(frames, 'brain parou: a resposta do Fog falhou');
     expect(claude.prompts).toHaveLength(1);
   });
 

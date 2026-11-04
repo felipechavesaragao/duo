@@ -64,4 +64,9 @@ export const COLORS: Record<Who, string> = {
   sistema: 'gray',
 };
 
-export const NAMES: Record<Who, string> = { claude: 'Claude', codex: 'Codex', voce: 'você', sistema: 'duo' };
+/**
+ * O nome que aparece na tela (janela, terminal, conversa salva): o Claude é o Cla, o Codex é o Fog. O que o duo manda
+ * aos agentes segue com o nome do produto (`agent.name`, e os textos do brain e do compartilhado): é por ele que cada
+ * um se reconhece e reconhece o outro.
+ */
+export const NAMES: Record<Who, string> = { claude: 'Cla', codex: 'Fog', voce: 'você', sistema: 'duo' };

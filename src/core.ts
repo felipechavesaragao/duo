@@ -30,7 +30,7 @@ import {
 } from './persist.js';
 import { BRAIN_MAX, brainOpening, brainReview, brainVerdict, otherOf } from './brain.js';
 import { describeChanges, type ChangeWatcher, type Fingerprints } from './changes.js';
-import { currentModel, modelLabel } from './display.js';
+import { currentModel, modelLabel, NAMES } from './display.js';
 import { HELP_TEXT, parseInput, targetsOf, type Target } from './router.js';
 import { SharedLog } from './shared.js';
 
@@ -384,7 +384,7 @@ export class Duo {
       ({ changes }) => {
         if (this.session !== session) return; // houve /novo: o trabalho era da conversa anterior
         for (const c of changes) {
-          this.add('sistema', 'text', describeChanges(c, this.agents[id].name, this.cwd), { changes: c });
+          this.add('sistema', 'text', describeChanges(c, NAMES[id], this.cwd), { changes: c });
         }
       },
       () => undefined,
@@ -469,7 +469,7 @@ export class Duo {
       // o que você digitou no app (Remote Control): aparece aqui e o outro recebe como contexto. A lida no meio de um
       // turno do duo é respondida nele; a outra conta para o turno dele que ela abre (ou em que entra).
       agent.onRemoteMessage = (text, inDuoTurn = false) => {
-        this.add('voce', 'text', `[pelo app, para o ${agent.name}] ${text}`);
+        this.add('voce', 'text', `[pelo app, para o ${NAMES[agent.id]}] ${text}`);
         this.log.userMessage([agent.id], text, rec.data.shared);
         if (!inDuoTurn) this.fromApp[agent.id] = (this.fromApp[agent.id] ?? true) && rec.data.shared;
         rec.saveSoon();
@@ -502,12 +502,12 @@ export class Duo {
         this.add(
           'sistema',
           'error',
-          `interrompida quando o duo fechou: "${truncate(t.text, 80)}" para o ${agents[t.agent].name}. Não foi reenviada.`,
+          `interrompida quando o duo fechou: "${truncate(t.text, 80)}" para o ${NAMES[t.agent]}. Não foi reenviada.`,
         );
       }
       rec.saveNow();
     } else {
-      this.add('sistema', 'text', 'Claude + Codex na mesma janela. Digite /ajuda para ver os comandos.');
+      this.add('sistema', 'text', 'Cla + Fog na mesma janela. Digite /ajuda para ver os comandos.');
     }
 
     // Um agente chama o outro pela ferramenta do duo: vira um turno normal do outro, na fila dele e visível na
@@ -540,9 +540,9 @@ export class Duo {
         signal.addEventListener('abort', release, { once: true });
         try {
           const sharedNow = rec.data.shared;
-          this.add(agent.id, 'text', `[para o ${agents[to].name}] ${text}`);
+          this.add(agent.id, 'text', `[para o ${NAMES[to]}] ${text}`);
           const msgIndex = this.log.agentMessage(agent.id, to, text, sharedNow);
-          const turnId = newTurn(rec.data, to, `[do ${agents[agent.id].name}] ${text}`);
+          const turnId = newTurn(rec.data, to, `[do ${NAMES[agent.id]}] ${text}`);
           rec.saveNow();
           const prompt =
             `[duo] O ${agents[agent.id].name} chamou você pela ferramenta do duo. A sua resposta volta direto para ele, ` +
@@ -634,7 +634,7 @@ export class Duo {
             this.add(
               'sistema',
               'error',
-              `não deu para retomar a conversa anterior do ${agents[id].name} (${err.message}). Abri uma nova, com o histórico da janela como contexto.`,
+              `não deu para retomar a conversa anterior do ${NAMES[id]} (${err.message}). Abri uma nova, com o histórico da janela como contexto.`,
             );
             continue;
           }
@@ -661,7 +661,7 @@ export class Duo {
     this.update({ brain: true });
     const data = this.rec.data;
     const epoch = this.session;
-    const name = (id: AgentId) => this.agents[id].name;
+    const name = (id: AgentId) => NAMES[id]; // só tela: o que vai aos agentes sai do brain.ts
     this.add(
       'sistema',
       'text',
@@ -846,7 +846,7 @@ export class Duo {
 
   private async applyModel(id: AgentId, choice: ModelChoice): Promise<void> {
     const agent = this.agents[id];
-    const fail = (why: string) => this.add('sistema', 'error', `não troquei o modelo do ${agent.name}: ${why}`);
+    const fail = (why: string) => this.add('sistema', 'error', `não troquei o modelo do ${NAMES[id]}: ${why}`);
     const target = choice.model === undefined ? currentModel(agent.models, agent.stats) : agent.models.find((m) => m.id === choice.model);
     if (!target) return fail(choice.model === undefined ? 'a lista de modelos dele ainda não carregou' : `ele não oferece ${choice.model}`);
     if (choice.effort !== undefined && !target.efforts.includes(choice.effort)) {
@@ -866,7 +866,7 @@ export class Duo {
     } catch (e) {
       return fail(e instanceof Error ? e.message : String(e));
     }
-    this.add('sistema', 'text', `modelo do ${agent.name} agora: ${modelLabel(agent.models, agent.stats)}`);
+    this.add('sistema', 'text', `modelo do ${NAMES[id]} agora: ${modelLabel(agent.models, agent.stats)}`);
   }
 
   /**
@@ -879,7 +879,7 @@ export class Duo {
     const running = this.state.runningSince[id] !== null;
     const queued = this.state.busy[id] - (this.running[id].duo ? 1 : 0);
     if (!running && queued === 0) {
-      this.add('sistema', 'error', `o ${agent.name} não está rodando nada.`);
+      this.add('sistema', 'error', `o ${NAMES[id]} não está rodando nada.`);
       return;
     }
     const epoch = this.session;
@@ -890,7 +890,7 @@ export class Duo {
       running ? 'o que ele estava fazendo' : '',
       queued === 1 ? 'a mensagem na fila dele' : queued > 1 ? `as ${queued} mensagens na fila dele` : '',
     ];
-    this.add('sistema', 'text', `você parou o ${agent.name}: ${what.filter(Boolean).join(' e ')}. A conversa continua.`);
+    this.add('sistema', 'text', `você parou o ${NAMES[id]}: ${what.filter(Boolean).join(' e ')}. A conversa continua.`);
     for (const stop of [...this.onCut[id]]) stop(); // quem esperava a resposta dele fica sabendo já
     if (!running) return;
     for (const part of ['duo', 'own'] as const) if (this.running[id][part]) this.stopParts[id].add(part);
@@ -902,7 +902,7 @@ export class Duo {
       if (this.session !== epoch || this.cut[id] !== mine) return;
       this.stopParts[id].clear();
       this.update({ stopping: { ...this.state.stopping, [id]: false } });
-      this.add('sistema', 'error', `não consegui parar o ${agent.name}: ${e instanceof Error ? e.message : String(e)}`);
+      this.add('sistema', 'error', `não consegui parar o ${NAMES[id]}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 

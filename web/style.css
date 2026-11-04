@@ -252,6 +252,18 @@ button:disabled {
   animation: pulse 1.2s ease-in-out infinite;
 }
 
+/* o robozinho do Cla e do Fog: pinta com a cor do agente (--c) */
+.face {
+  width: 18px;
+  height: 18px;
+  color: var(--c);
+  flex: none;
+}
+
+.face.pulse {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
 @keyframes pulse {
   50% {
     opacity: 0.3;
@@ -543,7 +555,8 @@ button:disabled {
 
 @media (prefers-reduced-motion: reduce) {
   .spinner,
-  .dot.pulse {
+  .dot.pulse,
+  .face.pulse {
     animation-duration: 3s;
   }
 }

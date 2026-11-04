@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ImageInput } from '../agents/types.js';
 import { cleanAnswers, type Duo, type DuoState } from '../core.js';
+import { NAMES } from '../display.js';
 import type { ModelBody, ServerEvents, Snapshot, Status } from './protocol.js';
 
 /**
@@ -218,7 +219,7 @@ export async function startGui(duo: Duo, opts: GuiOptions = {}): Promise<Gui> {
   };
   const snapshot = (): Snapshot => ({
     ...duo.getState(),
-    names: { claude: duo.agents.claude.name, codex: duo.agents.codex.name },
+    names: { claude: NAMES.claude, codex: NAMES.codex }, // o nome da tela (Cla e Fog), não o do produto
     cwd: duo.cwd,
   });
 

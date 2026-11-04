@@ -13,7 +13,7 @@ import { startGui } from './gui/server.js';
 import { newSessionData, Recorder, SessionStore, type SessionData } from './persist.js';
 import type { Target } from './router.js';
 
-const USAGE = `duo — Claude Code e Codex na mesma janela
+const USAGE = `duo — Claude Code (o Cla) e Codex (o Fog) na mesma janela
 
 uso: duo [opções]
 

@@ -464,7 +464,7 @@ describe('o que mudou de fato (no duo)', () => {
     const [card] = cardsOf(duo);
     expect(card.who).toBe('sistema');
     expect(card.changes).toEqual(change);
-    expect(card.text).toBe(describeChanges(change, 'Claude', duo.cwd));
+    expect(card.text).toBe(describeChanges(change, 'Cla', duo.cwd));
 
     fake.report = [];
     duo.submit('/cla só uma pergunta');
@@ -484,7 +484,7 @@ describe('o que mudou de fato (no duo)', () => {
     claude.onOwnTurnReply!('pronto', true);
     await vi.waitFor(() => expect(cardsOf(duo)).toHaveLength(1), { timeout: 5000 });
     expect(fake.calls).toEqual(['medida 1', 'compara com 1']);
-    expect(cardsOf(duo)[0].text.split('\n')[0]).toContain('enquanto o Claude trabalhava');
+    expect(cardsOf(duo)[0].text.split('\n')[0]).toContain('enquanto o Cla trabalhava');
   });
 
   it('o agente que edita assim que recebe a mensagem, logo depois de abrir o duo: a edição aparece', async () => {
@@ -607,7 +607,7 @@ describe('o que mudou de fato (no duo)', () => {
     });
     const [card] = cardsOf(resumed);
     expect(card.changes).toEqual(change);
-    expect(card.text).toBe(describeChanges(change, 'Claude', resumed.cwd));
+    expect(card.text).toBe(describeChanges(change, 'Cla', resumed.cwd));
 
     const file = path.join(store.root, 'sessions', `${data.id}.json`);
     const raw = JSON.parse(fs.readFileSync(file, 'utf8'));

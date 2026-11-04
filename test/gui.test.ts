@@ -264,10 +264,10 @@ describe('janela: conversa', () => {
     const { agents, port, cookie, post } = await setup();
     const events = listen(port, cookie);
     const snap = await events.next('snapshot');
-    expect(snap.names).toEqual({ claude: 'Claude', codex: 'Codex' });
+    expect(snap.names).toEqual({ claude: 'Cla', codex: 'Fog' });
     expect(snap.cwd).toBe(process.cwd());
     expect(snap.target).toBe('claude');
-    expect(snap.entries.at(-1).text).toContain('Claude + Codex na mesma janela');
+    expect(snap.entries.at(-1).text).toContain('Cla + Fog na mesma janela');
 
     expect(JSON.parse((await post('/api/submit', { text: '@todos oi' })).body)).toEqual({ ok: true });
     await events.next('entry', (e) => e.who === 'voce' && e.text === '[para os dois] oi');
@@ -796,12 +796,12 @@ describe('janela: seletor de modelo', () => {
     expect(await events.next('models')).toEqual({ claude: [], codex: list() });
 
     expect((await post('/api/modelo', { agent: 'codex', effort: 'max' })).status).toBe(200);
-    await vi.waitFor(() => expect(last(duo)).toMatchObject({ who: 'sistema', kind: 'text', text: 'modelo do Codex agora: A · max · rápido' }));
+    await vi.waitFor(() => expect(last(duo)).toMatchObject({ who: 'sistema', kind: 'text', text: 'modelo do Fog agora: A · max · rápido' }));
     expect(agents.codex.choices).toEqual([{ effort: 'max' }]);
     await events.next('status', (s) => s.stats.codex.effort === 'max');
 
     await post('/api/modelo', { agent: 'codex', fast: false });
-    await vi.waitFor(() => expect(last(duo)?.text).toBe('modelo do Codex agora: A · max'));
+    await vi.waitFor(() => expect(last(duo)?.text).toBe('modelo do Fog agora: A · max'));
     expect(agents.codex.prompts).toEqual([]); // nenhuma troca virou mensagem
     events.close();
   });
@@ -810,7 +810,7 @@ describe('janela: seletor de modelo', () => {
     const { agents, duo, post } = await setup();
     ready(agents.codex, { model: 'modelo-a', effort: 'high', fast: true });
     await post('/api/modelo', { agent: 'codex', model: 'b' });
-    await vi.waitFor(() => expect(last(duo)?.text).toBe('modelo do Codex agora: B · low'));
+    await vi.waitFor(() => expect(last(duo)?.text).toBe('modelo do Fog agora: B · low'));
     expect(agents.codex.choices).toEqual([{ model: 'b', effort: 'low', fast: false }]);
     // o que o novo tem fica como está
     await post('/api/modelo', { agent: 'codex', model: 'a' });
@@ -825,11 +825,11 @@ describe('janela: seletor de modelo', () => {
       expect((await post('/api/modelo', body)).status).toBe(200);
       await vi.waitFor(() => expect(last(duo)).toMatchObject({ who: 'sistema', kind: 'error', text: why }));
     };
-    await refused({ agent: 'codex', model: 'z' }, 'não troquei o modelo do Codex: ele não oferece z');
-    await refused({ agent: 'codex', effort: 'ultra' }, 'não troquei o modelo do Codex: o A não tem o esforço ultra');
-    await refused({ agent: 'codex', model: 'b', effort: 'max' }, 'não troquei o modelo do Codex: o B não tem o esforço max');
-    await refused({ agent: 'codex', model: 'b', fast: true }, 'não troquei o modelo do Codex: o B não tem modo rápido');
-    await refused({ agent: 'claude', effort: 'low' }, 'não troquei o modelo do Claude: a lista de modelos dele ainda não carregou');
+    await refused({ agent: 'codex', model: 'z' }, 'não troquei o modelo do Fog: ele não oferece z');
+    await refused({ agent: 'codex', effort: 'ultra' }, 'não troquei o modelo do Fog: o A não tem o esforço ultra');
+    await refused({ agent: 'codex', model: 'b', effort: 'max' }, 'não troquei o modelo do Fog: o B não tem o esforço max');
+    await refused({ agent: 'codex', model: 'b', fast: true }, 'não troquei o modelo do Fog: o B não tem modo rápido');
+    await refused({ agent: 'claude', effort: 'low' }, 'não troquei o modelo do Cla: a lista de modelos dele ainda não carregou');
     expect(agents.codex.choices).toEqual([]);
     expect(agents.claude.choices).toEqual([]);
   });
@@ -844,7 +844,7 @@ describe('janela: seletor de modelo', () => {
     expect(agents.codex.choices).toEqual([{ model: 'b', effort: 'low' }]);
     release();
     await vi.waitFor(() =>
-      expect(last(duo)).toMatchObject({ kind: 'error', text: 'não troquei o modelo do Codex: o B não tem o esforço high' }),
+      expect(last(duo)).toMatchObject({ kind: 'error', text: 'não troquei o modelo do Fog: o B não tem o esforço high' }),
     );
     expect(agents.codex.choices).toHaveLength(1);
   });
@@ -864,7 +864,7 @@ describe('janela: seletor de modelo', () => {
     agents.codex.modelFails = 'not_found';
     await post('/api/modelo', { agent: 'codex', model: 'b' });
     await vi.waitFor(() =>
-      expect(last(duo)).toMatchObject({ who: 'sistema', kind: 'error', text: 'não troquei o modelo do Codex: not_found' }),
+      expect(last(duo)).toMatchObject({ who: 'sistema', kind: 'error', text: 'não troquei o modelo do Fog: not_found' }),
     );
   });
 
@@ -905,7 +905,7 @@ describe('janela: parar só um agente', () => {
     expect(JSON.parse((await post('/api/parar', { agent: 'claude' })).body)).toEqual({ ok: true });
     await events.next(
       'entry',
-      (e) => e.text === 'você parou o Claude: o que ele estava fazendo e a mensagem na fila dele. A conversa continua.',
+      (e) => e.text === 'você parou o Cla: o que ele estava fazendo e a mensagem na fila dele. A conversa continua.',
     );
     await now(events, duo, (s) => s.busy.claude === 0 && s.runningSince.claude === null && !s.stopping.claude);
     expect(agents.claude.interrupts).toBe(1);
@@ -944,7 +944,7 @@ describe('janela: parar só um agente', () => {
     expect((await post('/api/parar', { agent: 'gemini' })).status).toBe(400);
     expect((await post('/api/parar', {})).status).toBe(400);
     expect(JSON.parse((await post('/api/parar', { agent: 'codex' })).body)).toEqual({ ok: true });
-    await events.next('entry', (e) => e.kind === 'error' && e.text === 'o Codex não está rodando nada.');
+    await events.next('entry', (e) => e.kind === 'error' && e.text === 'o Fog não está rodando nada.');
     expect(agents.codex.interrupts).toBe(0);
     events.close();
   });
@@ -992,7 +992,7 @@ describe('janela: parar só um agente', () => {
     await post('/api/submit', { text: '/brain /cla qual banco?' });
     await events.next('status', (s) => s.runningSince.claude !== null);
     await post('/api/parar', { agent: 'claude' });
-    await events.next('entry', (e) => e.text === '🧠 brain parou: você parou o Claude.');
+    await events.next('entry', (e) => e.text === '🧠 brain parou: você parou o Cla.');
     await now(events, duo, (s) => s.brain === false);
     expect(agents.codex.prompts).toHaveLength(0);
     events.close();
@@ -1008,7 +1008,7 @@ describe('janela: parar só um agente', () => {
     await post('/api/submit', { text: '/brain /cla qual banco?' });
     await events.next('status', (s) => s.runningSince.claude !== null);
     await post('/api/parar', { agent: 'claude' });
-    await events.next('entry', (e) => e.text === '🧠 brain parou: você parou o Claude.');
+    await events.next('entry', (e) => e.text === '🧠 brain parou: você parou o Cla.');
     await now(events, duo, (s) => s.brain === false && s.stopping.claude); // o turno dele ainda não fechou
     open(); // o CLI respondeu antes de parar
     await events.next('entry', (e) => e.who === 'claude' && e.text === 'Claude responde 1');
